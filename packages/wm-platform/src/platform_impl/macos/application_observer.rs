@@ -1,4 +1,5 @@
 use std::{
+  cell::RefCell,
   ptr::NonNull,
   sync::{Arc, Mutex},
 };
@@ -184,11 +185,14 @@ impl ApplicationObserver {
     observer: &CFRetained<AXObserver>,
     context: *mut ApplicationEventContext,
   ) -> crate::Result<()> {
+    let element_cell = window.ax_ui_element().get_ref()?;
+    let element = element_cell.borrow();
+
     for notification in AX_WINDOW_NOTIFICATIONS {
       unsafe {
         let notification_cfstr = CFString::from_static_str(notification);
         let result = observer.add_notification(
-          window.ax_ui_element().get_ref()?,
+          &element,
           &notification_cfstr,
           context.cast::<std::ffi::c_void>(),
         );
@@ -283,29 +287,53 @@ impl ApplicationObserver {
 
       app_windows
         .iter()
-        .find(|window| {
-          window.ax_ui_element().get_ref().ok() == Some(&ax_element)
-        })
+        .find(|window| window.inner.matches_element(&ax_element))
         .cloned()
     };
 
     if notification.name.as_str() == "AXUIElementDestroyed" {
       if let Some(window) = &found_window {
-        context
-          .app_windows
-          .lock()
-          .unwrap()
-          .retain(|w| w.id() != window.id());
+        // The element was destroyed, but the window itself may still exist
+        // under a *new* element — some apps (e.g. Finder on folder
+        // navigation) swap the element backing a live window. Re-resolve by
+        // the stable `WindowId` before treating this as a real close.
+        let live_element = context
+          .application
+          .windows()
+          .ok()
+          .and_then(|windows| {
+            windows.into_iter().find(|w| w.id() == window.id())
+          })
+          .and_then(|w| w.inner.element_clone().ok());
 
-        if let Err(err) = context.events_tx.send(WindowEvent::Destroyed {
-          window_id: window.id(),
-          notification: crate::WindowEventNotification(Some(notification)),
-        }) {
-          tracing::warn!(
-            "Failed to send window event for PID {}: {}",
-            context.application.pid,
-            err
+        if let Some(live_element) = live_element {
+          // Window is still alive: rebind to the new element (shared via
+          // the `Arc`, so the window manager's copy updates too) and
+          // re-register notifications. Do not emit `Destroyed`.
+          let _ = window.inner.set_element(live_element);
+          let _ = Self::register_window_notifications(
+            window,
+            &context.observer.clone(),
+            context,
           );
+        } else {
+          // Genuinely closed.
+          context
+            .app_windows
+            .lock()
+            .unwrap()
+            .retain(|w| w.id() != window.id());
+
+          if let Err(err) = context.events_tx.send(WindowEvent::Destroyed {
+            window_id: window.id(),
+            notification: crate::WindowEventNotification(Some(notification)),
+          }) {
+            tracing::warn!(
+              "Failed to send window event for PID {}: {}",
+              context.application.pid,
+              err
+            );
+          }
         }
       }
 
@@ -313,15 +341,22 @@ impl ApplicationObserver {
     }
 
     let is_new_window = found_window.is_none();
-    let window = found_window.unwrap_or_else(|| {
-      let window_id = WindowId::from_window_element(&ax_element);
+    let window = if let Some(window) = found_window {
+      window
+    } else {
+      // Ignore elements with no resolvable window ID — tracking a
+      // `WindowId(0)` would collide with every other unresolved element.
+      let Some(window_id) = WindowId::from_window_element(&ax_element)
+      else {
+        return;
+      };
       let ax_element = ThreadBound::new(
-        ax_element,
+        RefCell::new(ax_element),
         context.application.dispatcher.clone(),
       );
       NativeWindow::new(window_id, ax_element, context.application.clone())
         .into()
-    });
+    };
 
     if is_new_window {
       context.app_windows.lock().unwrap().push(window.clone());

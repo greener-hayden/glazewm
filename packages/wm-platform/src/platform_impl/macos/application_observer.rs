@@ -55,12 +55,14 @@ unsafe impl Send for ApplicationObserver {}
 impl ApplicationObserver {
   /// Creates a new `ApplicationObserver` for the given application.
   ///
-  /// If `is_startup` is `true`, the observer will not emit
-  /// `WindowEvent::Shown` for windows already running on startup.
+  /// Registers application- and window-level accessibility notifications,
+  /// then emits `WindowEvent::Shown` for every existing window so the window
+  /// manager can adopt windows that are already open. A failed window query
+  /// is tolerated so the observer is still created and future windows are
+  /// caught.
   pub fn new(
     app: &Application,
     events_tx: mpsc::UnboundedSender<WindowEvent>,
-    is_startup: bool,
   ) -> crate::Result<Self> {
     let observer = unsafe {
       let mut observer = std::ptr::null_mut();
@@ -85,7 +87,9 @@ impl ApplicationObserver {
       })?)
     };
 
-    let app_windows = Arc::new(Mutex::new(app.windows()?));
+    // Start empty; the window set is populated by the re-scan below, after
+    // notifications are registered.
+    let app_windows = Arc::new(Mutex::new(Vec::new()));
     let context = Box::into_raw(Box::new(ApplicationEventContext {
       application: app.clone(),
       events_tx: events_tx.clone(),
@@ -105,8 +109,17 @@ impl ApplicationObserver {
     // TODO: Remove from runloop if registration fails.
     Self::register_app_notifications(app, &observer, context)?;
 
-    // Emit `WindowEvent::Shown` for all existing windows.
-    for window in app_windows.lock().unwrap().iter() {
+    // Re-scan windows *after* registering app-level notifications. This
+    // recovers windows that were missed if an earlier query transiently
+    // failed, and catches any window created while registration was in
+    // progress.
+    let windows = app.windows().unwrap_or_default();
+
+    // Emit `WindowEvent::Shown` for every existing window. The window
+    // manager's handler is idempotent — it ignores already-managed windows
+    // — so this safely adopts windows missed during startup population
+    // without duplicating ones that are already tracked.
+    for window in &windows {
       if let Err(err) =
         Self::register_window_notifications(window, &observer, context)
       {
@@ -117,21 +130,19 @@ impl ApplicationObserver {
         );
       }
 
-      // Don't emit `WindowEvent::Shown` for windows that are already
-      // running on startup.
-      if !is_startup {
-        if let Err(err) = events_tx.send(WindowEvent::Shown {
-          window: window.clone(),
-          notification: crate::WindowEventNotification(None),
-        }) {
-          tracing::warn!(
-            "Failed to send window event for PID {}: {}",
-            app.pid,
-            err
-          );
-        }
+      if let Err(err) = events_tx.send(WindowEvent::Shown {
+        window: window.clone(),
+        notification: crate::WindowEventNotification(None),
+      }) {
+        tracing::warn!(
+          "Failed to send window event for PID {}: {}",
+          app.pid,
+          err
+        );
       }
     }
+
+    *app_windows.lock().unwrap() = windows;
 
     Ok(Self {
       pid: app.pid,

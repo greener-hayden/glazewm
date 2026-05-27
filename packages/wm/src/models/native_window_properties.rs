@@ -1,4 +1,6 @@
 use wm_platform::{NativeWindow, Rect};
+#[cfg(target_os = "macos")]
+use wm_platform::NativeWindowExtMacOs;
 #[cfg(target_os = "windows")]
 use wm_platform::{NativeWindowWindowsExt, RectDelta};
 
@@ -7,6 +9,8 @@ pub struct NativeWindowProperties {
   pub title: String,
   #[cfg(target_os = "windows")]
   pub class_name: String,
+  #[cfg(target_os = "macos")]
+  pub bundle_id: Option<String>,
   pub process_name: String,
   pub frame: Rect,
   pub is_minimized: bool,
@@ -24,6 +28,8 @@ impl TryFrom<&NativeWindow> for NativeWindowProperties {
       title: native_window.title()?,
       #[cfg(target_os = "windows")]
       class_name: native_window.class_name()?,
+      #[cfg(target_os = "macos")]
+      bundle_id: native_window.bundle_id(),
       process_name: native_window.process_name()?,
       frame: native_window.frame()?,
       is_minimized: native_window.is_minimized()?,

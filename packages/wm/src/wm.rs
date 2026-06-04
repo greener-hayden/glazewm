@@ -143,6 +143,14 @@ impl WindowManager {
       },
     }?;
 
+    Self::flush_pending_sync(state, config)
+  }
+
+  /// Flushes queued state changes to the OS, unless the WM is paused.
+  fn flush_pending_sync(
+    state: &mut WmState,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
     if !state.is_paused && state.pending_sync.has_changes() {
       platform_sync(state, config)?;
     }
@@ -777,6 +785,18 @@ impl WindowManager {
         Ok(())
       }
     }
+  }
+
+  /// Commits a debounced off-screen focus follow and flushes changes.
+  pub fn commit_pending_follow(
+    &mut self,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
+    let state = &mut self.state;
+
+    state.commit_pending_follow(config)?;
+
+    Self::flush_pending_sync(state, config)
   }
 
   /// Runs cleanup tasks when the WM is exiting.

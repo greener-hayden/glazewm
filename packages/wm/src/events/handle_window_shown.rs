@@ -26,6 +26,9 @@ pub fn handle_window_shown(
       state.pending_sync.queue_container_to_redraw(window);
     }
   } else if !state.ignored_windows.contains(&native_window) {
+    // New-window churn cancels deferred off-screen focus follows.
+    state.cancel_pending_follow();
+
     // If the window is not managed and not explicitly ignored, manage it.
     manage_window(native_window, None, state, config)?;
   }

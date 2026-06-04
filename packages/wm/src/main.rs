@@ -185,6 +185,8 @@ async fn start_wm(
     .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
   loop {
+    let follow_deadline = wm.state.pending_follow_deadline();
+
     let res = tokio::select! {
       _ = signal::ctrl_c() => {
         tracing::info!("Received SIGINT signal.");
@@ -219,6 +221,14 @@ async fn start_wm(
           Ok(())
         } else {
           wm.state.cleanup_invalid_windows()
+        }
+      },
+      () = wait_until(follow_deadline) => {
+        if wm.state.is_paused {
+          wm.state.cancel_pending_follow();
+          Ok(())
+        } else {
+          wm.commit_pending_follow(&config)
         }
       },
       Some((
@@ -296,6 +306,19 @@ async fn start_wm(
   wm.cleanup(&mut config, &mut ipc_server);
 
   Ok(())
+}
+
+/// Waits until `deadline`, or never resolves when no deadline exists.
+///
+/// Keeps deferred off-screen follows event-driven while idle.
+async fn wait_until(deadline: Option<std::time::Instant>) {
+  match deadline {
+    Some(deadline) => {
+      tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
+        .await;
+    }
+    None => std::future::pending::<()>().await,
+  }
 }
 
 /// Initialize logging with the specified verbosity level.

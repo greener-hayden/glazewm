@@ -326,7 +326,7 @@ pub struct WindowMatchConfig {
   pub window_process: Option<MatchType>,
   pub window_class: Option<MatchType>,
   pub window_title: Option<MatchType>,
-  /// Matches against the application's bundle ID (macOS only).
+  /// Matches the application's bundle ID (macOS only).
   pub window_bundle_id: Option<MatchType>,
 }
 

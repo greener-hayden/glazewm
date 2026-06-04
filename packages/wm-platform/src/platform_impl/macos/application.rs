@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -55,9 +55,11 @@ impl Application {
         el.get_attribute::<AXUIElement>("AXFocusedWindow");
 
       focused_window.map(|window_el| {
-        let window_id = WindowId::from_window_element(&window_el);
-        let window_el =
-          ThreadBound::new(window_el, self.dispatcher.clone());
+        let window_id = WindowId::from_window_element(&window_el)?;
+        let window_el = ThreadBound::new(
+          RefCell::new(window_el),
+          self.dispatcher.clone(),
+        );
         Some(NativeWindow::new(window_id, window_el, self.clone()).into())
       })
     })?
@@ -70,11 +72,15 @@ impl Application {
       windows.map(|windows| {
         windows
           .iter()
-          .map(|window_el| {
-            let window_id = WindowId::from_window_element(&window_el);
-            let window_el =
-              ThreadBound::new(window_el, self.dispatcher.clone());
-            NativeWindow::new(window_id, window_el, self.clone()).into()
+          .filter_map(|window_el| {
+            let window_id = WindowId::from_window_element(&window_el)?;
+            let window_el = ThreadBound::new(
+              RefCell::new(window_el),
+              self.dispatcher.clone(),
+            );
+            Some(
+              NativeWindow::new(window_id, window_el, self.clone()).into(),
+            )
           })
           .collect()
       })

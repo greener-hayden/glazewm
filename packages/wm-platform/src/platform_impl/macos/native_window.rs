@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
@@ -21,7 +21,14 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct NativeWindow {
   pub(crate) id: WindowId,
-  pub(crate) element: Arc<ThreadBound<CFRetained<AXUIElement>>>,
+  /// The window's accessibility element.
+  ///
+  /// Wrapped in a `RefCell` so it can be refreshed in place when an
+  /// application swaps the element backing a still-live window (e.g.
+  /// Finder on folder navigation). All clones share the `Arc`, so a
+  /// refresh is seen by every holder, including the window manager's
+  /// own copy.
+  pub(crate) element: Arc<ThreadBound<RefCell<CFRetained<AXUIElement>>>>,
   pub(crate) application: Application,
 }
 
@@ -30,7 +37,7 @@ impl NativeWindow {
   #[must_use]
   pub(crate) fn new(
     id: WindowId,
-    element: ThreadBound<CFRetained<AXUIElement>>,
+    element: ThreadBound<RefCell<CFRetained<AXUIElement>>>,
     application: Application,
   ) -> Self {
     Self {
@@ -40,6 +47,59 @@ impl NativeWindow {
     }
   }
 
+  /// Runs `f` with the window's current accessibility element.
+  ///
+  /// Centralizes borrowing the `RefCell` so call sites can treat the
+  /// element as if it were stored directly.
+  pub(crate) fn with_element<F, R>(&self, f: F) -> crate::Result<R>
+  where
+    F: Send + FnOnce(&CFRetained<AXUIElement>) -> R,
+    R: Send,
+  {
+    self.element.with(|cell| {
+      let element = cell.borrow();
+      f(&element)
+    })
+  }
+
+  /// Replaces the window's accessibility element in place.
+  ///
+  /// Used when an application swaps the element backing a still-live
+  /// window. All clones share the same `Arc`, so the new element is seen
+  /// by every holder. Must be called on the event loop thread.
+  pub(crate) fn set_element(
+    &self,
+    element: CFRetained<AXUIElement>,
+  ) -> crate::Result<()> {
+    let cell = self.element.get_ref()?;
+    *cell.borrow_mut() = element;
+    Ok(())
+  }
+
+  /// Clones (retains) the window's current accessibility element.
+  ///
+  /// Must be called on the event loop thread.
+  pub(crate) fn element_clone(
+    &self,
+  ) -> crate::Result<CFRetained<AXUIElement>> {
+    let cell = self.element.get_ref()?;
+    let element = cell.borrow().clone();
+    Ok(element)
+  }
+
+  /// Whether `element` is the window's current accessibility element.
+  ///
+  /// Must be called on the event loop thread.
+  pub(crate) fn matches_element(
+    &self,
+    element: &CFRetained<AXUIElement>,
+  ) -> bool {
+    self
+      .element
+      .get_ref()
+      .is_ok_and(|cell| &*cell.borrow() == element)
+  }
+
   /// Implements [`NativeWindow::id`].
   pub(crate) fn id(&self) -> WindowId {
     self.id
@@ -47,7 +107,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::title`].
   pub(crate) fn title(&self) -> crate::Result<String> {
-    self.element.with(|el| {
+    self.with_element(|el| {
       el.get_attribute::<CFString>("AXTitle")
         .map(|cf_string| cf_string.to_string())
     })?
@@ -80,7 +140,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::position`].
   pub(crate) fn position(&self) -> crate::Result<(f64, f64)> {
-    self.element.with(move |el| {
+    self.with_element(move |el| {
       el.get_attribute::<AXValue>("AXPosition")
         .and_then(|ax_value| ax_value.value_strict::<CGPoint>())
         .map(|point| (point.x, point.y))
@@ -89,7 +149,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::size`].
   pub(crate) fn size(&self) -> crate::Result<(f64, f64)> {
-    self.element.with(move |el| {
+    self.with_element(move |el| {
       el.get_attribute::<AXValue>("AXSize")
         .and_then(|ax_value| ax_value.value_strict::<CGSize>())
         .map(|size| (size.width, size.height))
@@ -100,8 +160,7 @@ impl NativeWindow {
   pub(crate) fn is_valid(&self) -> bool {
     // Query `AXRole`, which is present on all valid `AXUIElement`s.
     self
-      .element
-      .with(|el| match el.get_attribute::<CFString>("AXRole") {
+      .with_element(|el| match el.get_attribute::<CFString>("AXRole") {
         Err(crate::Error::Accessibility(_, code))
           if code == AXError::InvalidUIElement.0 =>
         {
@@ -138,7 +197,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::is_minimized`].
   pub(crate) fn is_minimized(&self) -> crate::Result<bool> {
-    self.element.with(|el| {
+    self.with_element(|el| {
       el.get_attribute::<CFBoolean>("AXMinimized")
         .map(|cf_bool| cf_bool.value())
     })?
@@ -146,7 +205,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::is_maximized`].
   pub(crate) fn is_maximized(&self) -> crate::Result<bool> {
-    self.element.with(|el| {
+    self.with_element(|el| {
       el.get_attribute::<CFBoolean>("AXFullScreen")
         .map(|cf_bool| cf_bool.value())
     })?
@@ -174,7 +233,7 @@ impl NativeWindow {
     // A Finder folder window is an `AXStandardWindow`; the desktop is not.
     // If the subrole can't be read, fall back to treating it as the
     // desktop.
-    let subrole = self.element.with(|el| {
+    let subrole = self.with_element(|el| {
       el.get_attribute::<CFString>("AXSubrole")
         .map(|subrole| subrole.to_string())
     })?;
@@ -226,7 +285,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::minimize`].
   pub(crate) fn minimize(&self) -> crate::Result<()> {
-    self.element.with(move |el| -> crate::Result<()> {
+    self.with_element(move |el| -> crate::Result<()> {
       let ax_bool = CFBoolean::new(true);
       el.set_attribute::<CFBoolean>("AXMinimized", &ax_bool.into())
     })?
@@ -234,7 +293,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::maximize`].
   pub(crate) fn maximize(&self) -> crate::Result<()> {
-    self.element.with(move |el| -> crate::Result<()> {
+    self.with_element(move |el| -> crate::Result<()> {
       let ax_bool = CFBoolean::new(true);
       el.set_attribute::<CFBoolean>("AXFullScreen", &ax_bool.into())
     })?
@@ -250,7 +309,7 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::close`].
   pub(crate) fn close(&self) -> crate::Result<()> {
-    self.element.with(|el| -> crate::Result<()> {
+    self.with_element(|el| -> crate::Result<()> {
       let close_button =
         el.get_attribute::<AXUIElement>("AXCloseButton")?;
 
@@ -303,7 +362,7 @@ impl NativeWindow {
       }
 
       // Execute the callback with the window element.
-      let result = self.element.with(callback);
+      let result = self.with_element(callback);
 
       // Restore enhanced UI if it was originally enabled.
       if was_enabled {
@@ -319,7 +378,7 @@ impl NativeWindow {
   }
 
   fn raise(&self) -> crate::Result<()> {
-    self.element.with(move |el| -> crate::Result<()> {
+    self.with_element(move |el| -> crate::Result<()> {
       // This has a couple of caveats:
       // - Some windows do not get raised without first calling
       //   `_SLPSSetFrontProcessWithOptions`.

@@ -1,5 +1,8 @@
 #[cfg(target_os = "macos")]
-use objc2_application_services::AXUIElement;
+use std::cell::RefCell;
+
+#[cfg(target_os = "macos")]
+use objc2_application_services::{AXError, AXUIElement};
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
 #[cfg(target_os = "windows")]
@@ -31,18 +34,28 @@ pub struct WindowId(
 );
 
 impl WindowId {
+  /// Resolves the stable `CGWindowID` for an accessibility element.
+  ///
+  /// Returns `None` if the element has no resolvable window ID — the
+  /// lookup failed, or the ID is zero (a sentinel that is never a valid
+  /// window). Such elements must not be tracked: a fabricated
+  /// `WindowId(0)` would collide with every other unresolved element,
+  /// since window identity is the `WindowId`.
   #[cfg(target_os = "macos")]
-  pub(crate) fn from_window_element(el: &CFRetained<AXUIElement>) -> Self {
+  pub(crate) fn from_window_element(
+    el: &CFRetained<AXUIElement>,
+  ) -> Option<Self> {
     let mut window_id = 0;
 
-    unsafe {
+    let result = unsafe {
       platform_impl::ffi::_AXUIElementGetWindow(
         CFRetained::as_ptr(el),
         &raw mut window_id,
       )
     };
 
-    Self(window_id)
+    (result == AXError::Success && window_id != 0)
+      .then_some(Self(window_id))
   }
 }
 
@@ -62,7 +75,9 @@ pub trait NativeWindowExtMacOs {
   /// # Platform-specific
   ///
   /// This method is only available on macOS.
-  fn ax_ui_element(&self) -> &ThreadBound<CFRetained<AXUIElement>>;
+  fn ax_ui_element(
+    &self,
+  ) -> &ThreadBound<RefCell<CFRetained<AXUIElement>>>;
 
   /// Gets the bundle ID of the application that owns the window.
   ///
@@ -102,7 +117,9 @@ pub trait NativeWindowExtMacOs {
 
 #[cfg(target_os = "macos")]
 impl NativeWindowExtMacOs for NativeWindow {
-  fn ax_ui_element(&self) -> &ThreadBound<CFRetained<AXUIElement>> {
+  fn ax_ui_element(
+    &self,
+  ) -> &ThreadBound<RefCell<CFRetained<AXUIElement>>> {
     &self.inner.element
   }
 
@@ -111,28 +128,28 @@ impl NativeWindowExtMacOs for NativeWindow {
   }
 
   fn role(&self) -> crate::Result<String> {
-    self.inner.element.with(|el| {
+    self.inner.with_element(|el| {
       el.get_attribute::<CFString>("AXRole")
         .map(|cf_string| cf_string.to_string())
     })?
   }
 
   fn subrole(&self) -> crate::Result<String> {
-    self.inner.element.with(|el| {
+    self.inner.with_element(|el| {
       el.get_attribute::<CFString>("AXSubrole")
         .map(|cf_string| cf_string.to_string())
     })?
   }
 
   fn is_modal(&self) -> crate::Result<bool> {
-    self.inner.element.with(|el| {
+    self.inner.with_element(|el| {
       el.get_attribute::<CFBoolean>("AXModal")
         .map(|cf_bool| cf_bool.value())
     })?
   }
 
   fn is_main(&self) -> crate::Result<bool> {
-    self.inner.element.with(|el| {
+    self.inner.with_element(|el| {
       el.get_attribute::<CFBoolean>("AXMain")
         .map(|cf_bool| cf_bool.value())
     })?

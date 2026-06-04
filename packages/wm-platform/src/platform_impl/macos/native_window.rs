@@ -160,11 +160,26 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindow::is_desktop_window`].
-  #[allow(clippy::unnecessary_wraps)]
+  ///
+  /// The desktop is owned by Finder, but unlike Finder's folder windows
+  /// (which are `AXStandardWindow`) it is exposed as an `AXScrollArea`.
+  /// Only the desktop element itself is treated as the desktop window, so
+  /// that real Finder windows remain manageable.
   pub(crate) fn is_desktop_window(&self) -> crate::Result<bool> {
-    Ok(
-      self.application.bundle_id() == Some("com.apple.finder".to_string()),
-    )
+    if self.application.bundle_id() != Some("com.apple.finder".to_string())
+    {
+      return Ok(false);
+    }
+
+    // A Finder folder window is an `AXStandardWindow`; the desktop is not.
+    // If the subrole can't be read, fall back to treating it as the
+    // desktop.
+    let subrole = self.element.with(|el| {
+      el.get_attribute::<CFString>("AXSubrole")
+        .map(|subrole| subrole.to_string())
+    })?;
+
+    Ok(subrole.map_or(true, |subrole| subrole != "AXStandardWindow"))
   }
 
   /// Implements [`NativeWindow::set_frame`].

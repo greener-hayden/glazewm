@@ -26,6 +26,11 @@ pub fn handle_window_shown(
       state.pending_sync.queue_container_to_redraw(window);
     }
   } else if !state.ignored_windows.contains(&native_window) {
+    // A newly shown (unmanaged) window is open/close churn. Cancel any
+    // deferred off-screen follow (macOS) so the new window is placed on
+    // the user's current workspace rather than a jumped-to one.
+    state.cancel_pending_follow();
+
     // If the window is not managed and not explicitly ignored, manage it.
     manage_window(native_window, None, state, config)?;
   }

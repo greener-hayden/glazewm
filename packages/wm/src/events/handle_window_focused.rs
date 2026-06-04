@@ -1,6 +1,6 @@
 use anyhow::Context;
 use tracing::info;
-use wm_common::{DisplayState, WindowRuleEvent, WmEvent};
+use wm_common::{DisplayState, HideMethod, WindowRuleEvent, WmEvent};
 use wm_platform::NativeWindow;
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
   models::WorkspaceTarget,
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
-  wm_state::WmState,
+  wm_state::{PendingFollow, WmState},
 };
 
 pub fn handle_window_focused(
@@ -59,6 +59,15 @@ pub fn handle_window_focused(
   if let Some(window) = found_window {
     let workspace = window.workspace().context("No workspace")?;
 
+    // A genuine focus that settles on a displayed window supersedes any
+    // deferred off-screen follow (e.g. the OS bounced focus back to the
+    // user's window during churn), so cancel the stale candidate. A focus
+    // landing on a *different* hidden window re-records below and
+    // naturally replaces it.
+    if window.display_state() != DisplayState::Hidden {
+      state.cancel_pending_follow();
+    }
+
     // Native focus has been synced to the WM's focused container.
     if focused_container == window.clone().into() {
       state.is_focus_synced = true;
@@ -72,6 +81,31 @@ pub fn handle_window_focused(
     // if Discord is forcefully shown by the OS when it's on a hidden
     // workspace, switch focus to Discord's workspace.
     if window.display_state() == DisplayState::Hidden {
+      // On macOS, corner-parked (`HideMethod::PlaceInCorner`) windows stay
+      // OS-focusable, so the OS transiently focuses a sibling/existing
+      // window on a hidden workspace during open/close churn. Defer the
+      // follow rather than jumping immediately: keep the user (and the
+      // WM's focus order) put, and let `commit_pending_follow`
+      // decide once churn has settled. Churn (a window closing, or a
+      // new window appearing) cancels the candidate; a genuine
+      // force-show survives the debounce and still follows. On
+      // Windows (`HideMethod::Cloak`), hidden windows
+      // are unfocusable, so any such focus is a genuine force-show and is
+      // followed immediately.
+      if config.value.general.hide_method == HideMethod::PlaceInCorner {
+        info!("Deferring off-screen follow: {window}");
+
+        state.pending_follow = Some(PendingFollow {
+          window_id: window.id(),
+          requested_at: std::time::Instant::now(),
+        });
+
+        // Leave the WM's focus order on the user's current container. The
+        // OS briefly focused the corner sliver; it is restored by churn
+        // (which re-asserts focus) or by the committed follow.
+        return Ok(());
+      }
+
       info!("Focusing off-screen window: {window}");
 
       focus_workspace(

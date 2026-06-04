@@ -30,18 +30,11 @@ use crate::{
   user_config::UserConfig,
 };
 
-/// A deferred off-screen focus follow awaiting confirmation.
+/// A debounced off-screen focus follow candidate.
 ///
-/// On macOS, hidden-workspace windows use `HideMethod::PlaceInCorner` and
-/// stay fully OS-focusable, so the OS transiently focuses a corner-parked
-/// window during open/close churn (e.g. closing a window of a multi-window
-/// app, or opening a second window of an app with windows on a hidden
-/// workspace). Following such focus immediately would yank the user to
-/// that window's workspace. The follow is instead recorded here and only
-/// committed once it has survived a short debounce without being cancelled
-/// by churn. A genuine force-show (e.g. Discord raising itself, or the
-/// user activating an app whose windows live on a hidden workspace) has no
-/// concurrent churn and therefore commits normally.
+/// macOS corner-parked windows remain OS-focusable, so close/open churn
+/// can briefly focus a hidden-workspace window. Debouncing lets churn
+/// cancel that focus while preserving genuine force-shows.
 #[derive(Clone, Copy, Debug)]
 pub struct PendingFollow {
   /// WM container id of the off-screen window to potentially follow.
@@ -78,13 +71,7 @@ pub struct WmState {
   /// Used to decide whether to override incoming focus events.
   pub unmanaged_or_minimized_timestamp: Option<Instant>,
 
-  /// A deferred off-screen focus follow awaiting confirmation.
-  ///
-  /// Used on macOS (`HideMethod::PlaceInCorner`) to avoid following OS
-  /// focus to a hidden-workspace window during open/close churn.
-  /// Committed by `commit_pending_follow` once it has survived a short
-  /// debounce without being cancelled by churn (a window
-  /// unmanaged/minimized, or a new window shown).
+  /// Deferred off-screen focus follow awaiting churn confirmation.
   pub pending_follow: Option<PendingFollow>,
 
   /// Configs of currently enabled binding modes.
@@ -698,35 +685,21 @@ impl WmState {
   }
 
   /// Cancels any pending off-screen follow.
-  ///
-  /// Called from churn sites (a focused window unmanaged/minimized, or a
-  /// new window shown) so that open/close churn never commits a workspace
-  /// jump. A no-op when no follow is pending.
   pub fn cancel_pending_follow(&mut self) {
     self.pending_follow = None;
   }
 
-  /// Instant at which a pending off-screen follow becomes eligible to
-  /// commit, or `None` when no follow is pending.
-  ///
-  /// Lets the main loop wait for exactly this instant rather than polling,
-  /// so the WM stays event-driven when idle.
+  /// Returns when a pending off-screen follow becomes eligible to commit.
   pub fn pending_follow_deadline(&self) -> Option<Instant> {
     self
       .pending_follow
       .map(|pending| pending.requested_at + Self::FOLLOW_DEBOUNCE)
   }
 
-  /// Commits a deferred off-screen follow if it has survived the debounce.
+  /// Commits a debounced off-screen follow if the candidate is still
+  /// valid.
   ///
-  /// Re-resolves the candidate window by id and follows to its workspace
-  /// only if it is still managed, still off-screen
-  /// (`DisplayState::Hidden`), and its workspace isn't already displayed.
-  /// While still within the debounce window, or once the candidate has
-  /// been invalidated, this is a no-op.
-  ///
-  /// Side effects are queued on `pending_sync`; the caller is responsible
-  /// for flushing via `platform_sync`.
+  /// Queues side effects on `pending_sync`; the caller must flush them.
   pub fn commit_pending_follow(
     &mut self,
     config: &UserConfig,
@@ -749,8 +722,7 @@ impl WmState {
       return Ok(());
     };
 
-    // Only follow if the window is still off-screen. A genuine force-show
-    // leaves it `Hidden`; any churn would have changed this.
+    // Churned windows stop being hidden before the debounce commits.
     if window.display_state() != DisplayState::Hidden {
       tracing::debug!(
         "Deferred off-screen follow candidate is on-screen."

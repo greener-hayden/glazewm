@@ -308,11 +308,9 @@ async fn start_wm(
   Ok(())
 }
 
-/// Waits until `deadline`, or never resolves when `None`.
+/// Waits until `deadline`, or never resolves when no deadline exists.
 ///
-/// Drives deferred off-screen follow commits (macOS) without an always-on
-/// timer: the returned future only completes when a follow is actually
-/// pending, keeping the main loop event-driven when idle.
+/// Keeps deferred off-screen follows event-driven while idle.
 async fn wait_until(deadline: Option<std::time::Instant>) {
   match deadline {
     Some(deadline) => {

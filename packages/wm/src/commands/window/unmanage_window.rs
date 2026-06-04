@@ -19,8 +19,7 @@ pub fn unmanage_window(
   // Create iterator of parent, grandparent, and great-grandparent.
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
 
-  // A window closing is open/close churn, so cancel any deferred
-  // off-screen follow (macOS) before it can commit a workspace jump.
+  // Close churn cancels deferred off-screen focus follows.
   state.cancel_pending_follow();
 
   // Get container to switch focus to after the window has been removed.

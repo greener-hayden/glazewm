@@ -24,11 +24,7 @@ pub fn focus_workspace(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  // A deliberate workspace focus supersedes any deferred off-screen follow
-  // (macOS), so cancel a stale candidate (e.g. the user navigated away
-  // during its debounce). The committing follow itself clears the
-  // candidate before reaching here, so this never cancels the
-  // commit-in-progress.
+  // User-initiated workspace focus supersedes any deferred follow.
   state.cancel_pending_follow();
 
   let focused_workspace = state

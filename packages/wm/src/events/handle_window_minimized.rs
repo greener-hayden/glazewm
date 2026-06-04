@@ -29,8 +29,7 @@ pub fn handle_window_minimized(
     if is_minimized && window.state() != WindowState::Minimized {
       info!("Window minimized: {window}");
 
-      // Minimizing is churn that can move OS focus, so cancel any deferred
-      // off-screen follow (macOS) before it can commit a workspace jump.
+      // Minimize churn cancels deferred off-screen focus follows.
       state.cancel_pending_follow();
 
       let window = update_window_state(

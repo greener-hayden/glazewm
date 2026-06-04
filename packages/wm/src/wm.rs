@@ -779,13 +779,7 @@ impl WindowManager {
     }
   }
 
-  /// Commits a deferred off-screen focus follow if it has survived the
-  /// debounce, flushing any resulting changes.
-  ///
-  /// Driven by the deadline future in the main loop (macOS
-  /// `HideMethod::PlaceInCorner`). A no-op while no follow is pending —
-  /// the future only resolves when one is — so the loop pays no cost
-  /// when idle.
+  /// Commits a debounced off-screen focus follow and flushes changes.
   pub fn commit_pending_follow(
     &mut self,
     config: &UserConfig,

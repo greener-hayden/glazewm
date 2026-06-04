@@ -140,14 +140,40 @@ impl Application {
   }
 
   /// Whether the application should be observed.
+  ///
+  /// Applications with a `Prohibited` activation policy or that are XPC
+  /// services are normally skipped, but some still expose standard windows
+  /// that should be managed (e.g. the Windows App). Such applications are
+  /// observed if any of their current windows is an `AXStandardWindow`.
+  ///
+  /// Note: this only inspects windows that exist when the application is
+  /// first evaluated. A filtered application that spawns its first window
+  /// later will still be missed until window re-enumeration is added.
   pub(crate) fn should_observe(&self) -> bool {
-    if self.activation_policy()
+    let is_filtered = self.activation_policy()
       == NSApplicationActivationPolicy::Prohibited
-    {
-      return false;
+      || self.is_xpc().unwrap_or(false);
+
+    if !is_filtered {
+      return true;
     }
 
-    !self.is_xpc().unwrap_or(false)
+    self.has_standard_window()
+  }
+
+  /// Whether the application currently exposes a standard window.
+  ///
+  /// Returns `false` if the application's windows cannot be enumerated.
+  fn has_standard_window(&self) -> bool {
+    use crate::NativeWindowExtMacOs;
+
+    self.windows().is_ok_and(|windows| {
+      windows.iter().any(|window| {
+        window
+          .subrole()
+          .is_ok_and(|subrole| subrole == "AXStandardWindow")
+      })
+    })
   }
 
   pub(crate) fn is_hidden(&self) -> bool {

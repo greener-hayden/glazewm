@@ -56,11 +56,11 @@ unsafe impl Send for ApplicationObserver {}
 impl ApplicationObserver {
   /// Creates a new `ApplicationObserver` for the given application.
   ///
-  /// Registers application- and window-level accessibility notifications,
-  /// then emits `WindowEvent::Shown` for every existing window so the
-  /// window manager can adopt windows that are already open. A failed
-  /// window query is tolerated so the observer is still created and
-  /// future windows are caught.
+  /// Registers notifications and emits `WindowEvent::Shown` for existing
+  /// windows.
+  ///
+  /// Window enumeration failure is tolerated so future windows are still
+  /// observed.
   pub fn new(
     app: &Application,
     events_tx: mpsc::UnboundedSender<WindowEvent>,
@@ -88,8 +88,7 @@ impl ApplicationObserver {
       })?)
     };
 
-    // Start empty; the window set is populated by the re-scan below, after
-    // notifications are registered.
+    // Seed after notification registration to avoid startup races.
     let app_windows = Arc::new(Mutex::new(Vec::new()));
     let context = Box::into_raw(Box::new(ApplicationEventContext {
       application: app.clone(),
@@ -110,16 +109,10 @@ impl ApplicationObserver {
     // TODO: Remove from runloop if registration fails.
     Self::register_app_notifications(app, &observer, context)?;
 
-    // Re-scan windows *after* registering app-level notifications. This
-    // recovers windows that were missed if an earlier query transiently
-    // failed, and catches any window created while registration was in
-    // progress.
+    // Re-scan after app-level notifications are registered.
     let windows = app.windows().unwrap_or_default();
 
-    // Emit `WindowEvent::Shown` for every existing window. The window
-    // manager's handler is idempotent — it ignores already-managed windows
-    // — so this safely adopts windows missed during startup population
-    // without duplicating ones that are already tracked.
+    // `Shown` is idempotent and adopts windows missed during startup.
     for window in &windows {
       if let Err(err) =
         Self::register_window_notifications(window, &observer, context)
@@ -293,11 +286,8 @@ impl ApplicationObserver {
 
     if notification.name.as_str() == "AXUIElementDestroyed" {
       if let Some(window) = &found_window {
-        // The element was destroyed, but the window itself may still exist
-        // under a *new* element — some apps (e.g. Finder on folder
-        // navigation) swap the element backing a live window. Re-resolve
-        // by the stable `WindowId` before treating this as a real
-        // close.
+        // Some apps swap the `AXUIElement` backing a live window. Confirm
+        // the stable `WindowId` is gone before emitting `Destroyed`.
         let live_element = match context.application.windows() {
           Ok(windows) => windows
             .into_iter()
@@ -314,9 +304,7 @@ impl ApplicationObserver {
         };
 
         if let Some(live_element) = live_element {
-          // Window is still alive: rebind to the new element (shared via
-          // the `Arc`, so the window manager's copy updates too) and
-          // re-register notifications. Do not emit `Destroyed`.
+          // Rebind the shared element and keep observing the live window.
           if let Err(err) = window.inner.set_element(live_element) {
             tracing::warn!(
               "Failed to refresh window element for PID {}: {}",
@@ -338,7 +326,6 @@ impl ApplicationObserver {
             );
           }
         } else {
-          // Genuinely closed.
           context
             .app_windows
             .lock()
@@ -369,8 +356,7 @@ impl ApplicationObserver {
     let window = if let Some(window) = found_window {
       window
     } else {
-      // Ignore elements with no resolvable window ID — tracking a
-      // `WindowId(0)` would collide with every other unresolved element.
+      // Ignore unresolved elements; `WindowId(0)` would collide.
       let Some(window_id) = WindowId::from_window_element(&ax_element)
       else {
         return;

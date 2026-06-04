@@ -21,13 +21,10 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct NativeWindow {
   pub(crate) id: WindowId,
-  /// The window's accessibility element.
+  /// Shared accessibility element for the window.
   ///
-  /// Wrapped in a `RefCell` so it can be refreshed in place when an
-  /// application swaps the element backing a still-live window (e.g.
-  /// Finder on folder navigation). All clones share the `Arc`, so a
-  /// refresh is seen by every holder, including the window manager's
-  /// own copy.
+  /// Refreshable in place because some apps swap the `AXUIElement` for a
+  /// still-live window.
   pub(crate) element: Arc<ThreadBound<RefCell<CFRetained<AXUIElement>>>>,
   pub(crate) application: Application,
 }
@@ -48,9 +45,6 @@ impl NativeWindow {
   }
 
   /// Runs `f` with the window's current accessibility element.
-  ///
-  /// Centralizes borrowing the `RefCell` so call sites can treat the
-  /// element as if it were stored directly.
   pub(crate) fn with_element<F, R>(&self, f: F) -> crate::Result<R>
   where
     F: Send + FnOnce(&CFRetained<AXUIElement>) -> R,
@@ -62,11 +56,9 @@ impl NativeWindow {
     })
   }
 
-  /// Replaces the window's accessibility element in place.
+  /// Replaces the shared accessibility element in place.
   ///
-  /// Used when an application swaps the element backing a still-live
-  /// window. All clones share the same `Arc`, so the new element is seen
-  /// by every holder. Must be called on the event loop thread.
+  /// Must be called on the event loop thread.
   pub(crate) fn set_element(
     &self,
     element: CFRetained<AXUIElement>,

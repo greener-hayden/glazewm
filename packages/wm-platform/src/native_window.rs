@@ -36,11 +36,8 @@ pub struct WindowId(
 impl WindowId {
   /// Resolves the stable `CGWindowID` for an accessibility element.
   ///
-  /// Returns `None` if the element has no resolvable window ID — the
-  /// lookup failed, or the ID is zero (a sentinel that is never a valid
-  /// window). Such elements must not be tracked: a fabricated
-  /// `WindowId(0)` would collide with every other unresolved element,
-  /// since window identity is the `WindowId`.
+  /// Returns `None` when lookup fails or macOS reports the invalid
+  /// sentinel `0`, which would collide with other unresolved elements.
   #[cfg(target_os = "macos")]
   pub(crate) fn from_window_element(
     el: &CFRetained<AXUIElement>,

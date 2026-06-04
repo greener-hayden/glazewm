@@ -224,10 +224,13 @@ impl UserConfig {
     window: &WindowContainer,
     event: &WindowRuleEvent,
   ) -> Vec<WindowRuleConfig> {
-    let window_title = window.native_properties().title;
+    let window_props = window.native_properties();
+    let window_title = window_props.title;
     #[cfg(target_os = "windows")]
-    let window_class = window.native_properties().class_name;
-    let window_process = window.native_properties().process_name;
+    let window_class = window_props.class_name;
+    #[cfg(target_os = "macos")]
+    let window_bundle_id = window_props.bundle_id;
+    let window_process = window_props.process_name;
 
     let pending_window_rules = self
       .window_rules_by_event
@@ -275,7 +278,27 @@ impl UserConfig {
             .as_ref()
             .is_none_or(|match_type| match_type.is_match(&window_title));
 
-          is_process_match && is_class_match && is_title_match
+          let is_bundle_id_match = {
+            #[cfg(target_os = "macos")]
+            {
+              match_config.window_bundle_id.as_ref().is_none_or(
+                |match_type| {
+                  window_bundle_id.as_deref().is_some_and(|bundle_id| {
+                    match_type.is_match(bundle_id)
+                  })
+                },
+              )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+              match_config.window_bundle_id.is_none()
+            }
+          };
+
+          is_process_match
+            && is_class_match
+            && is_title_match
+            && is_bundle_id_match
         })
       })
       .cloned()

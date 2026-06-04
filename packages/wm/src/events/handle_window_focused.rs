@@ -83,10 +83,7 @@ pub fn handle_window_focused(
       if config.value.general.hide_method == HideMethod::PlaceInCorner {
         info!("Deferring off-screen follow: {window}");
 
-        state.pending_follow = Some(PendingFollow {
-          window_id: window.id(),
-          requested_at: std::time::Instant::now(),
-        });
+        state.defer_follow(window.id());
 
         // Preserve WM focus until churn cancels or the follow commits.
         return Ok(());

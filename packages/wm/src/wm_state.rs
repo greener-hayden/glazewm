@@ -36,12 +36,19 @@ use crate::{
 /// can briefly focus a hidden-workspace window. Debouncing lets churn
 /// cancel that focus while preserving genuine force-shows.
 #[derive(Clone, Copy, Debug)]
-pub struct PendingFollow {
+struct PendingFollow {
   /// WM container id of the off-screen window to potentially follow.
-  pub window_id: Uuid,
+  window_id: Uuid,
+
+  /// WM focused container id when the follow was requested.
+  ///
+  /// The follow only commits while focus is unchanged, so any focus
+  /// mutation during the debounce supersedes it without every focus
+  /// path needing an explicit cancellation.
+  focused_at_request: Option<Uuid>,
 
   /// When the follow was first requested.
-  pub requested_at: Instant,
+  requested_at: Instant,
 }
 
 pub struct WmState {
@@ -72,7 +79,7 @@ pub struct WmState {
   pub unmanaged_or_minimized_timestamp: Option<Instant>,
 
   /// Deferred off-screen focus follow awaiting churn confirmation.
-  pub pending_follow: Option<PendingFollow>,
+  pending_follow: Option<PendingFollow>,
 
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
@@ -684,6 +691,20 @@ impl WmState {
       .cloned()
   }
 
+  /// Defers an off-screen focus follow for the given window.
+  ///
+  /// The follow commits after `FOLLOW_DEBOUNCE` unless cancelled by
+  /// intervening churn.
+  pub fn defer_follow(&mut self, window_id: Uuid) {
+    self.pending_follow = Some(PendingFollow {
+      window_id,
+      focused_at_request: self
+        .focused_container()
+        .map(|container| container.id()),
+      requested_at: Instant::now(),
+    });
+  }
+
   /// Cancels any pending off-screen follow.
   pub fn cancel_pending_follow(&mut self) {
     self.pending_follow = None;
@@ -708,11 +729,18 @@ impl WmState {
       return Ok(());
     };
 
-    if pending.requested_at.elapsed() < Self::FOLLOW_DEBOUNCE {
+    self.pending_follow = None;
+
+    // Any focus change during the debounce supersedes the follow.
+    let focused_id =
+      self.focused_container().map(|container| container.id());
+
+    if focused_id != pending.focused_at_request {
+      tracing::debug!(
+        "Deferred off-screen follow superseded by focus change."
+      );
       return Ok(());
     }
-
-    self.pending_follow = None;
 
     let Some(window) = self
       .container_by_id(pending.window_id)

@@ -143,6 +143,14 @@ impl WindowManager {
       },
     }?;
 
+    Self::flush_pending_sync(state, config)
+  }
+
+  /// Flushes queued state changes to the OS, unless the WM is paused.
+  fn flush_pending_sync(
+    state: &mut WmState,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
     if !state.is_paused && state.pending_sync.has_changes() {
       platform_sync(state, config)?;
     }
@@ -788,11 +796,7 @@ impl WindowManager {
 
     state.commit_pending_follow(config)?;
 
-    if !state.is_paused && state.pending_sync.has_changes() {
-      platform_sync(state, config)?;
-    }
-
-    Ok(())
+    Self::flush_pending_sync(state, config)
   }
 
   /// Runs cleanup tasks when the WM is exiting.

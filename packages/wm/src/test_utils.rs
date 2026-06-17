@@ -126,6 +126,8 @@ impl NativeWindowProperties {
       is_minimized,
       is_maximized,
       is_resizable,
+      #[cfg(target_os = "macos")]
+      bundle_id: None,
       #[cfg(target_os = "windows")]
       class_name: String::new(),
       #[cfg(target_os = "windows")]

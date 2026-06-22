@@ -24,6 +24,9 @@ pub fn focus_workspace(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  // User-initiated workspace focus supersedes any deferred follow.
+  state.cancel_pending_follow();
+
   let focused_workspace = state
     .focused_container()
     .and_then(|focused| focused.workspace())

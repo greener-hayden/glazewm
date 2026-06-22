@@ -779,6 +779,22 @@ impl WindowManager {
     }
   }
 
+  /// Commits a debounced off-screen focus follow and flushes changes.
+  pub fn commit_pending_follow(
+    &mut self,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
+    let state = &mut self.state;
+
+    state.commit_pending_follow(config)?;
+
+    if !state.is_paused && state.pending_sync.has_changes() {
+      platform_sync(state, config)?;
+    }
+
+    Ok(())
+  }
+
   /// Runs cleanup tasks when the WM is exiting.
   pub(crate) fn cleanup(
     &mut self,

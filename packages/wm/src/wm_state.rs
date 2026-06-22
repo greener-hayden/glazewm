@@ -1,10 +1,12 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
-use wm_common::{BindingModeConfig, HideCorner, WindowState, WmEvent};
+use wm_common::{
+  BindingModeConfig, DisplayState, HideCorner, WindowState, WmEvent,
+};
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
 };
@@ -17,6 +19,7 @@ use crate::{
     general::platform_sync,
     monitor::{add_monitor, move_bounded_workspaces_to_new_monitor},
     window::{manage_window, unmanage_window},
+    workspace::focus_workspace,
   },
   models::{
     Container, Monitor, NativeMonitorProperties, RootContainer,
@@ -26,6 +29,20 @@ use crate::{
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
 };
+
+/// A debounced off-screen focus follow candidate.
+///
+/// macOS corner-parked windows remain OS-focusable, so close/open churn
+/// can briefly focus a hidden-workspace window. Debouncing lets churn
+/// cancel that focus while preserving genuine force-shows.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingFollow {
+  /// WM container id of the off-screen window to potentially follow.
+  pub window_id: Uuid,
+
+  /// When the follow was first requested.
+  pub requested_at: Instant,
+}
 
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
@@ -54,6 +71,9 @@ pub struct WmState {
   /// Used to decide whether to override incoming focus events.
   pub unmanaged_or_minimized_timestamp: Option<Instant>,
 
+  /// Deferred off-screen focus follow awaiting churn confirmation.
+  pub pending_follow: Option<PendingFollow>,
+
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
 
@@ -78,6 +98,13 @@ pub struct WmState {
 }
 
 impl WmState {
+  /// Debounce before a deferred off-screen follow commits.
+  ///
+  /// Must comfortably outlast the macOS close churn, where the closed
+  /// window's `Destroyed` event is delayed (~34ms) by a synchronous
+  /// accessibility round-trip in the application observer.
+  const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(120);
+
   pub fn new(
     dispatcher: Dispatcher,
     event_tx: mpsc::UnboundedSender<WmEvent>,
@@ -90,6 +117,7 @@ impl WmState {
       prev_effects_window: None,
       recent_workspace_name: None,
       unmanaged_or_minimized_timestamp: None,
+      pending_follow: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       is_paused: false,
@@ -654,6 +682,68 @@ impl WmState {
           .is_ok_and(|rect| rect.contains_point(point))
       })
       .cloned()
+  }
+
+  /// Cancels any pending off-screen follow.
+  pub fn cancel_pending_follow(&mut self) {
+    self.pending_follow = None;
+  }
+
+  /// Returns when a pending off-screen follow becomes eligible to commit.
+  pub fn pending_follow_deadline(&self) -> Option<Instant> {
+    self
+      .pending_follow
+      .map(|pending| pending.requested_at + Self::FOLLOW_DEBOUNCE)
+  }
+
+  /// Commits a debounced off-screen follow if the candidate is still
+  /// valid.
+  ///
+  /// Queues side effects on `pending_sync`; the caller must flush them.
+  pub fn commit_pending_follow(
+    &mut self,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
+    let Some(pending) = self.pending_follow else {
+      return Ok(());
+    };
+
+    if pending.requested_at.elapsed() < Self::FOLLOW_DEBOUNCE {
+      return Ok(());
+    }
+
+    self.pending_follow = None;
+
+    let Some(window) = self
+      .container_by_id(pending.window_id)
+      .and_then(|container| container.as_window_container().ok())
+    else {
+      tracing::debug!("Deferred off-screen follow candidate is gone.");
+      return Ok(());
+    };
+
+    // Churned windows stop being hidden before the debounce commits.
+    if window.display_state() != DisplayState::Hidden {
+      tracing::debug!(
+        "Deferred off-screen follow candidate is on-screen."
+      );
+      return Ok(());
+    }
+
+    let workspace = window.workspace().context("No workspace.")?;
+
+    if workspace.is_displayed() {
+      return Ok(());
+    }
+
+    tracing::info!("Committing deferred off-screen follow: {window}");
+    focus_workspace(
+      WorkspaceTarget::Name(workspace.config().name),
+      self,
+      config,
+    )?;
+
+    Ok(())
   }
 
   /// Cleans up windows that are no longer alive.

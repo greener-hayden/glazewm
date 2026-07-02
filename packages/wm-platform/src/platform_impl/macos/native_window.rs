@@ -51,28 +51,38 @@ impl NativeWindow {
   ///
   /// Centralizes borrowing the `RefCell` so call sites can treat the
   /// element as if it were stored directly.
+  ///
+  /// Borrows are scoped to `f` and all element access happens on the
+  /// event loop thread, so a borrow conflict is never expected. If one
+  /// occurs regardless, an error is returned instead of panicking, since
+  /// unwinding out of an accessibility callback would abort the process.
   pub(crate) fn with_element<F, R>(&self, f: F) -> crate::Result<R>
   where
     F: Send + FnOnce(&CFRetained<AXUIElement>) -> R,
     R: Send,
   {
     self.element.with(|cell| {
-      let element = cell.borrow();
-      f(&element)
-    })
+      let element = cell.try_borrow().map_err(|_| element_borrow_error())?;
+      Ok(f(&element))
+    })?
   }
 
   /// Replaces the window's accessibility element in place.
   ///
   /// Used when an application swaps the element backing a still-live
   /// window. All clones share the same `Arc`, so the new element is seen
-  /// by every holder. Must be called on the event loop thread.
+  /// by every holder.
+  ///
+  /// Must be called on the event loop thread, and never from within a
+  /// `with_element` closure on the same window.
   pub(crate) fn set_element(
     &self,
     element: CFRetained<AXUIElement>,
   ) -> crate::Result<()> {
     let cell = self.element.get_ref()?;
-    *cell.borrow_mut() = element;
+    let mut current =
+      cell.try_borrow_mut().map_err(|_| element_borrow_error())?;
+    *current = element;
     Ok(())
   }
 
@@ -83,21 +93,26 @@ impl NativeWindow {
     &self,
   ) -> crate::Result<CFRetained<AXUIElement>> {
     let cell = self.element.get_ref()?;
-    let element = cell.borrow().clone();
+    let element = cell
+      .try_borrow()
+      .map_err(|_| element_borrow_error())?
+      .clone();
     Ok(element)
   }
 
   /// Whether `element` is the window's current accessibility element.
   ///
-  /// Must be called on the event loop thread.
+  /// Returns `false` if the element is inaccessible (called off the
+  /// event loop thread, or the element is concurrently borrowed).
   pub(crate) fn matches_element(
     &self,
     element: &CFRetained<AXUIElement>,
   ) -> bool {
-    self
-      .element
-      .get_ref()
-      .is_ok_and(|cell| &*cell.borrow() == element)
+    self.element.get_ref().is_ok_and(|cell| {
+      cell
+        .try_borrow()
+        .is_ok_and(|current| &*current == element)
+    })
   }
 
   /// Implements [`NativeWindow::id`].
@@ -456,6 +471,13 @@ impl NativeWindow {
 
     Ok(())
   }
+}
+
+/// Error for a conflicting borrow of a window's accessibility element.
+fn element_borrow_error() -> crate::Error {
+  crate::Error::Platform(
+    "Window accessibility element is already borrowed.".to_string(),
+  )
 }
 
 impl From<NativeWindow> for crate::NativeWindow {

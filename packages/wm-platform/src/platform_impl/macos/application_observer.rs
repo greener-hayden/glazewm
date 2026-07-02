@@ -186,7 +186,11 @@ impl ApplicationObserver {
     context: *mut ApplicationEventContext,
   ) -> crate::Result<()> {
     let element_cell = window.ax_ui_element().get_ref()?;
-    let element = element_cell.borrow();
+    let element = element_cell.try_borrow().map_err(|_| {
+      crate::Error::Platform(
+        "Window accessibility element is already borrowed.".to_string(),
+      )
+    })?;
 
     for notification in AX_WINDOW_NOTIFICATIONS {
       unsafe {
@@ -197,7 +201,12 @@ impl ApplicationObserver {
           context.cast::<std::ffi::c_void>(),
         );
 
-        if result != AXError::Success {
+        // The element may already be registered (e.g. when rebinding a
+        // window to an element that was previously observed). Treat this
+        // as success so the remaining notifications still register.
+        if result != AXError::Success
+          && result != AXError::NotificationAlreadyRegistered
+        {
           return Err(crate::Error::Platform(format!(
             "Failed to add notification {} for window {}: {:?}",
             notification,
@@ -269,7 +278,12 @@ impl ApplicationObserver {
       return;
     }
 
-    let context = &mut *context.cast::<ApplicationEventContext>();
+    let context_ptr = context.cast::<ApplicationEventContext>();
+    // SAFETY: The context is valid for the observer's lifetime and the
+    // callback only runs on the event loop thread. Only a shared
+    // reference is created, so no aliasing occurs even if the callback
+    // is ever re-entered.
+    let context = unsafe { &*context_ptr };
     let ax_element = unsafe { CFRetained::retain(element) };
     let notification = WindowEventNotificationInner {
       name: notification_name.as_ref().to_string(),
@@ -293,59 +307,17 @@ impl ApplicationObserver {
 
     if notification.name.as_str() == "AXUIElementDestroyed" {
       if let Some(window) = &found_window {
-        // The element was destroyed, but the window itself may still exist
-        // under a *new* element — some apps (e.g. Finder on folder
-        // navigation) swap the element backing a live window. Re-resolve
-        // by the stable `WindowId` before treating this as a real
-        // close.
-        let live_element = context
-          .application
-          .windows()
-          .ok()
-          .and_then(|windows| {
-            windows.into_iter().find(|w| w.id() == window.id())
-          })
-          .and_then(|w| w.inner.element_clone().ok());
-
-        if let Some(live_element) = live_element {
-          // Window is still alive: rebind to the new element (shared via
-          // the `Arc`, so the window manager's copy updates too) and
-          // re-register notifications. Do not emit `Destroyed`.
-          let _ = window.inner.set_element(live_element);
-          let _ = Self::register_window_notifications(
-            window,
-            &context.observer.clone(),
-            context,
-          );
-        } else {
-          // Genuinely closed.
-          context
-            .app_windows
-            .lock()
-            .unwrap()
-            .retain(|w| w.id() != window.id());
-
-          if let Err(err) =
-            context.events_tx.send(WindowEvent::Destroyed {
-              window_id: window.id(),
-              notification: crate::WindowEventNotification(Some(
-                notification,
-              )),
-            })
-          {
-            tracing::warn!(
-              "Failed to send window event for PID {}: {}",
-              context.application.pid,
-              err
-            );
-          }
-        }
+        Self::handle_element_destroyed(
+          window,
+          context,
+          context_ptr,
+          notification,
+        );
       }
 
       return;
     }
 
-    let is_new_window = found_window.is_none();
     let window = if let Some(window) = found_window {
       window
     } else {
@@ -355,35 +327,70 @@ impl ApplicationObserver {
       else {
         return;
       };
-      let ax_element = ThreadBound::new(
-        RefCell::new(ax_element),
-        context.application.dispatcher.clone(),
-      );
-      NativeWindow::new(window_id, ax_element, context.application.clone())
-        .into()
-    };
 
-    if is_new_window {
-      context.app_windows.lock().unwrap().push(window.clone());
-      let _ = Self::register_window_notifications(
-        &window,
-        &context.observer.clone(),
-        context,
-      );
+      let tracked_window = {
+        let app_windows = context.app_windows.lock().unwrap();
 
-      if let Err(err) = context.events_tx.send(WindowEvent::Shown {
-        window: window.clone(),
-        notification: crate::WindowEventNotification(Some(
-          notification.clone(),
-        )),
-      }) {
-        tracing::warn!(
-          "Failed to send window event for PID {}: {}",
-          context.application.pid,
-          err
+        app_windows
+          .iter()
+          .find(|window| window.id() == window_id)
+          .cloned()
+      };
+
+      if let Some(window) = tracked_window {
+        // A tracked window has appeared under a new backing element: the
+        // application swapped elements (e.g. Finder on folder
+        // navigation). Rebind in place instead of tracking a duplicate.
+        Self::rebind_window_element(
+          &window,
+          ax_element,
+          context,
+          context_ptr,
         );
+
+        window
+      } else {
+        let element = ThreadBound::new(
+          RefCell::new(ax_element),
+          context.application.dispatcher.clone(),
+        );
+        let window: crate::NativeWindow = NativeWindow::new(
+          window_id,
+          element,
+          context.application.clone(),
+        )
+        .into();
+
+        context.app_windows.lock().unwrap().push(window.clone());
+
+        if let Err(err) = Self::register_window_notifications(
+          &window,
+          &context.observer,
+          context_ptr,
+        ) {
+          tracing::warn!(
+            "Failed to register window notifications for window {}: {}",
+            window_id.0,
+            err
+          );
+        }
+
+        if let Err(err) = context.events_tx.send(WindowEvent::Shown {
+          window: window.clone(),
+          notification: crate::WindowEventNotification(Some(
+            notification.clone(),
+          )),
+        }) {
+          tracing::warn!(
+            "Failed to send window event for PID {}: {}",
+            context.application.pid,
+            err
+          );
+        }
+
+        window
       }
-    }
+    };
 
     let window_event = match notification.name.as_str() {
       "AXFocusedWindowChanged" => WindowEvent::Focused {
@@ -422,6 +429,114 @@ impl ApplicationObserver {
       tracing::warn!(
         "Failed to send window event for PID {}: {}",
         context.application.pid,
+        err
+      );
+    }
+  }
+
+  /// Handles `AXUIElementDestroyed` for a tracked window.
+  ///
+  /// The element may be destroyed while the window itself lives on under
+  /// a new element (e.g. Finder swaps the backing element on folder
+  /// navigation), so the window is re-resolved by its stable `WindowId`:
+  ///
+  /// - Still present: rebind to the new element. No `Destroyed` event.
+  /// - Absent: the window is confirmed closed and `Destroyed` is emitted.
+  /// - Query failed: keep the window. AX queries fail transiently during
+  ///   sleep/wake, and application teardown is covered separately by the
+  ///   workspace termination notification.
+  fn handle_element_destroyed(
+    window: &crate::NativeWindow,
+    context: &ApplicationEventContext,
+    context_ptr: *mut ApplicationEventContext,
+    notification: WindowEventNotificationInner,
+  ) {
+    let window_id = window.id();
+
+    let windows = match context.application.windows() {
+      Ok(windows) => windows,
+      Err(err) => {
+        tracing::warn!(
+          "Keeping window {} after failed window query for PID {}: {}",
+          window_id.0,
+          context.application.pid,
+          err
+        );
+        return;
+      }
+    };
+
+    let live_window =
+      windows.into_iter().find(|window| window.id() == window_id);
+
+    let Some(live_window) = live_window else {
+      // Confirmed closed: the window query succeeded and the ID is gone.
+      context
+        .app_windows
+        .lock()
+        .unwrap()
+        .retain(|window| window.id() != window_id);
+
+      if let Err(err) = context.events_tx.send(WindowEvent::Destroyed {
+        window_id,
+        notification: crate::WindowEventNotification(Some(notification)),
+      }) {
+        tracing::warn!(
+          "Failed to send window event for PID {}: {}",
+          context.application.pid,
+          err
+        );
+      }
+
+      return;
+    };
+
+    match live_window.inner.element_clone() {
+      Ok(element) => {
+        Self::rebind_window_element(window, element, context, context_ptr);
+      }
+      Err(err) => tracing::warn!(
+        "Failed to clone element for window {}: {}",
+        window_id.0,
+        err
+      ),
+    }
+  }
+
+  /// Rebinds a tracked window to a new backing element and re-registers
+  /// its window notifications.
+  ///
+  /// The rebind is shared via the window's `Arc`, so the window
+  /// manager's copy updates too.
+  fn rebind_window_element(
+    window: &crate::NativeWindow,
+    element: CFRetained<AXUIElement>,
+    context: &ApplicationEventContext,
+    context_ptr: *mut ApplicationEventContext,
+  ) {
+    if let Err(err) = window.inner.set_element(element) {
+      tracing::warn!(
+        "Failed to rebind element for window {}: {}",
+        window.id().0,
+        err
+      );
+      return;
+    }
+
+    tracing::info!(
+      "Rebound element for window {} of PID {}.",
+      window.id().0,
+      context.application.pid
+    );
+
+    if let Err(err) = Self::register_window_notifications(
+      window,
+      &context.observer,
+      context_ptr,
+    ) {
+      tracing::warn!(
+        "Failed to re-register notifications for window {}: {}",
+        window.id().0,
         err
       );
     }

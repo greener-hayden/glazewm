@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -54,12 +54,8 @@ impl Application {
       let focused_window =
         el.get_attribute::<AXUIElement>("AXFocusedWindow");
 
-      focused_window.map(|window_el| {
-        let window_id = WindowId::from_window_element(&window_el);
-        let window_el =
-          ThreadBound::new(window_el, self.dispatcher.clone());
-        Some(NativeWindow::new(window_id, window_el, self.clone()).into())
-      })
+      focused_window
+        .map(|window_el| self.window_from_element(window_el))
     })?
   }
 
@@ -70,15 +66,27 @@ impl Application {
       windows.map(|windows| {
         windows
           .iter()
-          .map(|window_el| {
-            let window_id = WindowId::from_window_element(&window_el);
-            let window_el =
-              ThreadBound::new(window_el, self.dispatcher.clone());
-            NativeWindow::new(window_id, window_el, self.clone()).into()
-          })
+          .filter_map(|window_el| self.window_from_element(window_el))
           .collect()
       })
     })?
+  }
+
+  /// Creates a `NativeWindow` from a window accessibility element.
+  ///
+  /// Returns `None` if the element has no resolvable window ID — such
+  /// elements must not be tracked, since a fabricated `WindowId(0)` would
+  /// collide with every other unresolved element.
+  ///
+  /// Must be called on the event loop thread.
+  pub(crate) fn window_from_element(
+    &self,
+    element: CFRetained<AXUIElement>,
+  ) -> Option<crate::NativeWindow> {
+    let window_id = WindowId::from_window_element(&element)?;
+    let element =
+      ThreadBound::new(RefCell::new(element), self.dispatcher.clone());
+    Some(NativeWindow::new(window_id, element, self.clone()).into())
   }
 
   pub fn psn(&self) -> crate::Result<ffi::ProcessSerialNumber> {

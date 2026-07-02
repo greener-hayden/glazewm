@@ -5,6 +5,8 @@ use wm_common::{
   CursorJumpTrigger, DisplayState, HideCorner, HideMethod, UniqueExt,
   WindowState, WmEvent,
 };
+#[cfg(target_os = "macos")]
+use wm_platform::DispatcherExtMacOs;
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
@@ -32,6 +34,11 @@ pub fn platform_sync(
   if !state.pending_sync.containers_to_redraw().is_empty()
     || !state.pending_sync.workspaces_to_reorder().is_empty()
   {
+    // Suspend screen updates so the relayout commits in a single frame
+    // instead of cascading repaints. Re-enabled when the guard drops.
+    #[cfg(target_os = "macos")]
+    let _screen_updates = state.dispatcher.suspend_screen_updates();
+
     redraw_containers(&focused_container, state, config)?;
   }
 

@@ -84,6 +84,45 @@ pub trait DispatcherExtMacOs {
   ///
   /// This method is only available on macOS.
   fn has_ax_permission(&self, prompt: bool) -> bool;
+
+  /// Suspends screen updates on the process's main WindowServer
+  /// connection, batching all visual changes until the returned guard is
+  /// dropped.
+  ///
+  /// Used to commit a multi-window relayout in a single frame instead of
+  /// cascading repaints.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on macOS.
+  #[must_use]
+  fn suspend_screen_updates(&self) -> ScreenUpdateGuard;
+}
+
+/// Guard that re-enables screen updates when dropped.
+///
+/// Returned by [`DispatcherExtMacOs::suspend_screen_updates`]. Dropping
+/// re-enables updates even on early return or panic. As a safety net,
+/// WindowServer force re-enables updates itself if a connection keeps
+/// them disabled for longer than ~1 second.
+#[cfg(target_os = "macos")]
+pub struct ScreenUpdateGuard(());
+
+#[cfg(target_os = "macos")]
+impl Drop for ScreenUpdateGuard {
+  fn drop(&mut self) {
+    // SAFETY: `SLSReenableUpdate` is callable from any thread and only
+    // affects the calling process's own WindowServer connection.
+    let result = unsafe {
+      platform_impl::ffi::SLSReenableUpdate(
+        platform_impl::ffi::SLSMainConnectionID(),
+      )
+    };
+
+    if result != CGError::Success {
+      tracing::warn!("Failed to re-enable screen updates: {result:?}");
+    }
+  }
 }
 
 #[cfg(target_os = "macos")]
@@ -99,6 +138,22 @@ impl DispatcherExtMacOs for Dispatcher {
     );
 
     unsafe { AXIsProcessTrustedWithOptions(Some(options.as_ref())) }
+  }
+
+  fn suspend_screen_updates(&self) -> ScreenUpdateGuard {
+    // SAFETY: `SLSDisableUpdate` is callable from any thread and only
+    // affects the calling process's own WindowServer connection.
+    let result = unsafe {
+      platform_impl::ffi::SLSDisableUpdate(
+        platform_impl::ffi::SLSMainConnectionID(),
+      )
+    };
+
+    if result != CGError::Success {
+      tracing::warn!("Failed to suspend screen updates: {result:?}");
+    }
+
+    ScreenUpdateGuard(())
   }
 }
 

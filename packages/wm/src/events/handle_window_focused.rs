@@ -1,6 +1,6 @@
 use anyhow::Context;
 use tracing::info;
-use wm_common::{DisplayState, WindowRuleEvent, WmEvent};
+use wm_common::{DisplayState, HideMethod, WindowRuleEvent, WmEvent};
 use wm_platform::NativeWindow;
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
   models::WorkspaceTarget,
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
-  wm_state::WmState,
+  wm_state::{PendingFollow, WmState},
 };
 
 pub fn handle_window_focused(
@@ -59,6 +59,11 @@ pub fn handle_window_focused(
   if let Some(window) = found_window {
     let workspace = window.workspace().context("No workspace")?;
 
+    // Displayed focus means any deferred off-screen follow is stale.
+    if window.display_state() != DisplayState::Hidden {
+      state.cancel_pending_follow();
+    }
+
     // Native focus has been synced to the WM's focused container.
     if focused_container == window.clone().into() {
       state.is_focus_synced = true;
@@ -72,6 +77,21 @@ pub fn handle_window_focused(
     // if Discord is forcefully shown by the OS when it's on a hidden
     // workspace, switch focus to Discord's workspace.
     if window.display_state() == DisplayState::Hidden {
+      // Corner-parked macOS windows stay OS-focusable during close/open
+      // churn. Defer the follow so churn can cancel it; genuine
+      // force-shows survive the debounce.
+      if config.value.general.hide_method == HideMethod::PlaceInCorner {
+        info!("Deferring off-screen follow: {window}");
+
+        state.pending_follow = Some(PendingFollow {
+          window_id: window.id(),
+          requested_at: std::time::Instant::now(),
+        });
+
+        // Preserve WM focus until churn cancels or the follow commits.
+        return Ok(());
+      }
+
       info!("Focusing off-screen window: {window}");
 
       focus_workspace(

@@ -29,6 +29,9 @@ pub fn handle_window_minimized(
     if is_minimized && window.state() != WindowState::Minimized {
       info!("Window minimized: {window}");
 
+      // Minimize churn cancels deferred off-screen focus follows.
+      state.cancel_pending_follow();
+
       let window = update_window_state(
         window.clone(),
         WindowState::Minimized,

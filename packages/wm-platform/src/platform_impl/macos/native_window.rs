@@ -221,7 +221,7 @@ impl NativeWindow {
     }
 
     // Unreadable subroles are treated as the desktop.
-    let subrole = self.element.with(|el| {
+    let subrole = self.with_element(|el| {
       el.get_attribute::<CFString>("AXSubrole")
         .map(|subrole| subrole.to_string())
     })?;

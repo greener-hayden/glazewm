@@ -14,7 +14,7 @@ use crate::{
   platform_impl::{
     Application, NativeWindow, ProcessId, WindowEventNotificationInner,
   },
-  NativeWindowExtMacOs, ThreadBound, WindowEvent, WindowId,
+  Dispatcher, NativeWindowExtMacOs, ThreadBound, WindowEvent, WindowId,
 };
 
 /// Notifications to register for the `AXUIElement` of an application.
@@ -48,6 +48,13 @@ pub(crate) struct ApplicationObserver {
   events_tx: mpsc::UnboundedSender<WindowEvent>,
   _observer: CFRetained<AXObserver>,
   observer_source: CFRetained<CFRunLoopSource>,
+
+  /// Pointer to the [`ApplicationEventContext`] leaked via
+  /// `Box::into_raw` in [`ApplicationObserver::new`]. Reclaimed on drop.
+  context_ptr: *mut ApplicationEventContext,
+
+  /// Dispatcher for reclaiming `context_ptr` on the event-loop thread.
+  dispatcher: Dispatcher,
 }
 
 // TODO: Remove this.
@@ -144,6 +151,8 @@ impl ApplicationObserver {
       events_tx,
       _observer: observer,
       observer_source,
+      context_ptr: context,
+      dispatcher: app.dispatcher.clone(),
     })
   }
 
@@ -442,8 +451,59 @@ impl ApplicationObserver {
 
 impl Drop for ApplicationObserver {
   fn drop(&mut self) {
-    // Invalidate the runloop source. This is thread-safe and is OK to call
-    // after the run loop is stopped.
-    self.observer_source.invalidate();
+    // Invalidate the source and reclaim the context on the event-loop
+    // thread. The observer callback runs on that same thread, so this
+    // serializes with any in-flight callback — no callback can be
+    // executing while the context is freed.
+    //
+    // Ownership is moved into the closure as raw addresses (an extra
+    // retain on the source, plus the context box), since `CFRetained`
+    // and raw pointers are not `Send`. `dispatch_async` either runs the
+    // closure (now or later) or fails without ever enqueueing it — there
+    // is no ambiguous timeout state, unlike `dispatch_sync`.
+    let source_addr =
+      CFRetained::into_raw(self.observer_source.clone()).as_ptr() as usize;
+    let context_addr = self.context_ptr as usize;
+
+    let result = self.dispatcher.dispatch_async(move || {
+      // SAFETY: `source_addr` came from `CFRetained::into_raw` above;
+      // ownership of that retain is reconstructed exactly once here.
+      let source = unsafe {
+        CFRetained::from_raw(NonNull::new_unchecked(
+          source_addr as *mut CFRunLoopSource,
+        ))
+      };
+
+      // Invalidate the runloop source to stop further callbacks from
+      // being dispatched. Any callback already dispatched has completed,
+      // since this closure runs on the same thread.
+      source.invalidate();
+
+      // Reclaim the context box. Dropping it releases the retained
+      // `AXObserver` clone, which detaches the observer's notifications
+      // and runloop source.
+      // SAFETY: `context_addr` came from `Box::into_raw` in `new` and is
+      // reclaimed exactly once.
+      drop(unsafe {
+        Box::from_raw(context_addr as *mut ApplicationEventContext)
+      });
+    });
+
+    // The closure was never enqueued, which means the event loop has
+    // stopped and no callback can be running — safe to clean up on the
+    // current thread instead.
+    if result.is_err() {
+      // SAFETY: Reconstructs the retain and box that the unenqueued
+      // closure never consumed (its captures are plain integers).
+      let source = unsafe {
+        CFRetained::from_raw(NonNull::new_unchecked(
+          source_addr as *mut CFRunLoopSource,
+        ))
+      };
+      source.invalidate();
+
+      // SAFETY: See above; reclaimed exactly once.
+      drop(unsafe { Box::from_raw(self.context_ptr) });
+    }
   }
 }

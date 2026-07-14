@@ -1,4 +1,5 @@
 use std::{
+  cell::Cell,
   os::raw::c_void,
   ptr::NonNull,
   time::{Duration, Instant},
@@ -28,6 +29,13 @@ struct CallbackData {
 
   /// Timestamp of the last emitted `Move` event for throttling.
   last_move_emission: Option<Instant>,
+
+  /// Back-pointer to the tap's `CFMachPort`, used to re-enable the tap
+  /// after macOS disables it (e.g. by timeout).
+  ///
+  /// Written once in [`MouseListener::create_event_tap`] and only ever
+  /// read on the run-loop thread that created the tap.
+  tap_port: Cell<*const CFMachPort>,
 }
 
 impl CallbackData {
@@ -36,6 +44,7 @@ impl CallbackData {
       event_tx,
       pressed_buttons: PressedButtons::default(),
       last_move_emission: None,
+      tap_port: Cell::new(std::ptr::null()),
     }
   }
 }
@@ -185,6 +194,16 @@ impl MouseListener {
     current_loop
       .add_source(Some(&loop_source), unsafe { kCFRunLoopCommonModes });
 
+    // Publish the port so the callback can re-enable the tap if macOS
+    // disables it. Set before `tap_enable` so it's present the instant
+    // events can flow.
+    // SAFETY: `callback_data_ptr` points to a live, leaked
+    // `CallbackData`; the pointer stays valid until `terminate()`
+    // reclaims the box, which only runs after the tap is invalidated.
+    let data =
+      unsafe { &*(callback_data_ptr as *const CallbackData) };
+    data.tap_port.set(&raw const *tap_port);
+
     CGEvent::tap_enable(&tap_port, true);
 
     Ok(ThreadBound::new(tap_port, dispatcher.clone()))
@@ -237,6 +256,17 @@ impl MouseListener {
     }
 
     let data = unsafe { &mut *user_info.cast::<CallbackData>() };
+
+    // Re-enable the tap if macOS disabled it (e.g. due to a timeout from
+    // a stalled run loop). Must be handled before mapping the event kind,
+    // since tap-disabled events would otherwise be misread as `Move`.
+    if super::event_tap::reenable_if_tap_disabled(
+      cg_event_type,
+      data.tap_port.get(),
+      "Mouse",
+    ) {
+      return unsafe { cg_event.as_mut() };
+    }
 
     // Map a `CGEventType` to a `MouseEventKind`.
     let event_kind = match cg_event_type {

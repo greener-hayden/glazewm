@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::RefCell, sync::Arc};
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -55,9 +55,11 @@ impl Application {
         el.get_attribute::<AXUIElement>("AXFocusedWindow");
 
       focused_window.map(|window_el| {
-        let window_id = WindowId::from_window_element(&window_el);
-        let window_el =
-          ThreadBound::new(window_el, self.dispatcher.clone());
+        let window_id = WindowId::from_window_element(&window_el)?;
+        let window_el = ThreadBound::new(
+          RefCell::new(window_el),
+          self.dispatcher.clone(),
+        );
         Some(NativeWindow::new(window_id, window_el, self.clone()).into())
       })
     })?
@@ -70,11 +72,15 @@ impl Application {
       windows.map(|windows| {
         windows
           .iter()
-          .map(|window_el| {
-            let window_id = WindowId::from_window_element(&window_el);
-            let window_el =
-              ThreadBound::new(window_el, self.dispatcher.clone());
-            NativeWindow::new(window_id, window_el, self.clone()).into()
+          .filter_map(|window_el| {
+            let window_id = WindowId::from_window_element(&window_el)?;
+            let window_el = ThreadBound::new(
+              RefCell::new(window_el),
+              self.dispatcher.clone(),
+            );
+            Some(
+              NativeWindow::new(window_id, window_el, self.clone()).into(),
+            )
           })
           .collect()
       })
@@ -140,14 +146,37 @@ impl Application {
   }
 
   /// Whether the application should be observed.
+  ///
+  /// Filtered apps are observed only if they already expose an
+  /// `AXStandardWindow`.
+  ///
+  /// This handles apps like Windows App while still missing filtered apps
+  /// that create their first standard window later.
   pub(crate) fn should_observe(&self) -> bool {
-    if self.activation_policy()
+    let is_filtered = self.activation_policy()
       == NSApplicationActivationPolicy::Prohibited
-    {
-      return false;
+      || self.is_xpc().unwrap_or(false);
+
+    if !is_filtered {
+      return true;
     }
 
-    !self.is_xpc().unwrap_or(false)
+    self.has_standard_window()
+  }
+
+  /// Whether the application currently exposes a standard window.
+  ///
+  /// Returns `false` if windows cannot be enumerated.
+  fn has_standard_window(&self) -> bool {
+    use crate::NativeWindowExtMacOs;
+
+    self.windows().is_ok_and(|windows| {
+      windows.iter().any(|window| {
+        window
+          .subrole()
+          .is_ok_and(|subrole| subrole == "AXStandardWindow")
+      })
+    })
   }
 
   pub(crate) fn is_hidden(&self) -> bool {

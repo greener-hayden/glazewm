@@ -1,4 +1,5 @@
 use std::{
+  cell::RefCell,
   ptr::NonNull,
   sync::{Arc, Mutex},
 };
@@ -55,12 +56,14 @@ unsafe impl Send for ApplicationObserver {}
 impl ApplicationObserver {
   /// Creates a new `ApplicationObserver` for the given application.
   ///
-  /// If `is_startup` is `true`, the observer will not emit
-  /// `WindowEvent::Shown` for windows already running on startup.
+  /// Registers notifications and emits `WindowEvent::Shown` for existing
+  /// windows.
+  ///
+  /// Window enumeration failure is tolerated so future windows are still
+  /// observed.
   pub fn new(
     app: &Application,
     events_tx: mpsc::UnboundedSender<WindowEvent>,
-    is_startup: bool,
   ) -> crate::Result<Self> {
     let observer = unsafe {
       let mut observer = std::ptr::null_mut();
@@ -85,7 +88,8 @@ impl ApplicationObserver {
       })?)
     };
 
-    let app_windows = Arc::new(Mutex::new(app.windows()?));
+    // Seed after notification registration to avoid startup races.
+    let app_windows = Arc::new(Mutex::new(Vec::new()));
     let context = Box::into_raw(Box::new(ApplicationEventContext {
       application: app.clone(),
       events_tx: events_tx.clone(),
@@ -105,8 +109,11 @@ impl ApplicationObserver {
     // TODO: Remove from runloop if registration fails.
     Self::register_app_notifications(app, &observer, context)?;
 
-    // Emit `WindowEvent::Shown` for all existing windows.
-    for window in app_windows.lock().unwrap().iter() {
+    // Re-scan after app-level notifications are registered.
+    let windows = app.windows().unwrap_or_default();
+
+    // `Shown` is idempotent and adopts windows missed during startup.
+    for window in &windows {
       if let Err(err) =
         Self::register_window_notifications(window, &observer, context)
       {
@@ -117,21 +124,19 @@ impl ApplicationObserver {
         );
       }
 
-      // Don't emit `WindowEvent::Shown` for windows that are already
-      // running on startup.
-      if !is_startup {
-        if let Err(err) = events_tx.send(WindowEvent::Shown {
-          window: window.clone(),
-          notification: crate::WindowEventNotification(None),
-        }) {
-          tracing::warn!(
-            "Failed to send window event for PID {}: {}",
-            app.pid,
-            err
-          );
-        }
+      if let Err(err) = events_tx.send(WindowEvent::Shown {
+        window: window.clone(),
+        notification: crate::WindowEventNotification(None),
+      }) {
+        tracing::warn!(
+          "Failed to send window event for PID {}: {}",
+          app.pid,
+          err
+        );
       }
     }
+
+    *app_windows.lock().unwrap() = windows;
 
     Ok(Self {
       pid: app.pid,
@@ -173,11 +178,14 @@ impl ApplicationObserver {
     observer: &CFRetained<AXObserver>,
     context: *mut ApplicationEventContext,
   ) -> crate::Result<()> {
+    let element_cell = window.ax_ui_element().get_ref()?;
+    let element = element_cell.borrow();
+
     for notification in AX_WINDOW_NOTIFICATIONS {
       unsafe {
         let notification_cfstr = CFString::from_static_str(notification);
         let result = observer.add_notification(
-          window.ax_ui_element().get_ref()?,
+          &element,
           &notification_cfstr,
           context.cast::<std::ffi::c_void>(),
         );
@@ -272,29 +280,72 @@ impl ApplicationObserver {
 
       app_windows
         .iter()
-        .find(|window| {
-          window.ax_ui_element().get_ref().ok() == Some(&ax_element)
-        })
+        .find(|window| window.inner.matches_element(&ax_element))
         .cloned()
     };
 
     if notification.name.as_str() == "AXUIElementDestroyed" {
       if let Some(window) = &found_window {
-        context
-          .app_windows
-          .lock()
-          .unwrap()
-          .retain(|w| w.id() != window.id());
+        // Some apps swap the `AXUIElement` backing a live window. Confirm
+        // the stable `WindowId` is gone before emitting `Destroyed`.
+        let live_element = match context.application.windows() {
+          Ok(windows) => windows
+            .into_iter()
+            .find(|w| w.id() == window.id())
+            .and_then(|w| w.inner.element_clone().ok()),
+          Err(err) => {
+            tracing::warn!(
+              "Failed to re-query windows for PID {}: {}",
+              context.application.pid,
+              err
+            );
+            return;
+          }
+        };
 
-        if let Err(err) = context.events_tx.send(WindowEvent::Destroyed {
-          window_id: window.id(),
-          notification: crate::WindowEventNotification(Some(notification)),
-        }) {
-          tracing::warn!(
-            "Failed to send window event for PID {}: {}",
-            context.application.pid,
-            err
-          );
+        if let Some(live_element) = live_element {
+          // Rebind the shared element and keep observing the live window.
+          if let Err(err) = window.inner.set_element(live_element) {
+            tracing::warn!(
+              "Failed to refresh window element for PID {}: {}",
+              context.application.pid,
+              err
+            );
+            return;
+          }
+
+          if let Err(err) = Self::register_window_notifications(
+            window,
+            &context.observer.clone(),
+            context,
+          ) {
+            tracing::warn!(
+              "Failed to register refreshed window notifications for PID {}: {}",
+              context.application.pid,
+              err
+            );
+          }
+        } else {
+          context
+            .app_windows
+            .lock()
+            .unwrap()
+            .retain(|w| w.id() != window.id());
+
+          if let Err(err) =
+            context.events_tx.send(WindowEvent::Destroyed {
+              window_id: window.id(),
+              notification: crate::WindowEventNotification(Some(
+                notification,
+              )),
+            })
+          {
+            tracing::warn!(
+              "Failed to send window event for PID {}: {}",
+              context.application.pid,
+              err
+            );
+          }
         }
       }
 
@@ -302,23 +353,35 @@ impl ApplicationObserver {
     }
 
     let is_new_window = found_window.is_none();
-    let window = found_window.unwrap_or_else(|| {
-      let window_id = WindowId::from_window_element(&ax_element);
+    let window = if let Some(window) = found_window {
+      window
+    } else {
+      // Ignore unresolved elements; `WindowId(0)` would collide.
+      let Some(window_id) = WindowId::from_window_element(&ax_element)
+      else {
+        return;
+      };
       let ax_element = ThreadBound::new(
-        ax_element,
+        RefCell::new(ax_element),
         context.application.dispatcher.clone(),
       );
       NativeWindow::new(window_id, ax_element, context.application.clone())
         .into()
-    });
+    };
 
     if is_new_window {
       context.app_windows.lock().unwrap().push(window.clone());
-      let _ = Self::register_window_notifications(
+      if let Err(err) = Self::register_window_notifications(
         &window,
         &context.observer.clone(),
         context,
-      );
+      ) {
+        tracing::warn!(
+          "Failed to register window notifications for PID {}: {}",
+          context.application.pid,
+          err
+        );
+      }
 
       if let Err(err) = context.events_tx.send(WindowEvent::Shown {
         window: window.clone(),

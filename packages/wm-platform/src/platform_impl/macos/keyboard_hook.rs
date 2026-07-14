@@ -1,4 +1,4 @@
-use std::{os::raw::c_void, ptr::NonNull};
+use std::{cell::Cell, os::raw::c_void, ptr::NonNull};
 
 use objc2_core_foundation::{
   kCFRunLoopCommonModes, CFMachPort, CFRetained, CFRunLoop,
@@ -62,6 +62,13 @@ impl KeyEvent {
 /// Data shared with the `CGEventTap` callback.
 struct CallbackData {
   callback: Box<dyn Fn(KeyEvent) -> bool + Send + Sync + 'static>,
+
+  /// Back-pointer to the tap's `CFMachPort`, used to re-enable the tap
+  /// after macOS disables it (e.g. by timeout).
+  ///
+  /// Written once in [`KeyboardHook::create_event_tap`] and only ever
+  /// read on the run-loop thread that created the tap.
+  tap_port: Cell<*const CFMachPort>,
 }
 
 /// A system-wide low-level keyboard hook.
@@ -89,6 +96,7 @@ impl KeyboardHook {
     let callback_ptr = {
       let data = Box::new(CallbackData {
         callback: Box::new(callback),
+        tap_port: Cell::new(std::ptr::null()),
       });
       Box::into_raw(data) as usize
     };
@@ -164,6 +172,15 @@ impl KeyboardHook {
     current_loop
       .add_source(Some(&loop_source), unsafe { kCFRunLoopCommonModes });
 
+    // Publish the port so the callback can re-enable the tap if macOS
+    // disables it. Set before `tap_enable` so it's present the instant
+    // events can flow.
+    // SAFETY: `callback_ptr` points to a live, leaked `CallbackData`; the
+    // pointer stays valid until `terminate()` reclaims the box, which
+    // only runs after the tap is invalidated.
+    let data = unsafe { &*(callback_ptr as *const CallbackData) };
+    data.tap_port.set(&raw const *tap_port);
+
     CGEvent::tap_enable(&tap_port, true);
 
     Ok(ThreadBound::new(tap_port, dispatcher.clone()))
@@ -180,6 +197,21 @@ impl KeyboardHook {
   ) -> *mut CGEvent {
     if user_info.is_null() {
       tracing::error!("Null pointer passed to keyboard event callback.");
+      return unsafe { event.as_mut() };
+    }
+
+    // SAFETY: `user_info` points to the live `CallbackData` leaked in
+    // `KeyboardHook::new`; it's reclaimed only after tap invalidation.
+    let data = unsafe { &*(user_info as *const CallbackData) };
+
+    // Re-enable the tap if macOS disabled it (e.g. due to a timeout from
+    // a stalled run loop). Must be handled before extracting the key
+    // code, since tap-disabled events carry no keyboard payload.
+    if super::event_tap::reenable_if_tap_disabled(
+      event_type,
+      data.tap_port.get(),
+      "Keyboard",
+    ) {
       return unsafe { event.as_mut() };
     }
 
@@ -204,8 +236,7 @@ impl KeyboardHook {
       event_flags,
     };
 
-    // Get callback from user data and invoke it.
-    let data = unsafe { &*(user_info as *const CallbackData) };
+    // Invoke the user-provided callback.
     let should_intercept = (data.callback)(key_event);
 
     if should_intercept {

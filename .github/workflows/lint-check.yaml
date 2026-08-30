@@ -70,5 +70,10 @@ jobs:
         with:
           shared-key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
+      # `--test-threads=1` is required, not a preference: wm-platform's
+      # harness runs its tests on the main thread because macOS UI APIs
+      # demand it, and returns NotMainThread otherwise. See its src/test.rs.
       - name: Run tests
-        run: cargo test --workspace --all-features ${{ matrix.exclusions }}
+        run: >-
+          cargo test --workspace --all-features ${{ matrix.exclusions }}
+          -- --test-threads=1

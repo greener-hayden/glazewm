@@ -59,7 +59,8 @@ impl NativeWindow {
     R: Send,
   {
     self.element.with(|cell| {
-      let element = cell.try_borrow().map_err(|_| element_borrow_error())?;
+      let element =
+        cell.try_borrow().map_err(|_| element_borrow_error())?;
       Ok(f(&element))
     })?
   }

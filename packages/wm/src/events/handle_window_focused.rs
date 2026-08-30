@@ -11,7 +11,7 @@ use crate::{
   models::WorkspaceTarget,
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
-  wm_state::{PendingFollow, WmState},
+  wm_state::WmState,
 };
 
 pub fn handle_window_focused(

@@ -10,9 +10,9 @@ use windows::Win32::{
   },
 };
 
-use crate::{platform_impl, Rect};
 #[cfg(target_os = "macos")]
 use crate::platform_impl::AXUIElementExt;
+use crate::{platform_impl, Rect};
 #[cfg(target_os = "windows")]
 use crate::{Color, CornerStyle, Delta, OpacityValue, RectDelta};
 

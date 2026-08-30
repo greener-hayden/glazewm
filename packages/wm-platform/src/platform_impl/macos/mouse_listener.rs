@@ -200,8 +200,7 @@ impl MouseListener {
     // SAFETY: `callback_data_ptr` points to a live, leaked
     // `CallbackData`; the pointer stays valid until `terminate()`
     // reclaims the box, which only runs after the tap is invalidated.
-    let data =
-      unsafe { &*(callback_data_ptr as *const CallbackData) };
+    let data = unsafe { &*(callback_data_ptr as *const CallbackData) };
     data.tap_port.set(&raw const *tap_port);
 
     CGEvent::tap_enable(&tap_port, true);

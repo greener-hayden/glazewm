@@ -1,3 +1,23 @@
+<fork_notice>
+
+This is `greener-hayden/glazewm`, a **permanent personal fork**. Nothing here is
+contributed upstream. Do not open PRs against `glzr-io/glazewm`, do not shape
+work for PR-ability, and do not treat upstream structure or file ownership as a
+constraint. Upstream files may be edited freely, this one included.
+`CONTRIBUTING.md` is upstream's and does not apply.
+
+- Work lands directly on `dogfood/all`. The `feat/*` and `fix/*` topic branches
+  and the open draft PRs are history, not work in flight.
+- `upstream` is a remote to pull from, never to push to. Resolve conflicts in
+  favour of local behaviour.
+- macOS and Windows must both build. `.github/workflows/lint-check.yaml` runs on
+  every push and compile-checks both, so CI is the gate, not your local box.
+- The quality bar below still holds, but "low quality code **will be rejected**"
+  is upstream's framing — there is no reviewer. The consequence of missing the
+  bar is a window manager that misbehaves on the desktop you are using now.
+
+</fork_notice>
+
 <project_overview>
 GlazeWM is a window manager for macOS and Windows, written in Rust.
 

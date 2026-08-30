@@ -8,8 +8,12 @@ constraint. Upstream files may be edited freely, this one included.
 
 - Work lands directly on `dogfood/all`. The `feat/*` and `fix/*` topic branches
   and the open draft PRs are history, not work in flight.
-- `upstream` is a remote to pull from, never to push to. Resolve conflicts in
-  favour of local behaviour.
+- `upstream` is a remote to pull from, never to push to; its push URL is set to
+  `no_push`. Resolve conflicts in favour of local behaviour.
+- Nothing here may affect upstream or any repo we do not own. The winget release
+  workflow was deleted because it published to the public `microsoft/winget-pkgs`
+  under upstream's `glzr-io.glazewm` identifier on every published release. Do
+  not add anything that writes outside this fork.
 - macOS and Windows must both build. `.github/workflows/lint-check.yaml` runs on
   every push and compile-checks both, so CI is the gate, not your local box.
 - The quality bar below still holds, but "low quality code **will be rejected**"

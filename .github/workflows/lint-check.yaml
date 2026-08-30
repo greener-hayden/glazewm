@@ -20,6 +20,7 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -47,24 +48,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # MacOS (Apple Silicon). `wm-watcher` is Windows-only and its
-          # build script panics elsewhere, so `--workspace` must skip it.
+          # MacOS (Apple Silicon). Two crates are skipped, for different
+          # reasons.
           #
-          # `--test-threads=1` keeps wm-platform's tests on the main
-          # thread, which macOS UI APIs require; without it they fail with
-          # `NotMainThread`. See that crate's `src/test.rs`.
+          # `wm-watcher` is Windows-only and its build script panics
+          # elsewhere by design, so `--workspace` has to leave it out.
+          #
+          # `wm-platform`'s own test binary needs a real desktop session.
+          # Run in parallel its event-loop and display tests fail with
+          # `NotMainThread`, because macOS demands the main thread for
+          # those APIs. Run serially with `--test-threads=1`, which is
+          # what its `src/test.rs` asks for, `event_loop.run()` never
+          # returns on a headless runner and the job hangs until killed.
+          # Its compile coverage comes from clippy above, which does run
+          # on macOS; the tests themselves are only meaningful on a real
+          # desktop.
           - platform: macos-latest
             target: aarch64-apple-darwin
-            test-args: --exclude wm-watcher -- --test-threads=1
-          # Windows (x64). Deliberately left parallel: the main-thread
-          # requirement above is macOS-only, and serializing here instead
-          # shares one thread message queue across every test, so the
+            test-args: --exclude wm-watcher --exclude wm-platform
+          # Windows (x64) runs everything, in parallel. The main-thread
+          # requirement is macOS-only, and serializing here would instead
+          # share one thread message queue across every test, so the
           # dispatcher tests observe each other's leftover messages.
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             test-args: ''
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

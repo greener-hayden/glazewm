@@ -1,7 +1,4 @@
 #[cfg(target_os = "macos")]
-use std::cell::RefCell;
-
-#[cfg(target_os = "macos")]
 use objc2_application_services::{AXError, AXUIElement};
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFBoolean, CFRetained, CFString};
@@ -15,7 +12,7 @@ use windows::Win32::{
 
 use crate::{platform_impl, Rect};
 #[cfg(target_os = "macos")]
-use crate::{platform_impl::AXUIElementExt, ThreadBound};
+use crate::platform_impl::AXUIElementExt;
 #[cfg(target_os = "windows")]
 use crate::{Color, CornerStyle, Delta, OpacityValue, RectDelta};
 
@@ -69,15 +66,6 @@ pub enum WindowZOrder {
 /// macOS-specific extension trait for [`NativeWindow`].
 #[cfg(target_os = "macos")]
 pub trait NativeWindowExtMacOs {
-  /// Gets the `AXUIElement` instance for this window.
-  ///
-  /// # Platform-specific
-  ///
-  /// This method is only available on macOS.
-  fn ax_ui_element(
-    &self,
-  ) -> &ThreadBound<RefCell<CFRetained<AXUIElement>>>;
-
   /// Gets the bundle ID of the application that owns the window.
   ///
   /// # Platform-specific
@@ -116,12 +104,6 @@ pub trait NativeWindowExtMacOs {
 
 #[cfg(target_os = "macos")]
 impl NativeWindowExtMacOs for NativeWindow {
-  fn ax_ui_element(
-    &self,
-  ) -> &ThreadBound<RefCell<CFRetained<AXUIElement>>> {
-    &self.inner.element
-  }
-
   fn bundle_id(&self) -> Option<String> {
     self.inner.application.bundle_id()
   }

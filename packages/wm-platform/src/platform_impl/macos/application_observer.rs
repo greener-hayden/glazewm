@@ -187,8 +187,7 @@ impl ApplicationObserver {
     observer: &CFRetained<AXObserver>,
     context: *mut ApplicationEventContext,
   ) -> crate::Result<()> {
-    let element_cell = window.ax_ui_element().get_ref()?;
-    let element = element_cell.borrow();
+    let element = window.inner.element_clone()?;
 
     for notification in AX_WINDOW_NOTIFICATIONS {
       unsafe {
@@ -199,7 +198,12 @@ impl ApplicationObserver {
           context.cast::<std::ffi::c_void>(),
         );
 
-        if result != AXError::Success {
+        // The element may already be registered (e.g. when rebinding a
+        // window to an element that was previously observed). Treat this
+        // as success so the remaining notifications still register.
+        if result != AXError::Success
+          && result != AXError::NotificationAlreadyRegistered
+        {
           return Err(crate::Error::Platform(format!(
             "Failed to add notification {} for window {}: {:?}",
             notification,
@@ -361,7 +365,7 @@ impl ApplicationObserver {
       return;
     }
 
-    let is_new_window = found_window.is_none();
+    let mut is_new_window = found_window.is_none();
     let window = if let Some(window) = found_window {
       window
     } else {
@@ -370,12 +374,58 @@ impl ApplicationObserver {
       else {
         return;
       };
-      let ax_element = ThreadBound::new(
-        RefCell::new(ax_element),
-        context.application.dispatcher.clone(),
-      );
-      NativeWindow::new(window_id, ax_element, context.application.clone())
+
+      // Windows are found by element identity, so a swapped element whose
+      // new element notifies before the old one's destroy looks untracked.
+      // Rebind in place rather than tracking a duplicate `WindowId`.
+      let tracked_window = {
+        let app_windows = context.app_windows.lock().unwrap();
+
+        app_windows
+          .iter()
+          .find(|window| window.id() == window_id)
+          .cloned()
+      };
+
+      if let Some(window) = tracked_window {
+        is_new_window = false;
+
+        if let Err(err) = window.inner.set_element(ax_element) {
+          tracing::warn!(
+            "Failed to rebind window element for PID {}: {}",
+            context.application.pid,
+            err
+          );
+
+          return;
+        }
+
+        if let Err(err) = Self::register_window_notifications(
+          &window,
+          &context.observer.clone(),
+          context,
+        ) {
+          tracing::warn!(
+            "Failed to register rebound window notifications for PID {}: {}",
+            context.application.pid,
+            err
+          );
+        }
+
+        window
+      } else {
+        let ax_element = ThreadBound::new(
+          RefCell::new(ax_element),
+          context.application.dispatcher.clone(),
+        );
+
+        NativeWindow::new(
+          window_id,
+          ax_element,
+          context.application.clone(),
+        )
         .into()
+      }
     };
 
     if is_new_window {

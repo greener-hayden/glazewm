@@ -14,7 +14,7 @@ use crate::{
   platform_impl::{
     Application, NativeWindow, ProcessId, WindowEventNotificationInner,
   },
-  Dispatcher, NativeWindowExtMacOs, ThreadBound, WindowEvent, WindowId,
+  Dispatcher, ThreadBound, WindowEvent, WindowId,
 };
 
 /// Notifications to register for the `AXUIElement` of an application.

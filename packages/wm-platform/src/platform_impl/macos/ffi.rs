@@ -64,7 +64,7 @@ unsafe extern "C" {
   ) -> AXError;
 }
 
-/// ID of a process's connection to WindowServer.
+/// ID of a process's connection to `WindowServer`.
 pub(crate) type SLSConnectionID = i32;
 
 #[link(name = "SkyLight", kind = "framework")]
@@ -81,13 +81,13 @@ unsafe extern "C" {
   ) -> CGError;
 
   /// Returns the ID of the calling process's main connection to
-  /// WindowServer.
+  /// `WindowServer`.
   pub(crate) fn SLSMainConnectionID() -> SLSConnectionID;
 
   /// Disables screen updates for changes made on the given connection,
   /// batching them until `SLSReenableUpdate` is called.
   ///
-  /// WindowServer force re-enables updates after ~1 second if left
+  /// `WindowServer` force re-enables updates after ~1 second if left
   /// disabled.
   pub(crate) fn SLSDisableUpdate(cid: SLSConnectionID) -> CGError;
 

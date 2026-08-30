@@ -85,7 +85,7 @@ pub trait DispatcherExtMacOs {
   /// This method is only available on macOS.
   fn has_ax_permission(&self, prompt: bool) -> bool;
 
-  /// Suspends screen updates on the process's main WindowServer
+  /// Suspends screen updates on the process's main `WindowServer`
   /// connection, batching all visual changes until the returned guard is
   /// dropped.
   ///
@@ -103,7 +103,7 @@ pub trait DispatcherExtMacOs {
 ///
 /// Returned by [`DispatcherExtMacOs::suspend_screen_updates`]. Dropping
 /// re-enables updates even on early return or panic. As a safety net,
-/// WindowServer force re-enables updates itself if a connection keeps
+/// `WindowServer` force re-enables updates itself if a connection keeps
 /// them disabled for longer than ~1 second.
 #[cfg(target_os = "macos")]
 pub struct ScreenUpdateGuard(());

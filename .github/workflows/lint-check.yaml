@@ -49,13 +49,20 @@ jobs:
         include:
           # MacOS (Apple Silicon). `wm-watcher` is Windows-only and its
           # build script panics elsewhere, so `--workspace` must skip it.
+          #
+          # `--test-threads=1` keeps wm-platform's tests on the main
+          # thread, which macOS UI APIs require; without it they fail with
+          # `NotMainThread`. See that crate's `src/test.rs`.
           - platform: macos-latest
             target: aarch64-apple-darwin
-            exclusions: --exclude wm-watcher
-          # Windows (x64)
+            test-args: --exclude wm-watcher -- --test-threads=1
+          # Windows (x64). Deliberately left parallel: the main-thread
+          # requirement above is macOS-only, and serializing here instead
+          # shares one thread message queue across every test, so the
+          # dispatcher tests observe each other's leftover messages.
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            exclusions: ''
+            test-args: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -74,11 +81,5 @@ jobs:
       # wm-platform's `test_utils`, which dev-dependencies already enable,
       # and wm's `ui_access`, which stamps uiAccess=true into the manifest
       # so the binary refuses to launch unelevated (os error 740).
-      #
-      # `--test-threads=1` is required, not a preference: wm-platform's
-      # harness runs its tests on the main thread because macOS UI APIs
-      # demand it, and returns NotMainThread otherwise. See its src/test.rs.
       - name: Run tests
-        run: >-
-          cargo test --workspace ${{ matrix.exclusions }}
-          -- --test-threads=1
+        run: cargo test --workspace ${{ matrix.test-args }}

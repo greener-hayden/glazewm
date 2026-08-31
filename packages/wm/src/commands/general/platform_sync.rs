@@ -14,6 +14,7 @@ use wm_platform::{CornerStyle, OpacityValue};
 use wm_platform::{Rect, WindowZOrder};
 
 use crate::{
+  animation_manager::AnimationTrigger,
   models::{Container, WindowContainer},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
@@ -287,14 +288,58 @@ fn redraw_containers(
       },
     );
 
+    let target_rect = window.to_rect()?;
+
     let is_visible = matches!(
       window.display_state(),
       DisplayState::Showing | DisplayState::Shown
     );
 
-    if let Err(err) =
-      reposition_window(window, *hide_corner, &z_order, is_visible, config)
-    {
+    // Determine the animation effect to apply, if any.
+    let animation_effect = if state.pending_sync.should_skip_animations() {
+      None
+    } else {
+      let animation_trigger = if is_visible
+        && state.pending_sync.open_animation_windows().contains(window)
+      {
+        AnimationTrigger::WindowOpened
+      } else {
+        AnimationTrigger::WindowMoved
+      };
+
+      state.animation_manager.animation_effect_for_window(
+        window,
+        animation_trigger,
+        &target_rect,
+        &monitor.native_properties(),
+        config,
+      )
+    };
+
+    if let Some(effect_config) = animation_effect {
+      if let Err(err) = state.animation_manager.start_animation(
+        window,
+        effect_config,
+        target_rect.clone(),
+        &monitor.native_properties(),
+        &state.dispatcher,
+      ) {
+        tracing::warn!("Failed to start animation: {}", err);
+      }
+    }
+
+    tracing::debug!("Updating window position: {window}");
+
+    // Hide the real window when an animation layer is active.
+    if let Err(err) = reposition_window(
+      window,
+      &target_rect,
+      *hide_corner,
+      &z_order,
+      animation_effect.is_some(),
+      is_visible,
+      config,
+    ) {
       tracing::warn!("Failed to set window position: {}", err);
     }
 
@@ -344,21 +389,22 @@ fn redraw_containers(
 
 fn reposition_window(
   window: &WindowContainer,
+  rect: &Rect,
   hide_corner: HideCorner,
   // LINT: `z_order` is only used on Windows.
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   z_order: &WindowZOrder,
+  is_animation_start: bool,
   is_visible: bool,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  let rect = window
-    .to_rect()?
-    .apply_delta(&window.total_border_delta()?, None);
+  let rect = rect.apply_delta(&window.total_border_delta()?, None);
 
-  // For `HideMethod::PlaceInCorner`, we need to reposition hidden windows
-  // to the corner of the monitor.
-  if config.value.general.hide_method == HideMethod::PlaceInCorner
-    && !is_visible
+  // For animations on macOS and `HideMethod::PlaceInCorner`, we need to
+  // hide windows by repositioning them in the corner of the monitor.
+  if (cfg!(target_os = "macos") && is_animation_start)
+    || (config.value.general.hide_method == HideMethod::PlaceInCorner
+      && !is_visible)
   {
     const VISIBLE_SLIVER: i32 = 1;
 
@@ -465,10 +511,20 @@ fn reposition_window(
       }
 
       // Set visibility based on the hide method.
-      if config.value.general.hide_method == HideMethod::Cloak {
+      if is_animation_start {
+        window
+          .native()
+          .set_transparency(&OpacityValue::from_alpha(0))?;
+      } else if config.value.general.hide_method == HideMethod::Cloak {
         window.native().set_cloaked(!is_visible)?;
+        window
+          .native()
+          .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
       } else if is_visible {
         window.native().show()?;
+        window
+          .native()
+          .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
       } else {
         window.native().hide()?;
       }

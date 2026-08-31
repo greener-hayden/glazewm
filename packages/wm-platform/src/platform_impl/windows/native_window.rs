@@ -663,6 +663,7 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindowWindowsExt::set_transparency`].
+  #[allow(clippy::trivially_copy_pass_by_ref)]
   pub(crate) fn set_transparency(
     &self,
     opacity_value: &OpacityValue,

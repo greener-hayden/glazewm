@@ -1,6 +1,7 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, FullscreenStateConfig, TilingDirection, WindowState,
+  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
+  WindowState,
 };
 use wm_platform::{LengthValue, Point, Rect};
 
@@ -130,16 +131,36 @@ pub fn handle_window_moved_or_resized_end(
         state,
       )?;
 
-      window.set_active_drag(None);
+      let is_edge_resize = {
+        let is_resize = window.active_drag().is_some_and(|drag| {
+          matches!(drag.operation, Some(ActiveDragOperation::Resize))
+        });
 
-      // Force a redraw of the window to snap it back to its original
-      // position. This is necessary when:
-      // - The window is the only tiling window in the workspace.
-      // - The window is not past the movement threshold for transitioning
-      //   to floating while being dragged.
-      // - Resizing in a direction that doesn't change the window's tiling
-      //   size.
-      state.pending_sync.queue_container_to_redraw(window.clone());
+        let is_edge_child =
+          !window.prev_siblings().any(|s| s.is_tiling_window())
+            || !window.next_siblings().any(|s| s.is_tiling_window());
+
+        is_resize && is_edge_child
+      };
+
+      // Tiling windows that are first or last children are already at
+      // their correct position after a manual resize.
+      if is_edge_resize {
+        state
+          .pending_sync
+          .dequeue_container_from_redraw(window.clone());
+      } else {
+        // Force a redraw of the window to snap it back to its original
+        // position. This is necessary when:
+        // - The window is the only tiling window in the workspace.
+        // - The window is not past the movement threshold for
+        //   transitioning to floating while being dragged.
+        // - Resizing in a direction that doesn't change the window's
+        //   tiling size.
+        state.pending_sync.queue_container_to_redraw(window.clone());
+      }
+
+      window.set_active_drag(None);
     }
   }
 

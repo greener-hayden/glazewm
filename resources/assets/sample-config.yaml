@@ -54,6 +54,17 @@ gaps:
     bottom: '20px'
     left: '20px'
 
+# *Experimental* animation support!
+# Uncomment to enable window move/open animations.
+animations:
+  # window_move:
+  #   duration_ms: 180
+  #   easing: 'ease_in_out'
+  #   trigger_threshold: '10px'
+  # window_open:
+  #   duration_ms: 180
+  #   easing: 'ease_out'
+
 window_effects:
   # Visual effects to apply to the focused window.
   focused_window:

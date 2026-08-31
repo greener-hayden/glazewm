@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct OpacityValue(pub f32);
 
 impl OpacityValue {
@@ -16,6 +16,17 @@ impl OpacityValue {
   #[must_use]
   pub fn from_alpha(alpha: u8) -> Self {
     Self(f32::from(alpha) / 255.0)
+  }
+
+  /// Interpolates between this and another [`OpacityValue`].
+  ///
+  /// `progress` should be a value between 0.0 (this opacity) and 1.0
+  /// (other opacity).
+  #[must_use]
+  pub fn interpolate(&self, other: &OpacityValue, progress: f32) -> Self {
+    let opacity = self.0 + (other.0 - self.0) * progress;
+
+    Self(opacity.clamp(0.0, 1.0))
   }
 }
 

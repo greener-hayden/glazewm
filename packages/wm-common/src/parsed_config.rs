@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use wm_platform::{
-  Color, CornerStyle, Key, Keybinding, LengthValue, OpacityValue,
-  RectDelta,
+  Color, CornerStyle, EasingFunction, Key, Keybinding, LengthValue,
+  OpacityValue, RectDelta,
 };
 
 use crate::app_command::InvokeCommand;
@@ -9,6 +9,7 @@ use crate::app_command::InvokeCommand;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all(serialize = "camelCase"))]
 pub struct ParsedConfig {
+  pub animations: AnimationsConfig,
   pub binding_modes: Vec<BindingModeConfig>,
   pub gaps: GapsConfig,
   pub general: GeneralConfig,
@@ -387,6 +388,58 @@ pub struct WorkspaceConfig {
 
   #[serde(default = "default_bool::<false>")]
   pub keep_alive: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, rename_all(serialize = "camelCase"))]
+pub struct AnimationsConfig {
+  pub window_move: Option<WindowMoveAnimationConfig>,
+  pub window_open: Option<AnimationEffectConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all(serialize = "camelCase"))]
+pub struct WindowMoveAnimationConfig {
+  /// Minimum distance to trigger movement animations.
+  pub trigger_threshold: LengthValue,
+
+  #[serde(flatten)]
+  pub effect: AnimationEffectConfig,
+}
+
+impl Default for WindowMoveAnimationConfig {
+  fn default() -> Self {
+    WindowMoveAnimationConfig {
+      trigger_threshold: LengthValue::from_px(10),
+      effect: AnimationEffectConfig::default(),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, rename_all(serialize = "camelCase"))]
+pub struct AnimationEffectConfig {
+  pub effect_type: AnimationEffect,
+  pub duration_ms: u32,
+  pub easing: EasingFunction,
+}
+
+impl Default for AnimationEffectConfig {
+  fn default() -> Self {
+    AnimationEffectConfig {
+      effect_type: AnimationEffect::default(),
+      duration_ms: 200,
+      easing: EasingFunction::default(),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationEffect {
+  /// Slide animation effect.
+  #[default]
+  Slide,
 }
 
 /// Helper function for setting a default value for a boolean field.

@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use serde::{Deserialize, Serialize};
 
 use crate::{Direction, LengthValue, Point, RectDelta};
@@ -127,6 +129,18 @@ impl Rect {
     )
   }
 
+  /// Returns a new `Rect` that is cropped to the bounds of the given
+  /// outer rectangle.
+  #[must_use]
+  pub fn crop(&self, outer_rect: &Rect) -> Self {
+    Self::from_ltrb(
+      self.left.clamp(outer_rect.left, outer_rect.right),
+      self.top.clamp(outer_rect.top, outer_rect.bottom),
+      self.right.clamp(outer_rect.left, outer_rect.right),
+      self.bottom.clamp(outer_rect.top, outer_rect.bottom),
+    )
+  }
+
   #[must_use]
   pub fn center_point(&self) -> Point {
     Point {
@@ -252,6 +266,25 @@ impl Rect {
     ((dx * dx + dy * dy) as f32).sqrt()
   }
 
+  /// Interpolates between this and another [`Rect`].
+  ///
+  /// `progress` should be a value between 0.0 (this rect) and 1.0 (other
+  /// rect).
+  #[must_use]
+  pub fn interpolate(&self, other: &Rect, progress: f32) -> Rect {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let lerp = |a: i32, b: i32| {
+      (a as f32 + (b - a) as f32 * progress).round() as i32
+    };
+
+    Rect::from_xy(
+      lerp(self.x(), other.x()),
+      lerp(self.y(), other.y()),
+      lerp(self.width(), other.width()),
+      lerp(self.height(), other.height()),
+    )
+  }
+
   /// Returns the union of this rect and another rect.
   ///
   /// The union is the smallest rect that contains both rects, taking the
@@ -264,6 +297,70 @@ impl Rect {
       self.right.max(other.right),
       self.bottom.max(other.bottom),
     )
+  }
+
+  /// Grows or shrinks the rect around its center point.
+  #[must_use]
+  pub fn scale_from_center(&self, scale: f32) -> Self {
+    let center_x = self.x() + self.width() / 2;
+    let center_y = self.y() + self.height() / 2;
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let new_width = (self.width() as f32 * scale).round() as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let new_height = (self.height() as f32 * scale).round() as i32;
+
+    let new_x = center_x - new_width / 2;
+    let new_y = center_y - new_height / 2;
+
+    Rect::from_xy(new_x, new_y, new_width, new_height)
+  }
+
+  /// Returns a new `Rect` with the Y-axis flipped within a container of
+  /// the given height.
+  ///
+  /// Useful for converting between AppKit and Core Graphics coordinate
+  /// systems. AppKit has (0,0) at the bottom-left corner of the primary
+  /// display, whereas Core Graphics has it at the top-left corner. So we
+  /// can convert between the two by offsetting the Y-axis by the primary
+  /// display's height.
+  #[must_use]
+  pub fn flip_y(&self, container_height: i32) -> Self {
+    Self::from_xy(
+      self.x(),
+      container_height - self.y() - self.height(),
+      self.width(),
+      self.height(),
+    )
+  }
+}
+
+#[cfg(target_os = "macos")]
+impl From<CGRect> for Rect {
+  fn from(value: CGRect) -> Self {
+    #[allow(clippy::cast_possible_truncation)]
+    Rect::from_xy(
+      value.origin.x as i32,
+      value.origin.y as i32,
+      value.size.width as i32,
+      value.size.height as i32,
+    )
+  }
+}
+
+#[cfg(target_os = "macos")]
+impl From<Rect> for CGRect {
+  fn from(value: Rect) -> Self {
+    CGRect {
+      origin: CGPoint {
+        x: f64::from(value.x()),
+        y: f64::from(value.y()),
+      },
+      size: CGSize {
+        width: f64::from(value.width()),
+        height: f64::from(value.height()),
+      },
+    }
   }
 }
 
@@ -292,5 +389,28 @@ mod tests {
     let r1 = Rect::from_xy(0, 0, 100, 100);
     let r2 = Rect::from_xy(100, 0, 100, 100);
     assert_eq!(r1.intersection_area(&r2), 0);
+  }
+
+  #[test]
+  fn interpolate_rect() {
+    let start = Rect::from_xy(0, 0, 100, 100);
+    let end = Rect::from_xy(100, 100, 200, 200);
+
+    let mid = start.interpolate(&end, 0.5);
+    assert_eq!(mid.x(), 50);
+    assert_eq!(mid.y(), 50);
+    assert_eq!(mid.width(), 150);
+    assert_eq!(mid.height(), 150);
+  }
+
+  #[test]
+  fn scale_rect_from_center() {
+    let rect = Rect::from_xy(100, 100, 200, 200);
+    let scaled = rect.scale_from_center(0.5);
+
+    assert_eq!(scaled.width(), 100);
+    assert_eq!(scaled.height(), 100);
+    assert_eq!(scaled.x(), 150);
+    assert_eq!(scaled.y(), 150);
   }
 }

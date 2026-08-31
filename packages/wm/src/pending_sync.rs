@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::{
-  models::{Container, Workspace},
+  models::{Container, WindowContainer, Workspace},
   traits::CommonGetters,
 };
 
@@ -16,6 +16,9 @@ pub struct PendingSync {
   /// Workspaces where z-order should be updated. Windows that match the
   /// focused window's state should be brought to the front.
   workspaces_to_reorder: Vec<Workspace>,
+
+  /// Newly managed windows that should have an opening animation.
+  open_animation_windows: Vec<WindowContainer>,
 
   /// Whether native focus should be reassigned to the WM's focused
   /// container.
@@ -30,12 +33,16 @@ pub struct PendingSync {
   /// Whether to jump the cursor to the focused container (if enabled in
   /// user config).
   needs_cursor_jump: bool,
+
+  /// Whether to skip animations for the current sync.
+  skip_animations: bool,
 }
 
 impl PendingSync {
   pub fn has_changes(&self) -> bool {
     !self.containers_to_redraw.is_empty()
       || !self.workspaces_to_reorder.is_empty()
+      || !self.open_animation_windows.is_empty()
       || self.needs_focus_update
       || self.needs_focused_effect_update
       || self.needs_all_effects_update
@@ -45,10 +52,12 @@ impl PendingSync {
   pub fn clear(&mut self) -> &mut Self {
     self.containers_to_redraw.clear();
     self.workspaces_to_reorder.clear();
+    self.open_animation_windows.clear();
     self.needs_focus_update = false;
     self.needs_focused_effect_update = false;
     self.needs_all_effects_update = false;
     self.needs_cursor_jump = false;
+    self.skip_animations = false;
     self
   }
 
@@ -96,6 +105,14 @@ impl PendingSync {
     self
   }
 
+  pub fn queue_open_animation_window(
+    &mut self,
+    window: WindowContainer,
+  ) -> &mut Self {
+    self.open_animation_windows.push(window);
+    self
+  }
+
   pub fn queue_focus_change(&mut self) -> &mut Self {
     self.needs_focus_update = true;
     self
@@ -114,6 +131,15 @@ impl PendingSync {
   pub fn queue_cursor_jump(&mut self) -> &mut Self {
     self.needs_cursor_jump = true;
     self
+  }
+
+  pub fn set_skip_animations(&mut self, skip: bool) -> &mut Self {
+    self.skip_animations = skip;
+    self
+  }
+
+  pub fn should_skip_animations(&self) -> bool {
+    self.skip_animations
   }
 
   pub fn needs_focus_update(&self) -> bool {
@@ -138,5 +164,9 @@ impl PendingSync {
 
   pub fn workspaces_to_reorder(&self) -> &Vec<Workspace> {
     &self.workspaces_to_reorder
+  }
+
+  pub fn open_animation_windows(&self) -> &Vec<WindowContainer> {
+    &self.open_animation_windows
   }
 }

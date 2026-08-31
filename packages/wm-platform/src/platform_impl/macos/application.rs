@@ -153,6 +153,11 @@ impl Application {
   /// This handles apps like Windows App while still missing filtered apps
   /// that create their first standard window later.
   pub(crate) fn should_observe(&self) -> bool {
+    // Skip our own process. The animation overlays are our windows.
+    if self.pid == std::process::id().cast_signed() {
+      return false;
+    }
+
     let is_filtered = self.activation_policy()
       == NSApplicationActivationPolicy::Prohibited
       || self.is_xpc().unwrap_or(false);

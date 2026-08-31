@@ -71,6 +71,10 @@ pub fn focus_workspace(
     // Display the workspace to switch focus to.
     state
       .pending_sync
+      // TODO: Add animations specifically for workspace switches. For now,
+      // skip the animation since using the normal movement animation will
+      // look strange.
+      .set_skip_animations(true)
       .queue_container_to_redraw(displayed_workspace)
       .queue_container_to_redraw(target_workspace);
 

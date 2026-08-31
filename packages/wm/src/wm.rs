@@ -158,6 +158,42 @@ impl WindowManager {
     Ok(())
   }
 
+  /// Updates all active animations and redraws windows that are animating.
+  pub fn update_animations(
+    &mut self,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
+    self
+      .state
+      .animation_manager
+      .tick_update(&self.state.dispatcher)?;
+
+    let completed_ids = self.state.animation_manager.completed_ids();
+
+    if !completed_ids.is_empty() {
+      let windows = self
+        .state
+        .windows()
+        .into_iter()
+        .filter(|window| completed_ids.contains(&window.id()));
+
+      // Redraw windows with completed animations to their target position.
+      self
+        .state
+        .pending_sync
+        .queue_containers_to_redraw(windows)
+        .set_skip_animations(true);
+
+      platform_sync(&mut self.state, config)?;
+
+      for completed_id in &completed_ids {
+        self.state.animation_manager.destroy_animation(completed_id);
+      }
+    }
+
+    Ok(())
+  }
+
   pub fn process_commands(
     &mut self,
     commands: &Vec<InvokeCommand>,

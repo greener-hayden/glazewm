@@ -8,6 +8,7 @@ use objc2_application_services::{AXError, AXValue};
 use objc2_core_foundation::{
   CFBoolean, CFRetained, CFString, CGPoint, CGSize,
 };
+#[allow(deprecated)]
 use objc2_core_graphics::{CGDisplayIsAsleep, CGError};
 
 use crate::{

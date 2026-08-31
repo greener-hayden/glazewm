@@ -89,6 +89,8 @@ impl NativeMonitorProperties {
     #[builder(default = mock_working_area())] working_area: Rect,
     #[builder(default = MOCK_DPI)] dpi: u32,
     #[builder(default = MOCK_SCALE_FACTOR)] scale_factor: f32,
+    // Left `None` by default; the animation manager falls back to 60.
+    refresh_rate: Option<u32>,
   ) -> Self {
     Self {
       device_name,
@@ -96,6 +98,7 @@ impl NativeMonitorProperties {
       working_area,
       dpi,
       scale_factor,
+      refresh_rate,
       #[cfg(target_os = "macos")]
       device_uuid: String::new(),
       #[cfg(target_os = "windows")]

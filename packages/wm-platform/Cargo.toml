@@ -29,9 +29,18 @@ libtest-mimic-collect = "0.3.2"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.52", features = [
   "implement",
+  "Foundation",
+  "Graphics_Capture",
+  "Graphics_DirectX",
+  "Graphics_DirectX_Direct3D11",
   "Win32_Devices_HumanInterfaceDevice",
   "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_DirectComposition",
   "Win32_Graphics_Dwm",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
   "Win32_Graphics_Gdi",
   "Win32_Security",
   "Win32_System_Com",
@@ -41,6 +50,9 @@ windows = { version = "0.52", features = [
   "Win32_System_RemoteDesktop",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
+  "Win32_System_WinRT",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
   "Win32_UI_Accessibility",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_Ime",
@@ -52,25 +64,40 @@ windows = { version = "0.52", features = [
 windows-interface = { version = "0.52" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-core-graphics = "0.3.2"
+objc2-core-graphics = { version = "0.3.2", features = [
+  "CGAffineTransform",
+  "CGImage",
+] }
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
   "NSAlert",
   "NSApplication",
+  "NSColor",
+  "NSControl",
   "NSEvent",
   "NSGraphics",
+  "NSImage",
+  "NSImageView",
   "NSRunningApplication",
   "NSResponder",
   "NSScreen",
+  "NSView",
   "NSWindow",
   "NSWorkspace",
   "libc",
   "objc2-core-foundation",
+  "objc2-core-graphics",
+  "objc2-quartz-core",
 ] }
 objc2-application-services = "0.3.2"
 objc2-core-foundation = { version = "0.3.2", features = [
   "CFCGTypes",
   "CFUUID",
+] }
+objc2-quartz-core = { version = "0.3.2", features = [
+  "CALayer",
+  "CATransaction",
+  "objc2-core-graphics",
 ] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSArray",
@@ -80,4 +107,5 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSString",
   "NSThread",
   "NSValue",
+  "NSUserDefaults",
 ] }

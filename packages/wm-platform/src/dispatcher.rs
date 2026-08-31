@@ -20,7 +20,7 @@ use objc2_core_foundation::{CFBoolean, CFDictionary, CGPoint};
 #[cfg(target_os = "macos")]
 use objc2_core_graphics::{CGError, CGEvent, CGWarpMouseCursorPosition};
 #[cfg(target_os = "macos")]
-use objc2_foundation::NSString;
+use objc2_foundation::{NSString, NSUserDefaults};
 #[cfg(target_os = "windows")]
 use windows::{
   core::PCWSTR,
@@ -85,6 +85,16 @@ pub trait DispatcherExtMacOs {
   /// This method is only available on macOS.
   fn has_ax_permission(&self, prompt: bool) -> bool;
 
+  /// Gets whether displays have separate spaces.
+  ///
+  /// This setting is present in System Preferences under "Desktop & Dock"
+  /// > "Mission Control" > "Displays have separate Spaces".
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on macOS.
+  fn displays_have_separate_spaces(&self) -> bool;
+
   /// Suspends screen updates on the process's main `WindowServer`
   /// connection, batching all visual changes until the returned guard is
   /// dropped.
@@ -138,6 +148,15 @@ impl DispatcherExtMacOs for Dispatcher {
     );
 
     unsafe { AXIsProcessTrustedWithOptions(Some(options.as_ref())) }
+  }
+
+  fn displays_have_separate_spaces(&self) -> bool {
+    let defaults = NSUserDefaults::new();
+    defaults.addSuiteNamed(&NSString::from_str("com.apple.spaces"));
+
+    // When "spans-displays" is false or absent, "Displays have separate
+    // Spaces" is enabled.
+    !defaults.boolForKey(&NSString::from_str("spans-displays"))
   }
 
   fn suspend_screen_updates(&self) -> ScreenUpdateGuard {

@@ -1,3 +1,4 @@
+mod animation_window;
 mod application;
 mod application_observer;
 mod ax_ui_element;
@@ -14,6 +15,7 @@ mod notification_center;
 mod single_instance;
 mod window_listener;
 
+pub(crate) use animation_window::*;
 pub(crate) use application::*;
 pub(crate) use application_observer::*;
 pub(crate) use ax_ui_element::*;

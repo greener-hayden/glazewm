@@ -34,6 +34,7 @@ use crate::{
   wm::WindowManager,
 };
 
+mod animation_manager;
 mod commands;
 mod events;
 mod ipc_server;
@@ -230,6 +231,9 @@ async fn start_wm(
         } else {
           wm.commit_pending_follow(&config)
         }
+      },
+      Some(()) = wm.state.animation_manager.tick_rx.recv() => {
+        wm.update_animations(&config)
       },
       Some((
         message,

@@ -477,6 +477,8 @@ struct Visibility {
   /// The window belongs to the workspace being displayed.
   visible: bool,
   /// This sync is part of a workspace switch that slides.
+  // LINT: only read on Windows, where cloaking is the hide method.
+  #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
   slide_pending: bool,
 }
 

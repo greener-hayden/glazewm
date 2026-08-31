@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use wm_common::{AnimationEffectConfig, AnimationsConfig, DisplayState};
+use wm_common::{AnimationEffectConfig, AnimationsConfig};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
@@ -325,22 +325,30 @@ impl AnimationManager {
     // applies is the difference between a window that should animate and
     // one that must not.
     //
-    // `Showing` means mid-reveal — a workspace arriving, whose windows
-    // are parked precisely because they were hidden. Those are the
-    // entering half of a switch and have to animate, or the outgoing
-    // workspace slides away while the incoming one pops into place.
+    // A slide is the one animation that may legitimately begin at the
+    // corner: its windows are parked there precisely because they were
+    // hidden, and the entering half has to travel out of it.
     //
-    // `Shown` and still cornered means the window settled visible but
-    // never made it back to its tile: it missed a restore. Animating it
-    // parks it again, and it is lost off screen for good.
-    let is_stranded =
-      matches!(window.display_state(), DisplayState::Shown)
-        && window.is_in_corner(&monitor_properties.working_area);
+    // Every other animation interpolates from the window's last known
+    // frame. Starting one while that frame is the corner makes the window
+    // fly in from off screen — and if it was `Shown` and cornered it
+    // missed a restore, so animating parks it again and loses it for
+    // good. Neither is a move the user made.
+    let is_slide = matches!(
+      trigger,
+      AnimationTrigger::WorkspaceEntering(_)
+        | AnimationTrigger::WorkspaceLeaving(_)
+    );
+
+    let starts_at_corner =
+      window.is_in_corner(&monitor_properties.working_area);
 
     if window.native_properties().is_minimized
       || (window.native_properties().is_maximized
         && cfg!(target_os = "macos"))
-      || (!self.is_animating(&window.id()) && is_stranded)
+      || (!self.is_animating(&window.id())
+        && starts_at_corner
+        && !is_slide)
     {
       return None;
     }

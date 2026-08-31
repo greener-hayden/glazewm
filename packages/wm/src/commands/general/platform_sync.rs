@@ -298,6 +298,7 @@ fn redraw_containers(
     // Determine the animation effect to apply, if any.
     let animation_trigger = if state.pending_sync.should_skip_animations()
     {
+      tracing::debug!("Animations skipped for this sync: {window}");
       None
     } else if let Some(direction) = state.pending_sync.workspace_slide() {
       // A switch moves both workspaces at once: the one being hidden
@@ -317,14 +318,29 @@ fn redraw_containers(
       Some(AnimationTrigger::WindowMoved)
     };
 
+    // The engine only ever logged animation *failures*, which makes a
+    // window that silently declined to animate indistinguishable from one
+    // that animated fine. Say which trigger fired and whether an effect
+    // was found, so "nothing is animating" is a question the log answers.
     let animation_effect = animation_trigger.and_then(|trigger| {
-      state.animation_manager.animation_effect_for_window(
+      let effect = state.animation_manager.animation_effect_for_window(
         window,
         trigger,
         &target_rect,
         &monitor.native_properties(),
         config,
-      )
+      );
+
+      tracing::debug!(
+        "Animation {trigger:?} for {window}: {}",
+        if effect.is_some() {
+          "applies"
+        } else {
+          "declined"
+        }
+      );
+
+      effect
     });
 
     // Where the animation runs between, which is not always where the real
@@ -553,25 +569,56 @@ fn reposition_window(
         }
       }
 
-      // Set visibility based on the hide method.
-      if is_animation_start {
-        window
-          .native()
-          .set_transparency(&OpacityValue::from_alpha(0))?;
-      } else if config.value.general.hide_method == HideMethod::Cloak {
-        window.native().set_cloaked(!is_visible)?;
-        window
-          .native()
-          .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
-      } else if is_visible {
-        window.native().show()?;
-        window
-          .native()
-          .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
-      } else {
-        window.native().hide()?;
-      }
+      apply_visibility(window, is_animation_start, is_visible, config)?;
     }
+  }
+
+  Ok(())
+}
+
+/// Shows or hides the real window according to the hide method, and to
+/// whether an animation is about to draw a copy of it instead.
+#[cfg(target_os = "windows")]
+fn apply_visibility(
+  window: &WindowContainer,
+  is_animation_start: bool,
+  is_visible: bool,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  if !is_animation_start {
+    if config.value.general.hide_method == HideMethod::Cloak {
+      window.native().set_cloaked(!is_visible)?;
+      window
+        .native()
+        .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
+    } else if is_visible {
+      window.native().show()?;
+      window
+        .native()
+        .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
+    } else {
+      window.native().hide()?;
+    }
+
+    return Ok(());
+  }
+
+  // Alpha first, cloak second, and never the other way round: the window
+  // is already sitting at its destination, so uncloaking it while opaque
+  // shows it there for a frame before the animation has travelled
+  // anywhere.
+  window
+    .native()
+    .set_transparency(&OpacityValue::from_alpha(0))?;
+
+  // A window arriving from another workspace is still cloaked, and a
+  // cloaked window has nothing to capture. Its animation would play
+  // empty and the window would pop into place at the end, which is what
+  // a workspace switch looked like before this. Costs nothing where the
+  // window was already uncloaked, since set_cloaked only writes on a
+  // change.
+  if is_visible && config.value.general.hide_method == HideMethod::Cloak {
+    window.native().set_cloaked(false)?;
   }
 
   Ok(())

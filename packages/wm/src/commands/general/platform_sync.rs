@@ -316,17 +316,32 @@ fn redraw_containers(
       )
     };
 
-    if let Some(effect_config) = animation_effect {
-      if let Err(err) = state.animation_manager.start_animation(
-        window,
-        effect_config,
-        target_rect.clone(),
-        &monitor.native_properties(),
-        &state.dispatcher,
-      ) {
-        tracing::warn!("Failed to start animation: {}", err);
+    // Whether an animation is actually running, which is not the same as
+    // one having been configured. `start_animation` registers the
+    // animation before creating its overlay, so a failure part-way leaves
+    // an entry behind with nothing drawing it and, if no other animation
+    // is in flight, no tick timer to ever complete it. Hiding the real
+    // window on `animation_effect.is_some()` then strands it: invisible,
+    // out of the layout, until an unrelated redraw happens by.
+    let is_animating = match animation_effect {
+      Some(effect_config) => {
+        match state.animation_manager.start_animation(
+          window,
+          effect_config,
+          target_rect.clone(),
+          &monitor.native_properties(),
+          &state.dispatcher,
+        ) {
+          Ok(()) => true,
+          Err(err) => {
+            tracing::warn!("Failed to start animation: {}", err);
+            state.animation_manager.destroy_animation(&window.id());
+            false
+          }
+        }
       }
-    }
+      None => false,
+    };
 
     tracing::debug!("Updating window position: {window}");
 
@@ -336,7 +351,7 @@ fn redraw_containers(
       &target_rect,
       *hide_corner,
       &z_order,
-      animation_effect.is_some(),
+      is_animating,
       is_visible,
       config,
     ) {

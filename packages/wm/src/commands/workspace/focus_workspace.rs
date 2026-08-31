@@ -54,9 +54,10 @@ pub fn focus_workspace(
 
     // Get the currently displayed workspace on the same monitor that the
     // workspace to focus is on.
-    let displayed_workspace = target_workspace
-      .monitor()
-      .and_then(|monitor| monitor.displayed_workspace())
+    let monitor = target_workspace.monitor().context("No monitor.")?;
+
+    let displayed_workspace = monitor
+      .displayed_workspace()
       .context("No workspace is currently displayed.")?;
 
     // Set focus to whichever window last had focus in workspace. If the
@@ -101,14 +102,20 @@ pub fn focus_workspace(
     state
       .pending_sync
       .set_skip_animations(slide.is_none())
-      .set_workspace_slide(slide)
+      .set_workspace_slide(slide, Some(monitor.id()))
       .queue_container_to_redraw(displayed_workspace)
       .queue_container_to_redraw(target_workspace);
 
     // Get empty workspace to destroy (if one is found). Cannot destroy
     // empty workspaces if they're the only workspace on the monitor.
+    //
+    // Scoped to the monitor that switched. Searching every monitor lets a
+    // switch here collect a stray empty workspace over there, and that
+    // deactivation is a second workspace transition — which the other
+    // monitor's windows answer by sliding off screen and back, for a
+    // switch they were never part of.
     let workspace_to_destroy =
-      state.workspaces().into_iter().find(|workspace| {
+      monitor.workspaces().into_iter().find(|workspace| {
         !workspace.config().keep_alive
           && !workspace.has_children()
           && !workspace.is_displayed()

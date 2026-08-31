@@ -42,6 +42,14 @@ pub struct PendingSync {
   /// content travels. Windows being shown enter from the opposite side;
   /// windows being hidden leave toward it.
   workspace_slide: Option<SlideDirection>,
+
+  /// Monitor whose displayed workspace is changing.
+  ///
+  /// A switch belongs to one monitor, but the slide is a property of the
+  /// whole sync, so without this every window queued for redraw picks up
+  /// a slide trigger — including windows on other monitors, which fly off
+  /// screen and are dragged back for a switch that never involved them.
+  workspace_slide_monitor: Option<Uuid>,
 }
 
 impl PendingSync {
@@ -65,6 +73,7 @@ impl PendingSync {
     self.needs_cursor_jump = false;
     self.skip_animations = false;
     self.workspace_slide = None;
+    self.workspace_slide_monitor = None;
     self
   }
 
@@ -149,18 +158,27 @@ impl PendingSync {
     self.skip_animations
   }
 
-  /// Marks this sync as a workspace switch travelling in `direction`.
+  /// Marks this sync as a workspace switch on `monitor_id`, travelling
+  /// in `direction`.
   pub fn set_workspace_slide(
     &mut self,
     direction: Option<SlideDirection>,
+    monitor_id: Option<Uuid>,
   ) -> &mut Self {
     self.workspace_slide = direction;
+    self.workspace_slide_monitor = monitor_id;
     self
   }
 
-  /// The direction this switch travels, or `None` if this sync is not one.
-  pub fn workspace_slide(&self) -> Option<SlideDirection> {
-    self.workspace_slide
+  /// The direction this switch travels for a window on `monitor_id`, or
+  /// `None` if that monitor is not the one switching.
+  pub fn workspace_slide_for(
+    &self,
+    monitor_id: Uuid,
+  ) -> Option<SlideDirection> {
+    (self.workspace_slide_monitor == Some(monitor_id))
+      .then_some(self.workspace_slide)
+      .flatten()
   }
 
   pub fn needs_focus_update(&self) -> bool {

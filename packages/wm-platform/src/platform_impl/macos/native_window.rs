@@ -355,10 +355,15 @@ impl NativeWindow {
     R: Send,
   {
     self.application.ax_element.with(|app_el| {
-      // Get whether enhanced UI is currently enabled.
-      let was_enabled = app_el
-        .get_attribute::<CFBoolean>("AXEnhancedUserInterface")
-        .is_ok_and(|cf_bool| cf_bool.value());
+      // Get whether enhanced UI is currently enabled, once per app. The
+      // read is a blocking cross-process call on the event loop thread,
+      // and this gates every frame set, so re-reading it made each move
+      // pay for a value that effectively never changes.
+      let was_enabled = *self.application.enhanced_ui.get_or_init(|| {
+        app_el
+          .get_attribute::<CFBoolean>("AXEnhancedUserInterface")
+          .is_ok_and(|cf_bool| cf_bool.value())
+      });
 
       // Disable enhanced UI if it was enabled.
       if was_enabled {

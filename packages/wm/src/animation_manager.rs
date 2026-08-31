@@ -6,7 +6,7 @@ use std::{
 use anyhow::Context;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use wm_common::{AnimationEffectConfig, AnimationsConfig};
+use wm_common::{AnimationEffectConfig, AnimationsConfig, DisplayState};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
@@ -103,6 +103,14 @@ struct WindowAnimationState {
   /// animation is active.
   start_opacity: Option<OpacityValue>,
   target_opacity: Option<OpacityValue>,
+
+  /// Whether this animation belongs to a workspace switch.
+  ///
+  /// A leaving window is travelling off screen, so a later sync measures
+  /// it a whole monitor from the tile it would occupy and starts a
+  /// second animation hauling it back — the outgoing workspace appears
+  /// to slide into the incoming one before vanishing.
+  is_workspace_slide: bool,
 }
 
 impl WindowAnimationState {
@@ -112,6 +120,7 @@ impl WindowAnimationState {
     target_rect: Rect,
     config: &AnimationEffectConfig,
     frame_rate: u32,
+    is_workspace_slide: bool,
   ) -> Self {
     Self {
       start_time: Instant::now(),
@@ -122,6 +131,7 @@ impl WindowAnimationState {
       target_rect,
       start_opacity: None,
       target_opacity: None,
+      is_workspace_slide,
     }
   }
 
@@ -132,9 +142,9 @@ impl WindowAnimationState {
     if elapsed >= self.duration {
       1.0
     } else {
-      #[allow(clippy::cast_precision_loss)]
-      let progress =
-        elapsed.as_millis() as f32 / self.duration.as_millis() as f32;
+      // `as_millis` truncates, quantising a 180ms animation into whole
+      // millisecond steps. Seconds keep the sub-frame precision.
+      let progress = elapsed.as_secs_f32() / self.duration.as_secs_f32();
 
       progress.clamp(0.0, 1.0)
     }
@@ -187,6 +197,14 @@ pub struct AnimationManager {
   /// Handle to the running tick task, if any.
   tick_task: Option<tokio::task::JoinHandle<()>>,
 
+  /// Animations prepared this sync but not yet handed to the compositor.
+  ///
+  /// Preparing one costs a screen capture, so starting each as it is
+  /// prepared staggers a workspace switch by roughly that cost per
+  /// window — the last window in a five-window switch began 180ms into
+  /// a 200ms slide and barely moved. Released together instead.
+  pending_starts: Vec<Uuid>,
+
   /// Whether "Displays have separate Spaces" setting is enabled.
   #[cfg(target_os = "macos")]
   displays_have_separate_spaces: bool,
@@ -207,6 +225,7 @@ impl AnimationManager {
       windows: HashMap::new(),
       context: None,
       tick_task: None,
+      pending_starts: Vec::new(),
       #[cfg(target_os = "macos")]
       displays_have_separate_spaces: dispatcher
         .displays_have_separate_spaces(),
@@ -247,11 +266,16 @@ impl AnimationManager {
   /// Updates all active animations during a single tick.
   ///
   /// Updates get batched into a single compositor transaction.
+  ///
+  /// Does nothing where the platform animates for itself: the compositor
+  /// is already producing frames, and the transaction below would put a
+  /// synchronous hop to the event loop thread on every one of them. Ticks
+  /// still fire, but only so `completed_ids` can drive the handover.
   pub fn tick_update(
     &mut self,
     dispatcher: &Dispatcher,
   ) -> anyhow::Result<()> {
-    if self.animations.is_empty() {
+    if AnimationWindow::SELF_ANIMATING || self.animations.is_empty() {
       return Ok(());
     }
 
@@ -262,13 +286,16 @@ impl AnimationManager {
       .transaction(
         || {
           for (id, anim) in &self.animations {
-            if !anim.is_complete() {
-              if let Some(anim_window) = self.windows.get(id) {
-                anim_window.update(
-                  &anim.current_rect(),
-                  anim.current_opacity().as_ref(),
-                )?;
-              }
+            // A completed animation still needs its final frame drawn.
+            // Completion falls between ticks, so skipping it leaves the
+            // overlay up to a frame short of the target while the
+            // handover puts the real window at full travel — two copies,
+            // offset by the remainder, for as long as the overlay lives.
+            if let Some(anim_window) = self.windows.get(id) {
+              anim_window.update(
+                &anim.current_rect(),
+                anim.current_opacity().as_ref(),
+              )?;
             }
           }
           anyhow::Ok(())
@@ -291,14 +318,29 @@ impl AnimationManager {
     //  - The window is minimized.
     //  - The window is maximized (macOS only - can't override the OS's
     //    animation).
-    //  - The window is hidden in the corner, but not animating. Safeguards
-    //    against race condition where window finished an animation, but
-    //    hasn't been moved to the real window position yet.
+    //  - The window is stranded in the corner.
+    //
+    // The corner serves two purposes: it is where an animating window is
+    // parked, and where a hidden workspace keeps its windows. Which one
+    // applies is the difference between a window that should animate and
+    // one that must not.
+    //
+    // `Showing` means mid-reveal — a workspace arriving, whose windows
+    // are parked precisely because they were hidden. Those are the
+    // entering half of a switch and have to animate, or the outgoing
+    // workspace slides away while the incoming one pops into place.
+    //
+    // `Shown` and still cornered means the window settled visible but
+    // never made it back to its tile: it missed a restore. Animating it
+    // parks it again, and it is lost off screen for good.
+    let is_stranded =
+      matches!(window.display_state(), DisplayState::Shown)
+        && window.is_in_corner(&monitor_properties.working_area);
+
     if window.native_properties().is_minimized
       || (window.native_properties().is_maximized
         && cfg!(target_os = "macos"))
-      || (!self.is_animating(&window.id())
-        && window.is_in_corner(&monitor_properties.working_area))
+      || (!self.is_animating(&window.id()) && is_stranded)
     {
       return None;
     }
@@ -332,6 +374,17 @@ impl AnimationManager {
           ..
         },
       ) => {
+        // A workspace slide owns its window until it completes. Its
+        // target is off screen, so measuring against the tile the window
+        // would otherwise occupy always clears the threshold.
+        if self
+          .animations
+          .get(&window.id())
+          .is_some_and(|anim| anim.is_workspace_slide)
+        {
+          return None;
+        }
+
         // If the window is mid-animation, compare the previous animation
         // target to the new target.
         let frame = window.native_properties().frame;
@@ -374,6 +427,7 @@ impl AnimationManager {
     monitor_properties: &NativeMonitorProperties,
     dispatcher: &Dispatcher,
     start_override: Option<Rect>,
+    is_workspace_slide: bool,
   ) -> anyhow::Result<()> {
     let existing_animation = self.animations.get(&window.id());
 
@@ -393,6 +447,7 @@ impl AnimationManager {
       target_rect,
       effect_config,
       frame_rate,
+      is_workspace_slide,
     );
 
     self.animations.insert(window.id(), animation.clone());
@@ -402,11 +457,18 @@ impl AnimationManager {
     // window beyond the display bounds causes it to wrap around on the
     // same display. We therefore crop the animation to only be shown on
     // the source display.
+    //
+    // A workspace slide is cropped whatever that setting says. It travels
+    // a whole monitor width, so its bounding box reaches an entire screen
+    // past the window and onto the neighbouring display — where the
+    // outgoing workspace is seen sliding across a monitor it was never
+    // on. A switch belongs to one display; only a window genuinely moving
+    // between them should be drawn across both.
     let outer_rect = {
       let outer_rect = animation.start_rect.union(&animation.target_rect);
 
       #[cfg(target_os = "macos")]
-      if self.displays_have_separate_spaces {
+      if self.displays_have_separate_spaces || is_workspace_slide {
         let display_bounds =
           dispatcher.nearest_display(&window.native())?.bounds()?;
 
@@ -434,15 +496,21 @@ impl AnimationManager {
       // Immediately redraw the animation after resizing. The animation is
       // scaled relative to the window's frame, so it would otherwise be
       // incorrect until the next tick.
-      context.transaction(
-        || {
-          anim_window.update(
-            &animation.current_rect(),
-            animation.current_opacity().as_ref(),
-          )
-        },
-        dispatcher,
-      )??;
+      //
+      // Skipped where the platform animates for itself: there is no next
+      // tick to be wrong until, and pinning the layer to its current rect
+      // here would fight the retarget issued below.
+      if !AnimationWindow::SELF_ANIMATING {
+        context.transaction(
+          || {
+            anim_window.update(
+              &animation.current_rect(),
+              animation.current_opacity().as_ref(),
+            )
+          },
+          dispatcher,
+        )??;
+      }
     } else {
       let anim_window = AnimationWindow::new(
         context,
@@ -456,14 +524,46 @@ impl AnimationManager {
       self.windows.insert(window.id(), anim_window);
     }
 
-    // Start the tick timer after the window has been created.
-    // NOTE: Start times for animations will differ slightly between
-    // windows within the same platform sync.
-    if let Some(animation) = self.animations.get_mut(&window.id()) {
+    if AnimationWindow::SELF_ANIMATING {
+      // Queue rather than start: see `begin_pending`.
+      self.pending_starts.push(window.id());
+    } else if let Some(animation) = self.animations.get_mut(&window.id()) {
       animation.start_time = Instant::now();
     }
 
     self.update_tick_rate();
+
+    Ok(())
+  }
+
+  /// Hands every animation prepared this sync to the compositor.
+  ///
+  /// Called once the sync has finished preparing them, so a workspace
+  /// switch releases as one sheet instead of a window at a time.
+  ///
+  /// The clock starts here too: `is_complete` retires the animation and
+  /// hands the real window back, so it must not lead the compositor, or
+  /// the window is restored to its tile while its overlay is still
+  /// travelling and both are on screen at once.
+  pub fn begin_pending(&mut self) -> anyhow::Result<()> {
+    for window_id in std::mem::take(&mut self.pending_starts) {
+      let Some(anim) = self.animations.get(&window_id) else {
+        continue;
+      };
+
+      if let Some(anim_window) = self.windows.get(&window_id) {
+        anim_window.animate_to(
+          &anim.target_rect,
+          anim.duration,
+          &anim.easing,
+          anim.target_opacity.as_ref(),
+        )?;
+      }
+
+      if let Some(anim) = self.animations.get_mut(&window_id) {
+        anim.start_time = Instant::now();
+      }
+    }
 
     Ok(())
   }
@@ -486,7 +586,13 @@ impl AnimationManager {
       return;
     };
 
-    let frame_time = Duration::from_millis(u64::from(1000 / frame_rate));
+    // `1000 / 60` truncates to 16ms, which beats against a 60Hz vsync
+    // and drops a frame roughly every 400ms. Guard against a 0Hz rate,
+    // which some macOS displays report and which would panic here.
+    let frame_rate = if frame_rate == 0 { 60 } else { frame_rate };
+
+    let frame_time =
+      Duration::from_nanos(1_000_000_000 / u64::from(frame_rate));
     let tick_tx = self.tick_tx.clone();
 
     self.tick_task = Some(tokio::spawn(async move {

@@ -124,6 +124,7 @@ impl NativeWindowProperties {
   ) -> Self {
     Self {
       title,
+      title_read_at: std::time::Instant::now(),
       process_name,
       frame,
       is_minimized,

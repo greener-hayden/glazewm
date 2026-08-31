@@ -32,13 +32,24 @@ pub fn platform_sync(
     sync_focus(&focused_container, state)?;
   }
 
+  #[cfg(target_os = "macos")]
+  queue_stranded_windows(state);
+
   if !state.pending_sync.containers_to_redraw().is_empty()
     || !state.pending_sync.workspaces_to_reorder().is_empty()
   {
     // Suspend screen updates so the relayout commits in a single frame
     // instead of cascading repaints. Re-enabled when the guard drops.
+    //
+    // Not while animating. Suspending freezes the window server, and an
+    // animation starting inside this block asks that same server for a
+    // screenshot of the window it is about to animate. The request
+    // cannot be served while updates are held, so it waits out the
+    // ~1s force re-enable — turning a 30ms capture into a full second,
+    // every time an animation needs a new frame to work from.
     #[cfg(target_os = "macos")]
-    let _screen_updates = state.dispatcher.suspend_screen_updates();
+    let _screen_updates = (!config.value.animations.is_enabled())
+      .then(|| state.dispatcher.suspend_screen_updates());
 
     redraw_containers(&focused_container, state, config)?;
   }
@@ -84,6 +95,43 @@ pub fn platform_sync(
   state.pending_sync.clear();
 
   Ok(())
+}
+
+/// Queues windows that lost their restore to be redrawn.
+///
+/// Taking a window off screen means parking it in the monitor's corner —
+/// that is how both an animating window and a hidden workspace are
+/// concealed. Restoring it is a separate write, and if that write is
+/// never issued the window stays parked with nothing to bring it back:
+/// invisible to the user, while the layout still holds a slot for it.
+///
+/// A window found in the corner while `Shown`, with no animation running,
+/// is exactly that case. Detection reads cached frames only, so it costs
+/// no accessibility calls, and the redraw repositions it the same way any
+/// other layout change would.
+#[cfg(target_os = "macos")]
+fn queue_stranded_windows(state: &mut WmState) {
+  let stranded = state
+    .windows()
+    .into_iter()
+    .filter(|window| {
+      matches!(window.display_state(), DisplayState::Shown)
+        && !state.animation_manager.is_animating(&window.id())
+        && window.monitor().is_some_and(|monitor| {
+          window.is_in_corner(&monitor.native_properties().working_area)
+        })
+    })
+    .collect::<Vec<_>>();
+
+  if stranded.is_empty() {
+    return;
+  }
+
+  for window in &stranded {
+    tracing::info!("Restoring stranded window: {window}");
+  }
+
+  state.pending_sync.queue_containers_to_redraw(stranded);
 }
 
 fn sync_focus(
@@ -300,7 +348,9 @@ fn redraw_containers(
     {
       tracing::debug!("Animations skipped for this sync: {window}");
       None
-    } else if let Some(direction) = state.pending_sync.workspace_slide() {
+    } else if let Some(direction) =
+      state.pending_sync.workspace_slide_for(monitor.id())
+    {
       // A switch moves both workspaces at once: the one being hidden
       // leaves toward `direction`, the one being shown arrives from the
       // other side. `is_visible` is derived from the display state
@@ -375,6 +425,13 @@ fn redraw_containers(
           &monitor.native_properties(),
           &state.dispatcher,
           anim_start.clone(),
+          matches!(
+            animation_trigger,
+            Some(
+              AnimationTrigger::WorkspaceEntering(_)
+                | AnimationTrigger::WorkspaceLeaving(_)
+            )
+          ),
         ) {
           Ok(()) => true,
           Err(err) => {
@@ -403,9 +460,18 @@ fn redraw_containers(
     // is the workspace being visible twice. So while a slide is pending,
     // uncloak but stay transparent; the animation, or the first sync after
     // the slide is over, brings the opacity back.
-    let slide_pending = state.pending_sync.workspace_slide().is_some();
+    let slide_pending = state
+      .pending_sync
+      .workspace_slide_for(monitor.id())
+      .is_some();
 
     tracing::debug!("Updating window position: {window}");
+
+    // Repositioning is a blocking accessibility write on the event loop
+    // thread, so a slow one stalls input and every other window with it.
+    // Timing it is the only way to tell an app that is slow to answer
+    // from time spent elsewhere in the sync.
+    let repositioned_at = std::time::Instant::now();
 
     // Hide the real window when an animation layer is active.
     if let Err(err) = reposition_window(
@@ -422,6 +488,11 @@ fn redraw_containers(
     ) {
       tracing::warn!("Failed to set window position: {}", err);
     }
+
+    tracing::debug!(
+      "Repositioned in {}ms: {window}",
+      repositioned_at.elapsed().as_millis()
+    );
 
     // Whether the window is either transitioning to or from fullscreen.
     // TODO: This check can be improved since `prev_state` can be
@@ -463,6 +534,13 @@ fn redraw_containers(
       }
     }
   }
+
+  // Release every animation prepared above at once. Preparing one costs
+  // a screen capture, so starting them inside the loop staggered a
+  // workspace switch by that cost per window: the last of five began
+  // 180ms into a 200ms slide and barely moved, which read as the
+  // workspace folding in rather than travelling as one sheet.
+  state.animation_manager.begin_pending()?;
 
   Ok(())
 }

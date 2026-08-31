@@ -5,6 +5,7 @@ use std::sync::{
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+use objc2_application_services::AXUIElement;
 use objc2_core_foundation::{
   kCFRunLoopDefaultMode, CFRetained, CFRunLoop, CFRunLoopSource,
   CFRunLoopSourceContext,
@@ -107,6 +108,24 @@ pub(crate) struct EventLoop {
 impl EventLoop {
   /// Implements [`EventLoop::new`].
   pub fn new() -> crate::Result<(Self, Dispatcher)> {
+    // Accessibility calls are cross-process and block the caller, and
+    // they run on this thread — the one that also services the event
+    // taps. Waiting on a busy app therefore stalls input for everyone,
+    // and macOS answers a long enough stall by disabling the tap
+    // (`kCGEventTapDisabledByTimeout`). A reposition measured at a 29ms
+    // median, so this leaves ample headroom while capping the worst
+    // case. Timed-out writes are dropped; the next sync redraws them.
+    //
+    // Must be set on the system-wide element: on any other element it
+    // applies to that element alone, not to the window elements that
+    // actually carry the writes.
+    const AX_MESSAGING_TIMEOUT_SECS: f32 = 0.25;
+
+    unsafe {
+      AXUIElement::new_system_wide()
+        .set_messaging_timeout(AX_MESSAGING_TIMEOUT_SECS);
+    }
+
     // Add a new run loop source that allows dispatching from any thread.
     let source = Self::add_dispatch_source()?;
 

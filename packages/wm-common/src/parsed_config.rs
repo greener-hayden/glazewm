@@ -405,6 +405,16 @@ pub struct AnimationsConfig {
   pub workspace_switch: Option<AnimationEffectConfig>,
 }
 
+impl AnimationsConfig {
+  /// Whether any animation effect is configured.
+  #[must_use]
+  pub const fn is_enabled(&self) -> bool {
+    self.window_move.is_some()
+      || self.window_open.is_some()
+      || self.workspace_switch.is_some()
+  }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, rename_all(serialize = "camelCase"))]
 pub struct WindowMoveAnimationConfig {

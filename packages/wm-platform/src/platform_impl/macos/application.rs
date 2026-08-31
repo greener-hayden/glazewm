@@ -1,4 +1,7 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{
+  cell::RefCell,
+  sync::{Arc, OnceLock},
+};
 
 use objc2::rc::Retained;
 use objc2_app_kit::{
@@ -22,6 +25,13 @@ pub struct Application {
   pub(crate) dispatcher: Dispatcher,
   pub(crate) ns_app: Retained<NSRunningApplication>,
   pub(crate) ax_element: Arc<ThreadBound<CFRetained<AXUIElement>>>,
+
+  /// Cached `AXEnhancedUserInterface`, read on first use.
+  ///
+  /// An app-level mode that only changes when something like VoiceOver
+  /// toggles it, but it gates every frame set, so reading it each time
+  /// costs a blocking round trip per window per move.
+  pub(crate) enhanced_ui: Arc<OnceLock<bool>>,
 }
 
 impl Application {
@@ -31,19 +41,21 @@ impl Application {
     dispatcher: Dispatcher,
   ) -> Self {
     let pid = ns_app.processIdentifier();
-    let ax_element = Arc::new(ThreadBound::new(
-      // Creation of `AXUIElement` for an application does not fail even
-      // if the PID is invalid. Instead, subsequent operations on
-      // the returned `AXUIElement` will error.
-      unsafe { AXUIElement::new_application(pid) },
-      dispatcher.clone(),
-    ));
+
+    // Creation of `AXUIElement` for an application does not fail even
+    // if the PID is invalid. Instead, subsequent operations on
+    // the returned `AXUIElement` will error.
+    let element = unsafe { AXUIElement::new_application(pid) };
+
+    let ax_element =
+      Arc::new(ThreadBound::new(element, dispatcher.clone()));
 
     Self {
       pid,
       dispatcher,
       ns_app,
       ax_element,
+      enhanced_ui: Arc::new(OnceLock::new()),
     }
   }
 

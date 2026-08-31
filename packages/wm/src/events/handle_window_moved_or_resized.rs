@@ -1,7 +1,8 @@
 use anyhow::Context;
 use wm_common::{
   try_warn, ActiveDrag, ActiveDragOperation, DisplayState,
-  FloatingStateConfig, FullscreenStateConfig, HideMethod, WindowState,
+  FloatingStateConfig, FullscreenStateConfig, HideMethod, TilingDirection,
+  WindowState,
 };
 #[cfg(target_os = "windows")]
 use wm_platform::NativeWindowWindowsExt;
@@ -11,15 +12,28 @@ use wm_platform::{NativeWindow, Rect};
 
 use crate::{
   commands::{
-    container::{flatten_split_container, move_container_within_tree},
+    container::{
+      flatten_split_container, move_container_within_tree,
+      resize_tiling_container,
+    },
     window::update_window_state,
   },
   events::handle_window_moved_or_resized_end,
   models::{Monitor, NonTilingWindow, WindowContainer},
-  traits::{CommonGetters, WindowGetters},
+  traits::{
+    CommonGetters, PositionGetters, TilingDirectionGetters,
+    TilingSizeGetters, WindowGetters,
+  },
   user_config::UserConfig,
   wm_state::WmState,
 };
+
+/// How far a tiling window may sit from its tile before the layout is
+/// reconciled to it.
+///
+/// Wide enough to ignore rounding and a window settling, narrow enough to
+/// catch one overhanging its neighbour.
+const TILE_MISMATCH_TOLERANCE_PX: i32 = 20;
 
 #[allow(clippy::too_many_lines)]
 pub fn handle_window_moved_or_resized(
@@ -71,6 +85,22 @@ pub fn handle_window_moved_or_resized(
       }
 
       return update_drag_state(&window, &frame_position, state, config);
+    }
+
+    // An animating window on macOS is parked in the corner by us, and
+    // that write comes back as a move event. Treating it as one the user
+    // made reads the parked frame as the window's position, finds it a
+    // screen away from its tile, and starts a second animation over the
+    // one already running — so a workspace switch animates every window
+    // twice, in opposite directions.
+    //
+    // Below the drag handling on purpose: a drag is the user moving a
+    // window that happens to be animating, and swallowing those events
+    // leaves the drag untracked, so the window never re-enters the grid
+    // when it is dropped.
+    #[cfg(target_os = "macos")]
+    if state.animation_manager.is_animating(&window.id()) {
+      return Ok(());
     }
 
     let old_is_maximized = window.native_properties().is_maximized;
@@ -266,8 +296,20 @@ pub fn handle_window_moved_or_resized(
       }
     };
 
+    // A window whose position we are driving is not authoritative about
+    // its own size. macOS reports the size we asked for until a later
+    // `MovedOrResized` event, and an animation parks the real window at
+    // its old dimensions in the meantime — so the frame that arrives here
+    // can still be the pre-move one. `should_fullscreen` is inferred from
+    // that frame, so a stale reading promotes a tiling window to
+    // fullscreen, which then sizes it to the workspace and keeps the
+    // inference true. `is_maximized` is a direct OS query, so it stays
+    // trusted; only the geometric inference is held back.
+    let is_animating = cfg!(target_os = "macos")
+      && state.animation_manager.is_animating(&window.id());
+
     // Handle a window being maximized or entering fullscreen.
-    if is_maximized || should_fullscreen {
+    if is_maximized || (should_fullscreen && !is_animating) {
       let is_same_state = is_maximized
         && matches!(
           window.state(),
@@ -350,9 +392,74 @@ pub fn handle_window_moved_or_resized(
           )?;
         }
       }
-      _ => {}
+      WindowState::Tiling => reconcile_tile_to_window(&window)?,
+      WindowState::Minimized => {}
     }
   }
+
+  Ok(())
+}
+
+/// Grows a tiling window's slot to the size the window actually took.
+///
+/// Applications enforce a minimum size, and macOS clamps a smaller
+/// request to it silently — reporting the value we asked for until a
+/// later move event tells the truth. `MIN_TILING_SIZE` is a fraction of
+/// the parent, so a busy workspace can hand a window a tile narrower than
+/// it is able to be. Retrying cannot help: the constraint is real and
+/// permanent.
+///
+/// Left alone the layout holds a tile the window overflows, so it
+/// overhangs its neighbour and can spill onto the next monitor. Giving
+/// the window the room it took and shrinking its siblings keeps the
+/// layout honest, and it settles: once the tile matches, there is nothing
+/// further to correct.
+fn reconcile_tile_to_window(
+  window: &WindowContainer,
+) -> anyhow::Result<()> {
+  let Some(tiling_window) = window.as_tiling_window() else {
+    return Ok(());
+  };
+
+  // Nothing to redistribute to.
+  if tiling_window.tiling_siblings().next().is_none() {
+    return Ok(());
+  }
+
+  let tile = window.to_rect()?;
+  let actual = window.native_properties().frame;
+
+  let parent = window.parent().context("No parent.")?;
+  let is_horizontal = matches!(
+    parent.as_direction_container()?.tiling_direction(),
+    TilingDirection::Horizontal
+  );
+
+  let (tile_len, actual_len) = if is_horizontal {
+    (tile.width(), actual.width())
+  } else {
+    (tile.height(), actual.height())
+  };
+
+  // Only grow. A window smaller than its tile is mid-settle, not
+  // constrained, and shrinking the tile to chase it would fight the
+  // layout the user asked for.
+  if actual_len - tile_len <= TILE_MISMATCH_TOLERANCE_PX || tile_len <= 0 {
+    return Ok(());
+  }
+
+  tracing::info!(
+    "Window kept {actual_len}px against a {tile_len}px tile; growing the \
+     tile to fit: {window}"
+  );
+
+  #[allow(clippy::cast_precision_loss)]
+  let scale = actual_len as f32 / tile_len as f32;
+
+  resize_tiling_container(
+    &tiling_window.clone().into(),
+    tiling_window.tiling_size() * scale,
+  );
 
   Ok(())
 }

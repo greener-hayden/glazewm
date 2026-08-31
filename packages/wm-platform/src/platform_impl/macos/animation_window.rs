@@ -1,9 +1,11 @@
+use std::time::Duration;
+
 use objc2::{
   rc::Retained, runtime::AnyObject, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-  NSBackingStoreType, NSColor, NSWindow, NSWindowAnimationBehavior,
-  NSWindowOrderingMode, NSWindowStyleMask,
+  NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSWindow,
+  NSWindowAnimationBehavior, NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
@@ -11,11 +13,29 @@ use objc2_core_graphics::CGImage;
 use objc2_core_graphics::{
   CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption,
 };
-use objc2_quartz_core::{CALayer, CATransaction};
+use objc2_quartz_core::{CALayer, CAMediaTimingFunction, CATransaction};
 
 use crate::{
-  Dispatcher, NativeWindow, OpacityValue, Rect, ThreadBound, WindowId,
+  Dispatcher, EasingFunction, NativeWindow, OpacityValue, Rect,
+  ThreadBound, WindowId,
 };
+
+/// Cubic Bézier control points for an [`EasingFunction`].
+///
+/// Core Animation expresses easing as a timing curve rather than a
+/// per-frame function, so each variant maps to the curve that matches
+/// `EasingFunction::apply` most closely.
+const fn control_points(easing: &EasingFunction) -> (f32, f32, f32, f32) {
+  match easing {
+    EasingFunction::Linear => (0.0, 0.0, 1.0, 1.0),
+    EasingFunction::EaseIn => (0.55, 0.085, 0.68, 0.53),
+    EasingFunction::EaseOut => (0.25, 0.46, 0.45, 0.94),
+    EasingFunction::EaseInOut => (0.455, 0.03, 0.515, 0.955),
+    EasingFunction::EaseInCubic => (0.55, 0.055, 0.675, 0.19),
+    EasingFunction::EaseOutCubic => (0.215, 0.61, 0.355, 1.0),
+    EasingFunction::EaseInOutCubic => (0.645, 0.045, 0.355, 1.0),
+  }
+}
 
 /// Platform-specific implementation of [`AnimationContext`].
 pub(crate) struct AnimationContext;
@@ -135,6 +155,11 @@ impl AnimationWindow {
           ));
         };
 
+        // Left at the default scale of 1: the capture is taken at
+        // logical resolution, so one image pixel is one point. Matching
+        // the display's backing scale here would make the layer treat
+        // the image as 2x and draw it at half size.
+
         CATransaction::begin();
         CATransaction::setDisableActions(true);
 
@@ -147,6 +172,12 @@ impl AnimationWindow {
         CATransaction::commit();
 
         root_layer.addSublayer(&layer);
+
+        // Ordering is relative to another process's window, which AppKit
+        // does not guarantee. Without a level of its own the overlay
+        // stays at the normal level and can land behind whatever else is
+        // on screen, so the tween plays invisibly and reads as a snap.
+        ns_window.setLevel(NSFloatingWindowLevel);
 
         #[allow(clippy::cast_possible_wrap)]
         ns_window.orderWindow_relativeTo(
@@ -189,6 +220,57 @@ impl AnimationWindow {
   ) -> crate::Result<()> {
     self.layer.with(|layer| {
       Self::update_layer(layer, inner_rect, &self.outer_rect, opacity);
+    })
+  }
+
+  /// Implements [`AnimationWindow::animate_to`].
+  ///
+  /// Starts a Core Animation transition to `target_rect` and returns
+  /// immediately. The render server interpolates every frame, so the
+  /// caller must not tick.
+  ///
+  /// Called again mid-flight, Core Animation retargets from wherever the
+  /// layer is currently presented, so a cancel-and-replace needs no
+  /// special handling here.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: costs a single hop to the main thread for the whole
+  ///   animation, rather than one per frame. That matters because
+  ///   accessibility calls are confined to that same thread, and a move
+  ///   issues several of them while the animation is running.
+  pub(crate) fn animate_to(
+    &self,
+    target_rect: &Rect,
+    duration: Duration,
+    easing: &EasingFunction,
+    opacity: Option<&OpacityValue>,
+  ) -> crate::Result<()> {
+    let outer_rect = self.outer_rect.clone();
+    let target_rect = target_rect.clone();
+    let easing = easing.clone();
+    let opacity = opacity.cloned();
+
+    self.layer.with(move |layer| {
+      let (c1x, c1y, c2x, c2y) = control_points(&easing);
+
+      CATransaction::begin();
+      CATransaction::setAnimationDuration(duration.as_secs_f64());
+      CATransaction::setAnimationTimingFunction(Some(
+        &CAMediaTimingFunction::functionWithControlPoints(
+          c1x, c1y, c2x, c2y,
+        ),
+      ));
+
+      // Unlike every other write to this layer, actions are left enabled
+      // so the change is animated rather than applied outright.
+      Self::update_layer(
+        layer,
+        &target_rect,
+        &outer_rect,
+        opacity.as_ref(),
+      );
+      CATransaction::commit();
     })
   }
 
@@ -253,7 +335,13 @@ impl CapturedFrame {
       cg_rect_null,
       CGWindowListOption::OptionIncludingWindow,
       window_id.0,
-      CGWindowImageOption::BestResolution
+      // `BestResolution` captures at the display's backing scale, so a
+      // 1478x1628 window on a 2x panel is ~2956x3256 px — around 38MB,
+      // taken synchronously before the animation clock starts. A swap
+      // pays it twice in a row, which reads as a stall before the slide.
+      // Logical resolution is a quarter of the data; the ghost is softer
+      // than the real window for the length of the tween.
+      CGWindowImageOption::NominalResolution
         .union(CGWindowImageOption::BoundsIgnoreFraming),
     )
     .ok_or(crate::Error::Platform(

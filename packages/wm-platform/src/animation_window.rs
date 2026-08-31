@@ -106,6 +106,46 @@ impl AnimationWindow {
     self.inner.update(inner_rect, opacity)
   }
 
+  /// Whether the platform interpolates an animation for itself.
+  ///
+  /// When `true`, a caller starts an animation once with
+  /// [`AnimationWindow::animate_to`] and does not drive it; the platform
+  /// compositor produces every frame. When `false`, the caller ticks and
+  /// calls [`AnimationWindow::update`] per frame.
+  pub const SELF_ANIMATING: bool = cfg!(target_os = "macos");
+
+  /// Animates the layer to `target_rect` over `duration`, returning as
+  /// soon as the animation is handed to the compositor.
+  ///
+  /// Only meaningful when [`AnimationWindow::SELF_ANIMATING`] is `true`.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: hands the transition to Core Animation, which interpolates
+  ///   on the render server. One hop to the main thread covers the whole
+  ///   animation instead of one per frame.
+  /// - Windows: unimplemented; the caller ticks `update` instead.
+  pub fn animate_to(
+    &self,
+    target_rect: &Rect,
+    duration: std::time::Duration,
+    easing: &crate::EasingFunction,
+    opacity: Option<&OpacityValue>,
+  ) -> crate::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+      self
+        .inner
+        .animate_to(target_rect, duration, easing, opacity)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+      let _ = (target_rect, duration, easing, opacity);
+      Ok(())
+    }
+  }
+
   /// Destroys the window and releases GPU resources.
   pub fn destroy(self) -> crate::Result<()> {
     self.inner.destroy()

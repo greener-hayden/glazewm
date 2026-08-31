@@ -106,6 +106,15 @@ fn set_tiling(
     // siblings, scale to 0.5 * (2/3) to maintain proportional sizing.
     let target_size = insertion_target.prev_tiling_size * size_scale;
     resize_tiling_container(&tiling_window.clone().into(), target_size);
+  } else {
+    // No remembered slot to scale from — the window never had one, or it
+    // was dropped above because its workspace is no longer displayed. A
+    // converted window is built at `tiling_size: 1.0`, so without this it
+    // arrives claiming the whole workspace and squeezes every sibling to
+    // the minimum. An equal share is the same thing a newly managed
+    // window would get.
+    let share = 1.0 / (tiling_window.tiling_siblings().count() + 1) as f32;
+    resize_tiling_container(&tiling_window.clone().into(), share);
   }
 
   state

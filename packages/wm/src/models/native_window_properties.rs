@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[cfg(target_os = "macos")]
 use wm_platform::NativeWindowExtMacOs;
 use wm_platform::{NativeWindow, Rect};
@@ -7,6 +9,13 @@ use wm_platform::{NativeWindowWindowsExt, RectDelta};
 #[derive(Debug, Clone)]
 pub struct NativeWindowProperties {
   pub title: String,
+
+  /// When `title` was last read from the platform.
+  ///
+  /// Reading a title is a blocking call into the owning app, and a
+  /// terminal rewrites its title several times a second while busy, so
+  /// the reads land exactly when that app is slowest to answer.
+  pub title_read_at: Instant,
   #[cfg(target_os = "windows")]
   pub class_name: String,
   #[cfg(target_os = "macos")]
@@ -26,6 +35,7 @@ impl TryFrom<&NativeWindow> for NativeWindowProperties {
   fn try_from(native_window: &NativeWindow) -> Result<Self, Self::Error> {
     Ok(Self {
       title: native_window.title()?,
+      title_read_at: Instant::now(),
       #[cfg(target_os = "windows")]
       class_name: native_window.class_name()?,
       #[cfg(target_os = "macos")]

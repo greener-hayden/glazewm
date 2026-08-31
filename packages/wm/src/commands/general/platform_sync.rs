@@ -387,6 +387,24 @@ fn redraw_containers(
       None => false,
     };
 
+    // An animation owns its window's visibility until it completes, and
+    // not merely for the sync that started it. A later sync routinely
+    // finds the window already at its target, declines to animate, and
+    // would then restore opacity on a window whose captured copy is
+    // still travelling — which is the real window reappearing at its
+    // destination mid-flight.
+    let animation_owns_window =
+      is_animating || state.animation_manager.is_animating(&window.id());
+
+    // A switch reveals its incoming windows across more than one sync, and
+    // the reveal does not always land in the sync that starts the slide. A
+    // window uncloaked opaque before its animation begins is on screen at
+    // its destination while the outgoing workspace is still leaving, which
+    // is the workspace being visible twice. So while a slide is pending,
+    // uncloak but stay transparent; the animation, or the first sync after
+    // the slide is over, brings the opacity back.
+    let slide_pending = state.pending_sync.workspace_slide().is_some();
+
     tracing::debug!("Updating window position: {window}");
 
     // Hide the real window when an animation layer is active.
@@ -395,8 +413,11 @@ fn redraw_containers(
       &target_rect,
       *hide_corner,
       &z_order,
-      is_animating,
-      is_visible,
+      Visibility {
+        animating: animation_owns_window,
+        visible: is_visible,
+        slide_pending,
+      },
       config,
     ) {
       tracing::warn!("Failed to set window position: {}", err);
@@ -446,6 +467,19 @@ fn redraw_containers(
   Ok(())
 }
 
+/// The three facts that decide whether the real window is on screen, as
+/// opposed to a captured copy of it standing in.
+#[derive(Clone, Copy)]
+struct Visibility {
+  /// An animation owns this window's opacity right now, either because
+  /// this sync started one or because one is still in flight.
+  animating: bool,
+  /// The window belongs to the workspace being displayed.
+  visible: bool,
+  /// This sync is part of a workspace switch that slides.
+  slide_pending: bool,
+}
+
 fn reposition_window(
   window: &WindowContainer,
   rect: &Rect,
@@ -453,17 +487,18 @@ fn reposition_window(
   // LINT: `z_order` is only used on Windows.
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   z_order: &WindowZOrder,
-  is_animation_start: bool,
-  is_visible: bool,
+  // LINT: `vis` is only fully used on Windows.
+  #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+  vis: Visibility,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
   let rect = rect.apply_delta(&window.total_border_delta()?, None);
 
   // For animations on macOS and `HideMethod::PlaceInCorner`, we need to
   // hide windows by repositioning them in the corner of the monitor.
-  if (cfg!(target_os = "macos") && is_animation_start)
+  if (cfg!(target_os = "macos") && vis.animating)
     || (config.value.general.hide_method == HideMethod::PlaceInCorner
-      && !is_visible)
+      && !vis.visible)
   {
     const VISIBLE_SLIVER: i32 = 1;
 
@@ -569,7 +604,7 @@ fn reposition_window(
         }
       }
 
-      apply_visibility(window, is_animation_start, is_visible, config)?;
+      apply_visibility(window, vis, config)?;
     }
   }
 
@@ -581,21 +616,28 @@ fn reposition_window(
 #[cfg(target_os = "windows")]
 fn apply_visibility(
   window: &WindowContainer,
-  is_animation_start: bool,
-  is_visible: bool,
+  vis: Visibility,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  if !is_animation_start {
+  let is_visible = vis.visible;
+
+  if !vis.animating {
+    // Held back only while the window is arriving. One that is leaving
+    // keeps its pixels until its own animation hides it.
+    let hold_for_slide = vis.slide_pending && is_visible;
+
+    let alpha = if hold_for_slide { 0 } else { u8::MAX };
+
     if config.value.general.hide_method == HideMethod::Cloak {
       window.native().set_cloaked(!is_visible)?;
       window
         .native()
-        .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
+        .set_transparency(&OpacityValue::from_alpha(alpha))?;
     } else if is_visible {
       window.native().show()?;
       window
         .native()
-        .set_transparency(&OpacityValue::from_alpha(u8::MAX))?;
+        .set_transparency(&OpacityValue::from_alpha(alpha))?;
     } else {
       window.native().hide()?;
     }

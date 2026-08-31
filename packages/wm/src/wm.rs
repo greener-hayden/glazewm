@@ -184,11 +184,17 @@ impl WindowManager {
         .queue_containers_to_redraw(windows)
         .set_skip_animations(true);
 
-      platform_sync(&mut self.state, config)?;
-
+      // Retire the animations first. The redraw below is what restores the
+      // real window, and it now refuses to do that while an animation is
+      // still registered, so leaving them in the map until afterwards
+      // would hide the window permanently. The overlay is
+      // unaffected: it is torn down on a short delay of its own,
+      // which is what keeps the handover from flickering.
       for completed_id in &completed_ids {
         self.state.animation_manager.destroy_animation(completed_id);
       }
+
+      platform_sync(&mut self.state, config)?;
     }
 
     Ok(())

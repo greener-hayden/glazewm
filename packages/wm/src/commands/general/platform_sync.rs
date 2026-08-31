@@ -467,12 +467,6 @@ fn redraw_containers(
 
     tracing::debug!("Updating window position: {window}");
 
-    // Repositioning is a blocking accessibility write on the event loop
-    // thread, so a slow one stalls input and every other window with it.
-    // Timing it is the only way to tell an app that is slow to answer
-    // from time spent elsewhere in the sync.
-    let repositioned_at = std::time::Instant::now();
-
     // Hide the real window when an animation layer is active.
     if let Err(err) = reposition_window(
       window,
@@ -488,11 +482,6 @@ fn redraw_containers(
     ) {
       tracing::warn!("Failed to set window position: {}", err);
     }
-
-    tracing::debug!(
-      "Repositioned in {}ms: {window}",
-      repositioned_at.elapsed().as_millis()
-    );
 
     // Whether the window is either transitioning to or from fullscreen.
     // TODO: This check can be improved since `prev_state` can be

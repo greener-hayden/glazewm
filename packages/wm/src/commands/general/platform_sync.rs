@@ -632,9 +632,20 @@ fn apply_visibility(
 
     if config.value.general.hide_method == HideMethod::Cloak {
       window.native().set_cloaked(!is_visible)?;
-      window
-        .native()
-        .set_transparency(&OpacityValue::from_alpha(alpha))?;
+
+      // Only a window that will be seen needs its opacity back. Restoring
+      // it on one being hidden is not merely redundant, it flashes:
+      // the cloak and the alpha both land on the compositor's next
+      // frame, and if the alpha wins the race the window is briefly
+      // opaque and uncloaked at its old tile. That is the outgoing
+      // workspace showing through at the end of a switch. Every path
+      // that shows a window sets alpha itself, so leaving a hidden
+      // one transparent costs nothing.
+      if is_visible {
+        window
+          .native()
+          .set_transparency(&OpacityValue::from_alpha(alpha))?;
+      }
     } else if is_visible {
       window.native().show()?;
       window

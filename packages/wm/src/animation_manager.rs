@@ -20,9 +20,66 @@ use crate::{
   user_config::UserConfig,
 };
 
+#[derive(Clone, Copy, Debug)]
 pub enum AnimationTrigger {
   WindowOpened,
   WindowMoved,
+  /// A window arriving with the workspace being switched to. It starts
+  /// one screen away, on the side it is travelling from.
+  WorkspaceEntering(SlideDirection),
+  /// A window leaving with the workspace being switched away from. It
+  /// ends one screen away and is hidden once it gets there.
+  WorkspaceLeaving(SlideDirection),
+}
+
+/// Which way the workspaces travel during a switch.
+///
+/// Named for the motion of the content, not the key pressed: moving to a
+/// higher-numbered workspace sends the old content `Left` and brings the
+/// new one in from the right, the way a pager works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlideDirection {
+  Left,
+  Right,
+}
+
+impl SlideDirection {
+  /// Offsets `rect` by one monitor width in this direction.
+  ///
+  /// A whole monitor rather than the window's own width so every window on
+  /// the workspace travels the same distance and the layout moves as one
+  /// sheet. Offsetting by each window's width would have them arrive at
+  /// different times and read as a scatter.
+  #[must_use]
+  pub fn offset(self, rect: &Rect, monitor: &Rect) -> Rect {
+    let distance = match self {
+      Self::Left => -monitor.width(),
+      Self::Right => monitor.width(),
+    };
+
+    rect.translate_to_coordinates(rect.x() + distance, rect.y())
+  }
+
+  /// The side an entering workspace arrives from, which is the side the
+  /// outgoing one is heading toward.
+  #[must_use]
+  pub fn opposite(self) -> Self {
+    match self {
+      Self::Left => Self::Right,
+      Self::Right => Self::Left,
+    }
+  }
+
+  /// The direction the outgoing workspace travels when moving from
+  /// `from_index` to `to_index` in the monitor's workspace order.
+  #[must_use]
+  pub fn between(from_index: usize, to_index: usize) -> Self {
+    if to_index > from_index {
+      Self::Left
+    } else {
+      Self::Right
+    }
+  }
 }
 
 /// State of an individual window animation.
@@ -261,6 +318,14 @@ impl AnimationManager {
         }
       }
       (
+        AnimationTrigger::WorkspaceEntering(_)
+        | AnimationTrigger::WorkspaceLeaving(_),
+        AnimationsConfig {
+          workspace_switch: Some(switch_config),
+          ..
+        },
+      ) => Some(switch_config),
+      (
         AnimationTrigger::WindowMoved,
         AnimationsConfig {
           window_move: Some(move_config),
@@ -296,6 +361,11 @@ impl AnimationManager {
 
   /// Starts a new animation, or extends an existing animation.
   #[allow(clippy::too_many_arguments)]
+  /// `start_override` forces where the animation begins, for a window that
+  /// is not currently where it should appear to come from. A workspace
+  /// entering from off screen is the case that needs it: its real frame is
+  /// already the tile it will occupy, so without an override there is
+  /// nothing to travel.
   pub fn start_animation(
     &mut self,
     window: &WindowContainer,
@@ -303,6 +373,7 @@ impl AnimationManager {
     target_rect: Rect,
     monitor_properties: &NativeMonitorProperties,
     dispatcher: &Dispatcher,
+    start_override: Option<Rect>,
   ) -> anyhow::Result<()> {
     let existing_animation = self.animations.get(&window.id());
 
@@ -310,10 +381,12 @@ impl AnimationManager {
     // skipped if the animation is behind, the frame rate is variable.
     let frame_rate = monitor_properties.refresh_rate.unwrap_or(60);
 
-    let start_rect = existing_animation.map_or_else(
-      || window.native_properties().frame.clone(),
-      WindowAnimationState::current_rect,
-    );
+    let start_rect = start_override.unwrap_or_else(|| {
+      existing_animation.map_or_else(
+        || window.native_properties().frame.clone(),
+        WindowAnimationState::current_rect,
+      )
+    });
 
     let animation = WindowAnimationState::new(
       start_rect,

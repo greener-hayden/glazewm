@@ -395,6 +395,14 @@ pub struct WorkspaceConfig {
 pub struct AnimationsConfig {
   pub window_move: Option<WindowMoveAnimationConfig>,
   pub window_open: Option<AnimationEffectConfig>,
+  /// Slides the outgoing workspace off screen and the incoming one on,
+  /// in the direction of travel.
+  ///
+  /// Separate from `window_move` because a switch is not a move: the
+  /// windows involved do not travel between the two layouts, they are
+  /// replaced. Reusing the move animation slides each window from
+  /// wherever it happened to be, which is why upstream left this off.
+  pub workspace_switch: Option<AnimationEffectConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

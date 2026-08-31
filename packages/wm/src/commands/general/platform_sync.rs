@@ -296,24 +296,51 @@ fn redraw_containers(
     );
 
     // Determine the animation effect to apply, if any.
-    let animation_effect = if state.pending_sync.should_skip_animations() {
+    let animation_trigger = if state.pending_sync.should_skip_animations()
+    {
       None
-    } else {
-      let animation_trigger = if is_visible
-        && state.pending_sync.open_animation_windows().contains(window)
-      {
-        AnimationTrigger::WindowOpened
+    } else if let Some(direction) = state.pending_sync.workspace_slide() {
+      // A switch moves both workspaces at once: the one being hidden
+      // leaves toward `direction`, the one being shown arrives from the
+      // other side. `is_visible` is derived from the display state
+      // transition set just above, so it already distinguishes them.
+      Some(if is_visible {
+        AnimationTrigger::WorkspaceEntering(direction)
       } else {
-        AnimationTrigger::WindowMoved
-      };
+        AnimationTrigger::WorkspaceLeaving(direction)
+      })
+    } else if is_visible
+      && state.pending_sync.open_animation_windows().contains(window)
+    {
+      Some(AnimationTrigger::WindowOpened)
+    } else {
+      Some(AnimationTrigger::WindowMoved)
+    };
 
+    let animation_effect = animation_trigger.and_then(|trigger| {
       state.animation_manager.animation_effect_for_window(
         window,
-        animation_trigger,
+        trigger,
         &target_rect,
         &monitor.native_properties(),
         config,
       )
+    });
+
+    // Where the animation runs between, which is not always where the real
+    // window goes. A leaving workspace ends one screen away and is hidden
+    // there; an entering one starts one screen away. Everything else
+    // animates to the tile it actually occupies.
+    let monitor_rect = monitor.native_properties().bounds.clone();
+    let (anim_start, anim_target) = match animation_trigger {
+      Some(AnimationTrigger::WorkspaceLeaving(direction)) => {
+        (None, direction.offset(&target_rect, &monitor_rect))
+      }
+      Some(AnimationTrigger::WorkspaceEntering(direction)) => (
+        Some(direction.opposite().offset(&target_rect, &monitor_rect)),
+        target_rect.clone(),
+      ),
+      _ => (None, target_rect.clone()),
     };
 
     // Whether an animation is actually running, which is not the same as
@@ -328,9 +355,10 @@ fn redraw_containers(
         match state.animation_manager.start_animation(
           window,
           effect_config,
-          target_rect.clone(),
+          anim_target.clone(),
           &monitor.native_properties(),
           &state.dispatcher,
+          anim_start.clone(),
         ) {
           Ok(()) => true,
           Err(err) => {

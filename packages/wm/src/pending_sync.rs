@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::{
+  animation_manager::SlideDirection,
   models::{Container, WindowContainer, Workspace},
   traits::CommonGetters,
 };
@@ -36,6 +37,11 @@ pub struct PendingSync {
 
   /// Whether to skip animations for the current sync.
   skip_animations: bool,
+
+  /// Set when this sync is a workspace switch, to the direction the
+  /// content travels. Windows being shown enter from the opposite side;
+  /// windows being hidden leave toward it.
+  workspace_slide: Option<SlideDirection>,
 }
 
 impl PendingSync {
@@ -58,6 +64,7 @@ impl PendingSync {
     self.needs_all_effects_update = false;
     self.needs_cursor_jump = false;
     self.skip_animations = false;
+    self.workspace_slide = None;
     self
   }
 
@@ -140,6 +147,20 @@ impl PendingSync {
 
   pub fn should_skip_animations(&self) -> bool {
     self.skip_animations
+  }
+
+  /// Marks this sync as a workspace switch travelling in `direction`.
+  pub fn set_workspace_slide(
+    &mut self,
+    direction: Option<SlideDirection>,
+  ) -> &mut Self {
+    self.workspace_slide = direction;
+    self
+  }
+
+  /// The direction this switch travels, or `None` if this sync is not one.
+  pub fn workspace_slide(&self) -> Option<SlideDirection> {
+    self.workspace_slide
   }
 
   pub fn needs_focus_update(&self) -> bool {

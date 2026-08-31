@@ -3,10 +3,11 @@ use tracing::info;
 
 use super::activate_workspace;
 use crate::{
+  animation_manager::SlideDirection,
   commands::{
     container::set_focused_descendant, workspace::deactivate_workspace,
   },
-  models::WorkspaceTarget,
+  models::{Workspace, WorkspaceTarget},
   traits::CommonGetters,
   user_config::UserConfig,
   wm_state::WmState,
@@ -68,13 +69,39 @@ pub fn focus_workspace(
     set_focused_descendant(&container_to_focus, None);
     state.pending_sync.queue_focus_change();
 
-    // Display the workspace to switch focus to.
+    // Which way the content travels, ordered the way `Next`/`Previous`
+    // order workspaces: by position in the configured list, not by
+    // activation order. Moving to a later workspace sends the old content
+    // left and brings the new one in from the right, as a pager does.
+    //
+    // `None` when either workspace is absent from the config, which is the
+    // case for a workspace created on the fly. There is no defensible
+    // direction to slide then, so that switch stays a cut.
+    let slide = config
+      .value
+      .animations
+      .workspace_switch
+      .as_ref()
+      .and_then(|_| {
+        let names = &config.value.workspaces;
+        let index_of = |workspace: &Workspace| {
+          let name = workspace.config().name.clone();
+          names.iter().position(|entry| entry.name == name)
+        };
+
+        Some(SlideDirection::between(
+          index_of(&displayed_workspace)?,
+          index_of(&target_workspace)?,
+        ))
+      });
+
+    // Display the workspace to switch focus to. A switch is not a move, so
+    // the move animation is still wrong for it: with no slide configured
+    // this stays a hard cut, which is what upstream does unconditionally.
     state
       .pending_sync
-      // TODO: Add animations specifically for workspace switches. For now,
-      // skip the animation since using the normal movement animation will
-      // look strange.
-      .set_skip_animations(true)
+      .set_skip_animations(slide.is_none())
+      .set_workspace_slide(slide)
       .queue_container_to_redraw(displayed_workspace)
       .queue_container_to_redraw(target_workspace);
 

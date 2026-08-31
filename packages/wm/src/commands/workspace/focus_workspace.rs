@@ -70,59 +70,69 @@ pub fn focus_workspace(
     set_focused_descendant(&container_to_focus, None);
     state.pending_sync.queue_focus_change();
 
-    // Which way the content travels, ordered the way `Next`/`Previous`
-    // order workspaces: by position in the configured list, not by
-    // activation order. Moving to a later workspace sends the old content
-    // left and brings the new one in from the right, as a pager does.
-    //
-    // `None` when either workspace is absent from the config, which is the
-    // case for a workspace created on the fly. There is no defensible
-    // direction to slide then, so that switch stays a cut.
-    let slide = config
-      .value
-      .animations
-      .workspace_switch
-      .as_ref()
-      .and_then(|_| {
-        let names = &config.value.workspaces;
-        let index_of = |workspace: &Workspace| {
-          let name = workspace.config().name.clone();
-          names.iter().position(|entry| entry.name == name)
-        };
+    // Refocusing the workspace already on screen moves focus without
+    // changing what is displayed. Sliding it, redrawing both workspaces
+    // and collecting an empty one are all answers to a switch that did
+    // not happen — and `SlideDirection::between` yields a direction even
+    // for equal indices, so the slide fires and every window on the
+    // monitor travels a screen width and back for a no-op.
+    if displayed_workspace.id() != target_workspace.id() {
+      // Which way the content travels, ordered the way `Next`/`Previous`
+      // order workspaces: by position in the configured list, not by
+      // activation order. Moving to a later workspace sends the old
+      // content left and brings the new one in from the right, as a pager
+      // does.
+      //
+      // `None` when either workspace is absent from the config, which is
+      // the case for a workspace created on the fly. There is no
+      // defensible direction to slide then, so that switch stays a cut.
+      let slide = config
+        .value
+        .animations
+        .workspace_switch
+        .as_ref()
+        .and_then(|_| {
+          let names = &config.value.workspaces;
+          let index_of = |workspace: &Workspace| {
+            let name = workspace.config().name.clone();
+            names.iter().position(|entry| entry.name == name)
+          };
 
-        Some(SlideDirection::between(
-          index_of(&displayed_workspace)?,
-          index_of(&target_workspace)?,
-        ))
-      });
+          Some(SlideDirection::between(
+            index_of(&displayed_workspace)?,
+            index_of(&target_workspace)?,
+          ))
+        });
 
-    // Display the workspace to switch focus to. A switch is not a move, so
-    // the move animation is still wrong for it: with no slide configured
-    // this stays a hard cut, which is what upstream does unconditionally.
-    state
-      .pending_sync
-      .set_skip_animations(slide.is_none())
-      .set_workspace_slide(slide, Some(monitor.id()))
-      .queue_container_to_redraw(displayed_workspace)
-      .queue_container_to_redraw(target_workspace);
+      // Display the workspace to switch focus to. A switch is not a move,
+      // so the move animation is still wrong for it: with no slide
+      // configured this stays a hard cut, which is what upstream does
+      // unconditionally.
+      state
+        .pending_sync
+        .set_skip_animations(slide.is_none())
+        .set_workspace_slide(slide, Some(monitor.id()))
+        .queue_container_to_redraw(displayed_workspace)
+        .queue_container_to_redraw(target_workspace.clone());
 
-    // Get empty workspace to destroy (if one is found). Cannot destroy
-    // empty workspaces if they're the only workspace on the monitor.
-    //
-    // Scoped to the monitor that switched. Searching every monitor lets a
-    // switch here collect a stray empty workspace over there, and that
-    // deactivation is a second workspace transition — which the other
-    // monitor's windows answer by sliding off screen and back, for a
-    // switch they were never part of.
-    let workspace_to_destroy =
-      monitor.workspaces().into_iter().find(|workspace| {
-        !workspace.config().keep_alive
-          && !workspace.has_children()
-          && !workspace.is_displayed()
-      });
+      // Get empty workspace to destroy (if one is found). Cannot destroy
+      // empty workspaces if they're the only workspace on the monitor.
+      //
+      // Scoped to the monitor that switched. Searching every monitor lets
+      // a switch here collect a stray empty workspace over there, and
+      // that deactivation is a second workspace transition — which the
+      // other monitor's windows answer by sliding off screen and back,
+      // for a switch they were never part of.
+      let workspace_to_destroy =
+        monitor.workspaces().into_iter().find(|workspace| {
+          !workspace.config().keep_alive
+            && !workspace.has_children()
+            && !workspace.is_displayed()
+        });
 
-    if let Some(workspace) = workspace_to_destroy {
-      deactivate_workspace(workspace, state)?;
+      if let Some(workspace) = workspace_to_destroy {
+        deactivate_workspace(workspace, state)?;
+      }
     }
 
     // Save the currently focused workspace as recent.

@@ -249,7 +249,7 @@ impl AnimationWindow {
     let outer_rect = self.outer_rect.clone();
     let target_rect = target_rect.clone();
     let easing = easing.clone();
-    let opacity = opacity.cloned();
+    let opacity = opacity.copied();
 
     self.layer.with(move |layer| {
       let (c1x, c1y, c2x, c2y) = control_points(&easing);

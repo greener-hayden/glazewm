@@ -28,7 +28,7 @@ pub struct Application {
 
   /// Cached `AXEnhancedUserInterface`, read on first use.
   ///
-  /// An app-level mode that only changes when something like VoiceOver
+  /// An app-level mode that only changes when something like `VoiceOver`
   /// toggles it, but it gates every frame set, so reading it each time
   /// costs a blocking round trip per window per move.
   pub(crate) enhanced_ui: Arc<OnceLock<bool>>,

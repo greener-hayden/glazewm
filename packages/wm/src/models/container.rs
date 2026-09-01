@@ -116,6 +116,62 @@ impl PartialEq for Container {
 
 impl Eq for Container {}
 
+impl TilingContainer {
+  /// Smallest this container can be along an axis, in pixels.
+  ///
+  /// A window's floor is one it has been observed to insist on. A split
+  /// that divides the same axis has to fit all of its children end to
+  /// end, gaps included; one that divides the other axis stacks them, so
+  /// it only has to be as wide as its widest child.
+  ///
+  /// Returns 0 where nothing is known, which leaves the layout free.
+  pub fn min_length(&self, is_horizontal: bool) -> i32 {
+    match self {
+      Self::TilingWindow(window) => window
+        .native_properties()
+        .min_size
+        .map_or(
+          0,
+          |(width, height)| {
+            if is_horizontal {
+              width
+            } else {
+              height
+            }
+          },
+        ),
+      Self::Split(split) => {
+        let children = split.tiling_children().collect::<Vec<_>>();
+
+        let mins =
+          children.iter().map(|child| child.min_length(is_horizontal));
+
+        let divides_axis =
+          matches!(split.tiling_direction(), TilingDirection::Horizontal)
+            == is_horizontal;
+
+        if divides_axis {
+          let gap =
+            split.inner_gaps().map_or(0, |(horizontal, vertical)| {
+              if is_horizontal {
+                horizontal
+              } else {
+                vertical
+              }
+            });
+
+          mins.sum::<i32>()
+            + gap
+              * i32::try_from(children.len().saturating_sub(1))
+                .unwrap_or(0)
+        } else {
+          mins.max().unwrap_or(0)
+        }
+      }
+    }
+  }
+}
+
 impl PartialEq for TilingContainer {
   fn eq(&self, other: &Self) -> bool {
     self.id() == other.id()

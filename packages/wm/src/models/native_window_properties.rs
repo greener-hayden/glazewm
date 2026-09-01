@@ -25,6 +25,17 @@ pub struct NativeWindowProperties {
   pub is_minimized: bool,
   pub is_maximized: bool,
   pub is_resizable: bool,
+
+  /// Smallest frame the window has been observed to accept.
+  ///
+  /// Learned, not read: an accessibility resize reports success and is
+  /// then clamped inside the owning app, so the only way to know a
+  /// window's floor is to have asked for less and been refused. `None`
+  /// until that happens, and cleared again the moment the window takes
+  /// something smaller — a browser collapsing its sidebar lowers its own
+  /// minimum, and a floor kept from before that would waste the space
+  /// forever.
+  pub min_size: Option<(i32, i32)>,
   #[cfg(target_os = "windows")]
   pub shadow_borders: RectDelta,
 }
@@ -45,6 +56,7 @@ impl TryFrom<&NativeWindow> for NativeWindowProperties {
       is_minimized: native_window.is_minimized()?,
       is_maximized: native_window.is_maximized()?,
       is_resizable: native_window.is_resizable()?,
+      min_size: None,
       #[cfg(target_os = "windows")]
       shadow_borders: native_window.shadow_borders()?,
     })

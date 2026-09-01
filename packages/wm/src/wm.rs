@@ -229,6 +229,21 @@ impl WindowManager {
         && (frame.height() - expected.rect.height()).abs() <= TOLERANCE_PX;
 
       if took_it {
+        // A window that takes less than its recorded floor has moved
+        // its own goalposts — a browser collapsing a sidebar does this —
+        // so the floor is dropped rather than reserving space forever.
+        if window.native_properties().min_size.is_some_and(
+          |(width, height)| {
+            frame.width() < width || frame.height() < height
+          },
+        ) {
+          window.update_native_properties(|properties| {
+            properties.min_size = None;
+          });
+
+          self.state.pending_sync.queue_container_to_redraw(window);
+        }
+
         self.state.expected_frames.remove(&id);
         continue;
       }
@@ -244,7 +259,24 @@ impl WindowManager {
           expected.attempts
         );
 
+        // Asked five times over more than a second and refused every
+        // time: this is the app's own floor, not a write that went
+        // missing. Recording it lets the layout reserve the space
+        // instead of handing out a slot the window will overhang.
+        window.update_native_properties(|properties| {
+          properties.min_size = Some((frame.width(), frame.height()));
+        });
+
         self.state.expected_frames.remove(&id);
+
+        // The parent, not the window: reserving this floor changes what
+        // every sibling is owed, and the window itself is already the
+        // size it insisted on.
+        let to_redraw =
+          window.parent().unwrap_or_else(|| window.clone().into());
+
+        self.state.pending_sync.queue_container_to_redraw(to_redraw);
+
         continue;
       }
 

@@ -121,6 +121,7 @@ impl NativeWindowProperties {
     #[builder(default = false)] is_minimized: bool,
     #[builder(default = false)] is_maximized: bool,
     #[builder(default = true)] is_resizable: bool,
+    min_size: Option<(i32, i32)>,
   ) -> Self {
     Self {
       title,
@@ -130,6 +131,7 @@ impl NativeWindowProperties {
       is_minimized,
       is_maximized,
       is_resizable,
+      min_size,
       #[cfg(target_os = "macos")]
       bundle_id: None,
       #[cfg(target_os = "windows")]

@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{bail, Context};
 use tokio::sync::mpsc::{self};
 use tracing::warn;
@@ -156,6 +158,107 @@ impl WindowManager {
     }
 
     Ok(())
+  }
+
+  /// How long a written frame is given before it is asked for again.
+  ///
+  /// Long enough that an app which merely needed a moment is not asked
+  /// twice for the same thing, short enough that a dropped write is not
+  /// left standing where the user can see it.
+  const FRAME_SETTLE: Duration = Duration::from_millis(250);
+
+  /// How many times a frame is written before the app is taken at its
+  /// word.
+  const FRAME_ATTEMPTS: u8 = 5;
+
+  /// Writes again any frame an app accepted and then quietly dropped.
+  ///
+  /// A resize returns success whether or not the app acts on it, and an
+  /// app that drops one sends no event to say so — so there is no signal
+  /// to react to, only the absence of the change. This polls for that
+  /// absence, which is why it runs on a timer rather than from an event
+  /// handler.
+  ///
+  /// Nothing here touches the layout. The only write is the same rect
+  /// `platform_sync` already decided on, so the worst a spurious re-ask
+  /// can do is repeat a write the window has already taken.
+  pub fn reassert_frames(
+    &mut self,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
+    /// Rounding and a settling window both land within this.
+    const TOLERANCE_PX: i32 = 20;
+
+    if self.state.is_paused || self.state.expected_frames.is_empty() {
+      return Ok(());
+    }
+
+    let now = Instant::now();
+
+    let due = self
+      .state
+      .expected_frames
+      .iter()
+      .filter(|(_, expected)| {
+        now.duration_since(expected.written_at) >= Self::FRAME_SETTLE
+      })
+      .map(|(id, expected)| (*id, expected.clone()))
+      .collect::<Vec<_>>();
+
+    for (id, expected) in due {
+      let Some(window) =
+        self.state.windows().into_iter().find(|w| w.id() == id)
+      else {
+        self.state.expected_frames.remove(&id);
+        continue;
+      };
+
+      // An animating window is mid-flight between two frames of ours and
+      // is not answerable for either yet.
+      if self.state.animation_manager.is_animating(&id) {
+        continue;
+      }
+
+      let Ok(frame) = window.native().frame() else {
+        self.state.expected_frames.remove(&id);
+        continue;
+      };
+
+      let took_it = (frame.width() - expected.rect.width()).abs()
+        <= TOLERANCE_PX
+        && (frame.height() - expected.rect.height()).abs() <= TOLERANCE_PX;
+
+      if took_it {
+        self.state.expected_frames.remove(&id);
+        continue;
+      }
+
+      if expected.attempts >= Self::FRAME_ATTEMPTS {
+        warn!(
+          "Window kept {}x{} against the {}x{} it was given, after {} \
+           attempts: {window}",
+          frame.width(),
+          frame.height(),
+          expected.rect.width(),
+          expected.rect.height(),
+          expected.attempts
+        );
+
+        self.state.expected_frames.remove(&id);
+        continue;
+      }
+
+      // Animating the re-ask would park the window and restore it a
+      // frame later, which is the pair of writes that loses a size in the
+      // first place. A correction has to be the one write.
+      self
+        .state
+        .pending_sync
+        .set_skip_animations(true)
+        .queue_container_to_redraw(window);
+    }
+
+    Self::flush_pending_sync(&mut self.state, config)
   }
 
   /// Updates all active animations and redraws windows that are animating.

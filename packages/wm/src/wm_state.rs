@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+  collections::HashMap,
+  time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use tokio::sync::mpsc::{self};
@@ -52,6 +55,19 @@ struct PendingFollow {
   requested_at: Instant,
 }
 
+/// A frame written to a window, awaiting confirmation that it took.
+#[derive(Clone, Debug)]
+pub struct ExpectedFrame {
+  /// The rect last written to the window.
+  pub rect: Rect,
+
+  /// When it was written.
+  pub written_at: Instant,
+
+  /// How many times it has been written.
+  pub attempts: u8,
+}
+
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
@@ -84,6 +100,15 @@ pub struct WmState {
 
   /// Deferred off-screen focus follow awaiting churn confirmation.
   pending_follow: Option<PendingFollow>,
+
+  /// Frames written to windows that have yet to be confirmed.
+  ///
+  /// An accessibility resize reports success and is then dropped by an
+  /// app that is busy, and the app sends no event when it does so. There
+  /// is therefore nothing to react to: the window keeps a size nobody
+  /// asked for until an unrelated layout change happens to write again.
+  /// Holding what was written is what lets a timer notice and re-ask.
+  pub expected_frames: HashMap<Uuid, ExpectedFrame>,
 
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
@@ -130,6 +155,7 @@ impl WmState {
       recent_workspace_name: None,
       unmanaged_or_minimized_timestamp: None,
       pending_follow: None,
+      expected_frames: HashMap::new(),
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       is_paused: false,

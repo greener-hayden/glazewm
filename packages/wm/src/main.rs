@@ -181,6 +181,14 @@ async fn start_wm(
   }
 
   // Create an interval for periodically cleaning up invalid windows.
+  // Polls for resizes an app accepted and dropped. See
+  // `Wm::reassert_frames`; a dropped write raises no event, so the only
+  // way to notice is to look.
+  let mut reassert_interval =
+    tokio::time::interval(Duration::from_millis(250));
+  reassert_interval
+    .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
   cleanup_interval
     .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -217,6 +225,9 @@ async fn start_wm(
         tracing::debug!("Received keyboard event: {:?}", event);
         wm.process_event(PlatformEvent::Keybinding(event), &mut config)
       }
+      _ = reassert_interval.tick() => {
+        wm.reassert_frames(&config)
+      },
       _ = cleanup_interval.tick() => {
         if wm.state.is_paused {
           Ok(())

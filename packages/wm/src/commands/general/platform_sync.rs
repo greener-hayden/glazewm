@@ -18,7 +18,7 @@ use crate::{
   models::{Container, WindowContainer},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
-  wm_state::WmState,
+  wm_state::{ExpectedFrame, WmState},
 };
 
 pub fn platform_sync(
@@ -468,7 +468,7 @@ fn redraw_containers(
     tracing::debug!("Updating window position: {window}");
 
     // Hide the real window when an animation layer is active.
-    if let Err(err) = reposition_window(
+    match reposition_window(
       window,
       &target_rect,
       *hide_corner,
@@ -480,7 +480,30 @@ fn redraw_containers(
       },
       config,
     ) {
-      tracing::warn!("Failed to set window position: {}", err);
+      // Only a rect we wrote is worth confirming, so the record is made
+      // here rather than inferred later from the layout. A re-ask writes
+      // the same rect and arrives back here, so the attempt count has to
+      // survive that; a different rect is a fresh ask and starts over.
+      Ok(written) => {
+        let attempts = state
+          .expected_frames
+          .get(&window.id())
+          .filter(|expected| expected.rect == written)
+          .map_or(0, |expected| expected.attempts);
+
+        state.expected_frames.insert(
+          window.id(),
+          ExpectedFrame {
+            rect: written,
+            written_at: std::time::Instant::now(),
+            attempts: attempts.saturating_add(1),
+          },
+        );
+      }
+      Err(err) => {
+        state.expected_frames.remove(&window.id());
+        tracing::warn!("Failed to set window position: {}", err);
+      }
     }
 
     // Whether the window is either transitioning to or from fullscreen.
@@ -549,6 +572,8 @@ struct Visibility {
   slide_pending: bool,
 }
 
+/// Returns the rect actually written to the window, which is the corner
+/// rather than `rect` when the window is being parked.
 fn reposition_window(
   window: &WindowContainer,
   rect: &Rect,
@@ -560,7 +585,7 @@ fn reposition_window(
   #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
   vis: Visibility,
   config: &UserConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Rect> {
   let rect = rect.apply_delta(&window.total_border_delta()?, None);
 
   // For animations on macOS and `HideMethod::PlaceInCorner`, we need to
@@ -590,14 +615,12 @@ fn reposition_window(
     // Even though the window size is unchanged, `NativeWindow::set_frame`
     // is used instead of `NativeWindow::reposition` because the latter
     // resulted in occasional incorrect positionings on macOS.
-    window.native().set_frame(&Rect::from_xy(
-      position_x,
-      position_y,
-      frame.width(),
-      frame.height(),
-    ))?;
+    let corner_rect =
+      Rect::from_xy(position_x, position_y, frame.width(), frame.height());
 
-    return Ok(());
+    window.native().set_frame(&corner_rect)?;
+
+    return Ok(corner_rect);
   }
 
   if window.active_drag().is_some() {
@@ -677,7 +700,7 @@ fn reposition_window(
     }
   }
 
-  Ok(())
+  Ok(rect)
 }
 
 /// Shows or hides the real window according to the hide method, and to

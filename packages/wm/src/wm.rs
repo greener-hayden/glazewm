@@ -263,8 +263,27 @@ impl WindowManager {
         // time: this is the app's own floor, not a write that went
         // missing. Recording it lets the layout reserve the space
         // instead of handing out a slot the window will overhang.
+        //
+        // Per axis, because a refusal is per axis. A window that would
+        // not narrow says nothing about how short it can be, and taking
+        // its current height as a floor too would pin the height it
+        // happened to have — which is the whole row, so nothing could
+        // ever be stacked under it.
+        let floor = |actual: i32, asked: i32| {
+          if actual > asked + TOLERANCE_PX {
+            actual
+          } else {
+            0
+          }
+        };
+
+        let min_size = (
+          floor(frame.width(), expected.rect.width()),
+          floor(frame.height(), expected.rect.height()),
+        );
+
         window.update_native_properties(|properties| {
-          properties.min_size = Some((frame.width(), frame.height()));
+          properties.min_size = Some(min_size);
         });
 
         self.state.expected_frames.remove(&id);

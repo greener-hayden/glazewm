@@ -481,9 +481,9 @@ fn redraw_containers(
       config,
     ) {
       // Only a rect we wrote is worth confirming, so the record is made
-      // here rather than inferred later from the layout. A re-ask writes
-      // the same rect and arrives back here, so the attempt count has to
-      // survive that; a different rect is a fresh ask and starts over.
+      // here rather than inferred later from the layout. The attempt
+      // count belongs to `reassert_frames`: a redraw of the same rect
+      // keeps it, a different rect is a fresh ask and starts over.
       Ok(written) => {
         let attempts = state
           .expected_frames
@@ -496,7 +496,7 @@ fn redraw_containers(
           ExpectedFrame {
             rect: written,
             written_at: std::time::Instant::now(),
-            attempts: attempts.saturating_add(1),
+            attempts,
           },
         );
       }

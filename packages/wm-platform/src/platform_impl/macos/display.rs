@@ -407,6 +407,40 @@ pub(crate) fn primary_display(
   })?
 }
 
+/// Bounds of the display showing most of `rect`.
+///
+/// Falls back to the display nearest the rect's centre.
+pub(crate) fn display_bounds_for_rect(
+  rect: &Rect,
+  dispatcher: &Dispatcher,
+) -> crate::Result<Rect> {
+  let bounds = all_displays(dispatcher)?
+    .iter()
+    .map(crate::Display::bounds)
+    .collect::<crate::Result<Vec<_>>>()?;
+
+  let overlapping = bounds
+    .iter()
+    .map(|display| (rect.intersection_area(display), display))
+    .filter(|(area, _)| *area > 0)
+    .max_by_key(|(area, _)| *area)
+    .map(|(_, display)| display.clone());
+
+  if let Some(display) = overlapping {
+    return Ok(display);
+  }
+
+  let center = rect.center_point();
+
+  bounds
+    .into_iter()
+    .min_by(|a, b| {
+      a.distance_to_point(&center)
+        .total_cmp(&b.distance_to_point(&center))
+    })
+    .ok_or(crate::Error::DisplayNotFound)
+}
+
 /// Implements [`Dispatcher::nearest_display`].
 ///
 /// NOTE: This was benchmarked to be 400-600µs on initial retrieval and

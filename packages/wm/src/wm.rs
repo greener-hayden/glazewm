@@ -167,8 +167,7 @@ impl WindowManager {
   /// left standing where the user can see it.
   const FRAME_SETTLE: Duration = Duration::from_millis(250);
 
-  /// How many times a frame is written before the app is taken at its
-  /// word.
+  /// How many re-asks a frame gets before the app is taken at its word.
   const FRAME_ATTEMPTS: u8 = 5;
 
   /// Writes again any frame an app accepted and then quietly dropped.
@@ -229,21 +228,6 @@ impl WindowManager {
         && (frame.height() - expected.rect.height()).abs() <= TOLERANCE_PX;
 
       if took_it {
-        // A window that takes less than its recorded floor has moved
-        // its own goalposts — a browser collapsing a sidebar does this —
-        // so the floor is dropped rather than reserving space forever.
-        if window.native_properties().min_size.is_some_and(
-          |(width, height)| {
-            frame.width() < width || frame.height() < height
-          },
-        ) {
-          window.update_native_properties(|properties| {
-            properties.min_size = None;
-          });
-
-          self.state.pending_sync.queue_container_to_redraw(window);
-        }
-
         self.state.expected_frames.remove(&id);
         continue;
       }
@@ -297,6 +281,12 @@ impl WindowManager {
         self.state.pending_sync.queue_container_to_redraw(to_redraw);
 
         continue;
+      }
+
+      // Counted here, not per redraw: only a re-ask after a settle
+      // says anything about the app.
+      if let Some(expected) = self.state.expected_frames.get_mut(&id) {
+        expected.attempts = expected.attempts.saturating_add(1);
       }
 
       // Animating the re-ask would park the window and restore it a

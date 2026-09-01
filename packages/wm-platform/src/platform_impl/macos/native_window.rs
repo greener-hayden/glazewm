@@ -250,22 +250,52 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindow::set_frame`].
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS returns success for a size write it then ignores while the
+  ///   window is parked to a 1px sliver or straddles two displays. The
+  ///   window is first staged fully onto the target's display at its
+  ///   current size, then resized, then moved into place.
   pub(crate) fn set_frame(&self, rect: &Rect) -> crate::Result<()> {
-    // TODO: Consider adding a separate `set_frame_async` method which
-    // spawns a thread. Calling blocking AXUIElement methods from different
-    // threads supposedly works fine.
-    // TODO: Refactor the repeated `set_attribute` calls.
     let rect = rect.clone();
+    let dispatcher = self.application.dispatcher.clone();
+
     self.with_enhanced_ui_disabled(move |el| -> crate::Result<()> {
-      let ax_size = CGSize::new(rect.width().into(), rect.height().into());
-      let ax_value = AXValue::new_strict(&ax_size)?;
-      el.set_attribute("AXSize", &ax_value)?;
-      let ax_point = CGPoint::new(rect.x().into(), rect.y().into());
-      let ax_value = AXValue::new_strict(&ax_point)?;
-      el.set_attribute("AXPosition", &ax_value)?;
-      let ax_size = CGSize::new(rect.width().into(), rect.height().into());
-      let ax_value = AXValue::new_strict(&ax_size)?;
-      el.set_attribute("AXSize", &ax_value)
+      let current = read_frame(el)?;
+
+      let is_same_size = current.width() == rect.width()
+        && current.height() == rect.height();
+
+      // A bare move is safe from anywhere.
+      if is_same_size {
+        write_position(el, rect.x(), rect.y())?;
+        return write_size(el, rect.width(), rect.height());
+      }
+
+      let display =
+        platform_impl::display_bounds_for_rect(&rect, &dispatcher)?;
+
+      if !display.contains_rect(&current) {
+        let staging = staging_origin(&current, &rect, &display);
+        write_position(el, staging.x, staging.y)?;
+      }
+
+      write_size(el, rect.width(), rect.height())?;
+      write_position(el, rect.x(), rect.y())?;
+
+      // Fully on one display now, so a second ask is answerable.
+      let (width, height) = read_size(el)?;
+      if width != rect.width() || height != rect.height() {
+        tracing::debug!(
+          "Window took {width}x{height} for {}x{}; asking again.",
+          rect.width(),
+          rect.height()
+        );
+        write_size(el, rect.width(), rect.height())?;
+      }
+
+      Ok(())
     })
   }
 
@@ -275,20 +305,12 @@ impl NativeWindow {
     width: i32,
     height: i32,
   ) -> crate::Result<()> {
-    self.with_enhanced_ui_disabled(move |el| -> crate::Result<()> {
-      let ax_size = CGSize::new(width.into(), height.into());
-      let ax_value = AXValue::new_strict(&ax_size)?;
-      el.set_attribute("AXSize", &ax_value)
-    })
+    self.with_enhanced_ui_disabled(move |el| write_size(el, width, height))
   }
 
   /// Implements [`NativeWindow::reposition`].
   pub(crate) fn reposition(&self, x: i32, y: i32) -> crate::Result<()> {
-    self.with_enhanced_ui_disabled(move |el| -> crate::Result<()> {
-      let ax_point = CGPoint::new(x.into(), y.into());
-      let ax_value = AXValue::new_strict(&ax_point)?;
-      el.set_attribute("AXPosition", &ax_value)
-    })
+    self.with_enhanced_ui_disabled(move |el| write_position(el, x, y))
   }
 
   /// Implements [`NativeWindow::minimize`].
@@ -590,4 +612,122 @@ fn element_borrow_error() -> crate::Error {
   crate::Error::Platform(
     "Window accessibility element is already borrowed.".to_string(),
   )
+}
+
+/// Reads the window's size via `AXSize`, rounded to pixels.
+#[allow(clippy::cast_possible_truncation)]
+fn read_size(el: &CFRetained<AXUIElement>) -> crate::Result<(i32, i32)> {
+  let size = el
+    .get_attribute::<AXValue>("AXSize")?
+    .value_strict::<CGSize>()?;
+
+  Ok((size.width.round() as i32, size.height.round() as i32))
+}
+
+/// Reads the window's frame via `AXPosition` and `AXSize`.
+#[allow(clippy::cast_possible_truncation)]
+fn read_frame(el: &CFRetained<AXUIElement>) -> crate::Result<Rect> {
+  let position = el
+    .get_attribute::<AXValue>("AXPosition")?
+    .value_strict::<CGPoint>()?;
+
+  let (width, height) = read_size(el)?;
+
+  Ok(Rect::from_xy(
+    position.x.round() as i32,
+    position.y.round() as i32,
+    width,
+    height,
+  ))
+}
+
+/// Writes `AXSize`.
+fn write_size(
+  el: &CFRetained<AXUIElement>,
+  width: i32,
+  height: i32,
+) -> crate::Result<()> {
+  let size = CGSize::new(width.into(), height.into());
+  el.set_attribute("AXSize", &AXValue::new_strict(&size)?)
+}
+
+/// Writes `AXPosition`.
+fn write_position(
+  el: &CFRetained<AXUIElement>,
+  x: i32,
+  y: i32,
+) -> crate::Result<()> {
+  let point = CGPoint::new(x.into(), y.into());
+  el.set_attribute("AXPosition", &AXValue::new_strict(&point)?)
+}
+
+/// Where to put a window, at its current size, so it lies fully on
+/// `display` and as close to `target` as it can.
+///
+/// A window larger than the display on an axis is pinned to the near edge.
+fn staging_origin(current: &Rect, target: &Rect, display: &Rect) -> Point {
+  let fit = |start: i32, length: i32, low: i32, high: i32| {
+    if length >= high - low {
+      low
+    } else {
+      start.clamp(low, high - length)
+    }
+  };
+
+  Point {
+    x: fit(target.x(), current.width(), display.left, display.right),
+    y: fit(target.y(), current.height(), display.top, display.bottom),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  const DISPLAY: Rect = Rect {
+    left: -3008,
+    top: -368,
+    right: 0,
+    bottom: 1324,
+  };
+
+  #[test]
+  fn keeps_a_target_that_already_fits() {
+    let current = Rect::from_xy(-2000, -320, 841, 1628);
+    let target = Rect::from_xy(-1500, -320, 632, 1628);
+    let origin = staging_origin(&current, &target, &DISPLAY);
+    assert_eq!((origin.x, origin.y), (-1500, -320));
+  }
+
+  #[test]
+  fn pulls_an_overhang_back_from_the_right() {
+    let current = Rect::from_xy(-1263, -320, 841, 1628);
+    let target = Rect::from_xy(-648, -320, 632, 1628);
+    let origin = staging_origin(&current, &target, &DISPLAY);
+    assert_eq!((origin.x, origin.y), (-841, -320));
+  }
+
+  #[test]
+  fn pulls_an_overhang_back_from_the_left() {
+    let current = Rect::from_xy(-3848, 1296, 841, 1628);
+    let target = Rect::from_xy(-3100, -320, 632, 1628);
+    let origin = staging_origin(&current, &target, &DISPLAY);
+    assert_eq!((origin.x, origin.y), (-3008, -320));
+  }
+
+  #[test]
+  fn pins_a_window_larger_than_the_display() {
+    let current = Rect::from_xy(-100, 0, 4000, 2000);
+    let target = Rect::from_xy(-2992, -320, 2976, 1628);
+    let origin = staging_origin(&current, &target, &DISPLAY);
+    assert_eq!((origin.x, origin.y), (-3008, -368));
+  }
+
+  #[test]
+  fn lifts_a_parked_sliver_onto_the_display() {
+    let current = Rect::from_xy(-1, 1296, 841, 1628);
+    let target = Rect::from_xy(-648, 1000, 632, 1628);
+    let origin = staging_origin(&current, &target, &DISPLAY);
+    assert_eq!((origin.x, origin.y), (-841, -304));
+  }
 }

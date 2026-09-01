@@ -21,8 +21,10 @@ pub trait PositionGetters {
 ///
 /// Returns a length per child, in the order given. When the floors alone
 /// exceed `total` every child gets its floor and the overflow is
-/// accepted — no arrangement satisfies everyone, and spreading the
-/// shortfall would leave every window wrong instead of one.
+/// accepted here — no arrangement satisfies everyone, and spreading the
+/// shortfall would leave every window wrong instead of one. `to_rect`
+/// then keeps each child inside its parent, so the overflow shows as
+/// overlap rather than a window past the workspace edge.
 pub fn resolve_lengths(
   sizes: &[f32],
   mins: &[i32],
@@ -108,6 +110,24 @@ pub fn resolve_lengths(
       }
     })
     .collect()
+}
+
+/// Keeps a child's rect inside its parent.
+///
+/// A floor that does not fit overlaps its neighbour inside the workspace
+/// rather than reaching onto the next monitor, where macOS stops
+/// honouring size writes.
+#[must_use]
+pub fn contain_in_parent(rect: &Rect, parent: &Rect) -> Rect {
+  let width = rect.width().min(parent.width());
+  let height = rect.height().min(parent.height());
+
+  Rect::from_xy(
+    rect.x().min(parent.right - width),
+    rect.y().min(parent.bottom - height),
+    width,
+    height,
+  )
 }
 
 /// Implements the `PositionGetters` trait for tiling containers that can
@@ -202,7 +222,10 @@ macro_rules! impl_position_getters_as_resizable {
           }
         };
 
-        Ok(Rect::from_xy(x, y, width, height))
+        Ok($crate::traits::contain_in_parent(
+          &Rect::from_xy(x, y, width, height),
+          &parent_rect,
+        ))
       }
     }
   };
@@ -263,5 +286,40 @@ mod tests {
       resolve_lengths(&[0.75, 0.25], &[0, 0], 1000),
       vec![750, 250]
     );
+  }
+}
+
+#[cfg(test)]
+mod contain_tests {
+  use wm_platform::Rect;
+
+  use super::contain_in_parent;
+
+  const PARENT: Rect = Rect {
+    left: -2992,
+    top: -320,
+    right: -16,
+    bottom: 1308,
+  };
+
+  #[test]
+  fn leaves_a_fitting_rect_alone() {
+    let rect = Rect::from_xy(-2992, -320, 2324, 1628);
+    assert_eq!(contain_in_parent(&rect, &PARENT), rect);
+  }
+
+  #[test]
+  fn pulls_an_overhang_back_to_the_edge() {
+    let rect = Rect::from_xy(-648, -320, 841, 1628);
+    let contained = contain_in_parent(&rect, &PARENT);
+    assert_eq!(contained.right, PARENT.right);
+    assert_eq!(contained.width(), 841);
+  }
+
+  #[test]
+  fn shrinks_a_rect_wider_than_the_parent() {
+    let rect = Rect::from_xy(-2992, -320, 4000, 1628);
+    let contained = contain_in_parent(&rect, &PARENT);
+    assert_eq!(contained, PARENT);
   }
 }

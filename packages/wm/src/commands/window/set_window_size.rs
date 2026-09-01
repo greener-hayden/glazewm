@@ -82,8 +82,22 @@ fn set_tiling_window_length(
         - vertical_gap * window.tiling_siblings().count() as i32
     };
 
+    // A sibling pinned to its floor cannot give the space up, and the
+    // window cannot take less than its own; asking would only be undone.
+    let siblings_floor = container_to_resize
+      .tiling_siblings()
+      .map(|sibling| sibling.min_length(is_width_resize))
+      .sum::<i32>();
+
+    let floor = container_to_resize.min_length(is_width_resize);
+    let ceiling = (parent_length - siblings_floor).max(floor);
+    let target_px = target_length
+      .to_px(parent_length, None)
+      .clamp(floor, ceiling);
+
     // Convert the target length to a tiling size.
-    let tiling_size = target_length.to_percentage(parent_length);
+    let tiling_size =
+      LengthValue::from_px(target_px).to_percentage(parent_length);
 
     // Skip the resize if the window is already at the target size.
     if container_to_resize.tiling_size() - tiling_size != 0. {

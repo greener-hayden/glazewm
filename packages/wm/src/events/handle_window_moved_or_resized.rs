@@ -43,6 +43,8 @@ pub fn handle_window_moved_or_resized(
       properties.frame = frame_position.clone();
     });
 
+    release_disproved_floor(&window, &frame_position, state);
+
     // Handle windows that are actively being dragged.
     if !state.is_paused && window.active_drag().is_some() {
       let is_drag_end = {
@@ -540,4 +542,36 @@ fn update_drag_state(
   }
 
   Ok(())
+}
+
+/// Drops any floor axis the window has just been seen under.
+///
+/// A window that takes less than its recorded floor has moved its own
+/// goalposts — a browser collapsing a sidebar does this — so the space
+/// is given back rather than reserved forever.
+fn release_disproved_floor(
+  window: &WindowContainer,
+  frame: &Rect,
+  state: &mut WmState,
+) {
+  let Some((width, height)) = window.native_properties().min_size else {
+    return;
+  };
+
+  let kept =
+    |floor: i32, actual: i32| if actual < floor { 0 } else { floor };
+  let min_size =
+    (kept(width, frame.width()), kept(height, frame.height()));
+
+  if min_size == (width, height) {
+    return;
+  }
+
+  window.update_native_properties(|properties| {
+    properties.min_size = (min_size != (0, 0)).then_some(min_size);
+  });
+
+  if let Some(parent) = window.parent() {
+    state.pending_sync.queue_container_to_redraw(parent);
+  }
 }

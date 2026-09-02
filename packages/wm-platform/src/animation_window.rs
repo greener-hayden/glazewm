@@ -22,9 +22,13 @@ impl AnimationContext {
   ///
   /// The capture is taken from the window's own surface, so the overlay
   /// can be positioned anywhere on screen independently of where the
-  /// window currently sits. On Windows this is a blocking `WGC` capture
-  /// that can take tens of milliseconds; callers should run multiple
-  /// captures concurrently.
+  /// window currently sits.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: A screenshot of the window as it is right now.
+  /// - Windows: Nothing is captured. The overlay is a live DWM thumbnail
+  ///   of the window, so this returns a token immediately.
   pub fn capture_frame(
     &self,
     window_id: WindowId,
@@ -54,10 +58,10 @@ impl AnimationContext {
 /// A captured frame of a [`NativeWindow`], ready to be shown in an
 /// [`AnimationWindow`].
 ///
-/// Created via [`AnimationContext::capture_frame`], which is cheap on
-/// macOS and costs tens of milliseconds on Windows. Holding the capture
-/// apart from the overlay lets a batch of frames be captured concurrently
-/// before any animation clock starts.
+/// Created via [`AnimationContext::capture_frame`]. Holding the capture
+/// apart from the overlay lets a batch of frames be captured before any
+/// animation clock starts, so every window of one sync begins from the
+/// same instant.
 pub struct AnimationCapture {
   inner: platform_impl::AnimationCapture,
 }

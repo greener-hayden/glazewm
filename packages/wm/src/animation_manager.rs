@@ -15,7 +15,7 @@ use wm_platform::DispatcherExtMacOs;
 use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{
   AnimationCapture, AnimationContext, AnimationWindow, Dispatcher,
-  EasingFunction, OpacityValue, Rect, WindowId,
+  EasingFunction, FrameClock, OpacityValue, Rect, WindowId,
 };
 
 use crate::{
@@ -23,6 +23,13 @@ use crate::{
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
 };
+
+/// How far an opening window starts from its full size.
+///
+/// Small on purpose: the overlay is the window's surface scaled, and at
+/// 140ms a few percent reads as the window settling in rather than as
+/// distortion.
+const OPEN_START_SCALE: f32 = 0.94;
 
 #[derive(Clone, Copy, Debug)]
 pub enum AnimationTrigger {
@@ -34,6 +41,67 @@ pub enum AnimationTrigger {
   /// A window leaving with the workspace being switched away from. It
   /// ends one screen away and is hidden once it gets there.
   WorkspaceLeaving(SlideDirection),
+}
+
+impl AnimationTrigger {
+  /// Where a window's animation runs between, which is not always where
+  /// the real window goes.
+  ///
+  /// A leaving workspace ends one screen away and is hidden there; an
+  /// entering one starts one screen away. An opening window grows and
+  /// fades in at its tile rather than sliding over from wherever the OS
+  /// spawned it, which read as the window landing in the wrong place and
+  /// being dragged into the right one. Everything else animates from
+  /// where it is to the tile it occupies.
+  #[must_use]
+  pub fn path(self, target: &Rect, monitor: &Rect) -> AnimationPath {
+    match self {
+      Self::WorkspaceLeaving(direction) => AnimationPath {
+        start: None,
+        target: direction.offset(target, monitor),
+        opacity: None,
+      },
+      Self::WorkspaceEntering(direction) => AnimationPath {
+        start: Some(direction.opposite().offset(target, monitor)),
+        target: target.clone(),
+        opacity: None,
+      },
+      Self::WindowOpened => AnimationPath {
+        start: Some(target.scale_from_center(OPEN_START_SCALE)),
+        target: target.clone(),
+        opacity: Some((OpacityValue(0.0), OpacityValue(1.0))),
+      },
+      Self::WindowMoved => AnimationPath {
+        start: None,
+        target: target.clone(),
+        opacity: None,
+      },
+    }
+  }
+
+  /// Whether the trigger is one side of a workspace slide.
+  #[must_use]
+  pub fn is_slide(self) -> bool {
+    matches!(self, Self::WorkspaceEntering(_) | Self::WorkspaceLeaving(_))
+  }
+}
+
+/// The geometry of one window's animation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimationPath {
+  /// Where the animation begins, if not where the window currently is.
+  pub start: Option<Rect>,
+  /// Where the animation ends.
+  pub target: Rect,
+  /// Opacity to travel between, for an animation that fades.
+  pub opacity: Option<(OpacityValue, OpacityValue)>,
+}
+
+/// An animation decided for a window, ready to start.
+pub struct AnimationPlan<'a> {
+  pub effect: &'a AnimationEffectConfig,
+  pub trigger: AnimationTrigger,
+  pub path: AnimationPath,
 }
 
 /// Which way the workspaces travel during a switch.
@@ -96,7 +164,7 @@ struct WindowAnimationState {
   duration: Duration,
   easing: EasingFunction,
 
-  /// Target frame rate for the animation.
+  /// Tick rate to fall back to where the platform has no frame clock.
   frame_rate: u32,
 
   /// Start and target positions for the animation.
@@ -116,14 +184,18 @@ struct WindowAnimationState {
 }
 
 impl WindowAnimationState {
-  /// Creates a new movement animation between two rects.
+  /// Creates a new animation between two rects, and optionally between
+  /// two opacities.
   fn new(
     start_rect: Rect,
     target_rect: Rect,
+    opacity: Option<(OpacityValue, OpacityValue)>,
     config: &AnimationEffectConfig,
     frame_rate: u32,
     is_slide: bool,
   ) -> Self {
+    let (start_opacity, target_opacity) = opacity.unzip();
+
     Self {
       start_time: Instant::now(),
       duration: Duration::from_millis(u64::from(config.duration_ms)),
@@ -132,8 +204,8 @@ impl WindowAnimationState {
       start_rect,
       target_rect,
       is_slide,
-      start_opacity: None,
-      target_opacity: None,
+      start_opacity,
+      target_opacity,
     }
   }
 
@@ -144,9 +216,7 @@ impl WindowAnimationState {
     if elapsed >= self.duration {
       1.0
     } else {
-      #[allow(clippy::cast_precision_loss)]
-      let progress =
-        elapsed.as_millis() as f32 / self.duration.as_millis() as f32;
+      let progress = elapsed.as_secs_f32() / self.duration.as_secs_f32();
 
       progress.clamp(0.0, 1.0)
     }
@@ -194,14 +264,18 @@ pub struct AnimationManager {
 
   /// Pre-captured frames, keyed by window ID, waiting for their
   /// animations to start.
+  // LINT: On Windows a capture is a zero-sized token; the map is still
+  // what carries a real screenshot on macOS.
+  #[allow(clippy::zero_sized_map_values)]
   pending_captures: HashMap<Uuid, AnimationCapture>,
 
   /// Shared GPU context for animation overlay windows. Lazily
   /// initialized on the first animation.
   context: Option<AnimationContext>,
 
-  /// The running tick task and the frame rate it ticks at, if any.
-  tick_task: Option<(u32, tokio::task::JoinHandle<()>)>,
+  /// The running frame clock and the fallback rate it was started with,
+  /// if any.
+  clock: Option<(u32, FrameClock)>,
 
   /// Whether "Displays have separate Spaces" setting is enabled.
   #[cfg(target_os = "macos")]
@@ -209,6 +283,8 @@ pub struct AnimationManager {
 }
 
 impl AnimationManager {
+  // LINT: See `pending_captures`.
+  #[allow(clippy::zero_sized_map_values)]
   pub fn new(
     // LINT: `dispatcher` is only used on macOS.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -223,7 +299,7 @@ impl AnimationManager {
       windows: HashMap::new(),
       pending_captures: HashMap::new(),
       context: None,
-      tick_task: None,
+      clock: None,
       #[cfg(target_os = "macos")]
       displays_have_separate_spaces: dispatcher
         .displays_have_separate_spaces(),
@@ -245,11 +321,19 @@ impl AnimationManager {
       .collect::<HashSet<_>>()
   }
 
+  /// Discards ticks that queued while the loop was busy.
+  ///
+  /// The clock keeps ticking through a long sync, and each queued tick
+  /// would otherwise redraw the same frame again. One tick is one frame.
+  pub fn drain_ticks(&mut self) {
+    while self.tick_rx.try_recv().is_ok() {}
+  }
+
   /// Destroys the animation window and clears animation state.
   pub fn destroy_animation(&mut self, window_id: &Uuid) {
     self.animations.remove(window_id);
     self.pending_captures.remove(window_id);
-    self.update_tick_rate();
+    self.update_clock();
 
     if let Some(anim_window) = self.windows.remove(window_id) {
       std::thread::spawn(|| {
@@ -455,9 +539,10 @@ impl AnimationManager {
   ///
   /// The frames are stored until their animations start, so every
   /// animation started by one sync begins from an already-captured frame.
-  /// On Windows a capture blocks for tens of milliseconds, so capturing
-  /// sequentially would stagger each animation's start time and break the
-  /// motion of a workspace switch into a wave.
+  /// On macOS a capture is a screenshot, so capturing sequentially would
+  /// stagger each animation's start time and break the motion of a
+  /// workspace switch into a wave. On Windows the overlay is a live
+  /// thumbnail and each capture returns at once.
   pub fn pre_capture(
     &mut self,
     windows: &[(Uuid, WindowId)],
@@ -525,29 +610,24 @@ impl AnimationManager {
   }
 
   /// Starts a new animation, or extends an existing animation.
-  #[allow(clippy::too_many_arguments)]
-  /// `start_override` forces where the animation begins, for a window that
-  /// is not currently where it should appear to come from. A workspace
-  /// entering from off screen is the case that needs it: its real frame is
-  /// already the tile it will occupy, so without an override there is
-  /// nothing to travel.
+  ///
+  /// The plan's path decides where the animation begins. Without a start
+  /// of its own it begins where the window is, or where its running
+  /// animation has got to.
   pub fn start_animation(
     &mut self,
     window: &WindowContainer,
-    effect_config: &AnimationEffectConfig,
-    target_rect: Rect,
+    plan: &AnimationPlan,
     monitor_properties: &NativeMonitorProperties,
     dispatcher: &Dispatcher,
-    start_override: Option<Rect>,
-    is_slide: bool,
   ) -> anyhow::Result<()> {
     let existing_animation = self.animations.get(&window.id());
 
-    // Sync the frame rate to the monitor's refresh rate. Since ticks are
-    // skipped if the animation is behind, the frame rate is variable.
+    // The monitor's refresh rate, for platforms that pace the clock by
+    // sleeping rather than by the compositor.
     let frame_rate = monitor_properties.refresh_rate.unwrap_or(60);
 
-    let start_rect = start_override.unwrap_or_else(|| {
+    let start_rect = plan.path.start.clone().unwrap_or_else(|| {
       existing_animation.map_or_else(
         || window.native_properties().frame.clone(),
         WindowAnimationState::current_rect,
@@ -556,10 +636,11 @@ impl AnimationManager {
 
     let animation = WindowAnimationState::new(
       start_rect,
-      target_rect,
-      effect_config,
+      plan.path.target.clone(),
+      plan.path.opacity,
+      plan.effect,
       frame_rate,
-      is_slide,
+      plan.trigger.is_slide(),
     );
 
     self.animations.insert(window.id(), animation.clone());
@@ -631,68 +712,108 @@ impl AnimationManager {
       self.windows.insert(window.id(), anim_window);
     }
 
-    // Start the tick timer after the window has been created.
+    // Start the clock after the window has been created.
     // NOTE: Start times for animations will differ slightly between
     // windows within the same platform sync.
     if let Some(animation) = self.animations.get_mut(&window.id()) {
       animation.start_time = Instant::now();
     }
 
-    self.update_tick_rate();
+    self.update_clock();
 
     Ok(())
   }
 
-  /// Spawns a task for emitting ticks at the target frame rate.
+  /// Starts, replaces, or stops the frame clock to match the animations.
   ///
-  /// The ticks are emitted at the highest frame rate among the animated
-  /// windows. A running task is only replaced when that rate changes.
+  /// The clock's fallback rate is the highest refresh rate among the
+  /// animated windows' monitors. A running clock is only replaced when
+  /// that rate changes: animations of one sync start together, and a
+  /// clock started per window would tick once per start and render a
+  /// burst of duplicate frames.
   ///
   /// Called on animation start and completion.
-  fn update_tick_rate(&mut self) {
-    // Get the highest frame rate among the animated windows.
+  fn update_clock(&mut self) {
     let Some(frame_rate) =
       self.animations.values().map(|anim| anim.frame_rate).max()
     else {
-      if let Some((_, handle)) = self.tick_task.take() {
-        handle.abort();
-      }
+      self.clock = None;
       return;
     };
 
-    // Keep a task already ticking at this rate. Animations of one sync
-    // start together, and restarting the task per window would emit an
-    // immediate tick per window, rendering as a burst of duplicate
-    // frames. A monitor with a faster refresh rate joining the batch is
-    // what does change the rate, and only then is the task replaced.
     if self
-      .tick_task
+      .clock
       .as_ref()
       .is_some_and(|(rate, _)| *rate == frame_rate)
     {
       return;
     }
 
-    if let Some((_, handle)) = self.tick_task.take() {
-      handle.abort();
-    }
-
-    let frame_time = Duration::from_millis(u64::from(1000 / frame_rate));
     let tick_tx = self.tick_tx.clone();
+    let clock =
+      FrameClock::start(frame_rate, move || tick_tx.send(()).is_ok());
 
-    let handle = tokio::spawn(async move {
-      let mut interval = tokio::time::interval(frame_time);
-      interval
-        .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    self.clock = Some((frame_rate, clock));
+  }
+}
 
-      loop {
-        interval.tick().await;
-        if tick_tx.send(()).is_err() {
-          break;
-        }
-      }
-    });
+#[cfg(test)]
+mod tests {
+  use super::*;
 
-    self.tick_task = Some((frame_rate, handle));
+  #[test]
+  fn opened_window_grows_in_at_its_tile() {
+    let tile = Rect::from_xy(100, 100, 1000, 500);
+    let monitor = Rect::from_xy(0, 0, 3440, 1440);
+
+    let path = AnimationTrigger::WindowOpened.path(&tile, &monitor);
+
+    let start = path.start.expect("An opening window has a start.");
+    assert_eq!(path.target, tile);
+    let (start_center, tile_center) =
+      (start.center_point(), tile.center_point());
+    assert_eq!(
+      (start_center.x, start_center.y),
+      (tile_center.x, tile_center.y)
+    );
+    assert!(start.width() < tile.width());
+    assert!(tile.contains_rect(&start));
+    assert_eq!(path.opacity, Some((OpacityValue(0.0), OpacityValue(1.0))));
+  }
+
+  #[test]
+  fn slide_travels_one_monitor_width() {
+    let tile = Rect::from_xy(100, 100, 1000, 500);
+    let monitor = Rect::from_xy(0, 0, 3440, 1440);
+
+    let leaving = AnimationTrigger::WorkspaceLeaving(SlideDirection::Left)
+      .path(&tile, &monitor);
+    assert_eq!(leaving.start, None);
+    assert_eq!(leaving.target, Rect::from_xy(100 - 3440, 100, 1000, 500));
+
+    let entering =
+      AnimationTrigger::WorkspaceEntering(SlideDirection::Left)
+        .path(&tile, &monitor);
+    assert_eq!(
+      entering.start,
+      Some(Rect::from_xy(100 + 3440, 100, 1000, 500))
+    );
+    assert_eq!(entering.target, tile);
+    assert_eq!(entering.opacity, None);
+  }
+
+  #[test]
+  fn moved_window_starts_where_it_is() {
+    let tile = Rect::from_xy(100, 100, 1000, 500);
+    let monitor = Rect::from_xy(0, 0, 3440, 1440);
+
+    let path = AnimationTrigger::WindowMoved.path(&tile, &monitor);
+
+    assert_eq!(path.start, None);
+    assert_eq!(path.target, tile);
+    assert!(!AnimationTrigger::WindowMoved.is_slide());
+    assert!(
+      AnimationTrigger::WorkspaceLeaving(SlideDirection::Right).is_slide()
+    );
   }
 }

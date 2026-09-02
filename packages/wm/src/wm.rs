@@ -167,6 +167,9 @@ impl WindowManager {
     &mut self,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
+    // Ticks that queued behind a long sync are not more frames.
+    self.state.animation_manager.drain_ticks();
+
     let animating_windows = self
       .state
       .windows()

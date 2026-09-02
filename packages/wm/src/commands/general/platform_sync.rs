@@ -5,8 +5,8 @@ use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use wm_common::WindowEffectConfig;
 use wm_common::{
-  AnimationEffectConfig, CursorJumpTrigger, DisplayState, HideCorner,
-  HideMethod, UniqueExt, WindowState, WmEvent,
+  CursorJumpTrigger, DisplayState, HideCorner, HideMethod, UniqueExt,
+  WindowState, WmEvent,
 };
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
@@ -19,7 +19,7 @@ use wm_platform::{Rect, WindowId, WindowZOrder};
 #[cfg(target_os = "windows")]
 use crate::traits::WindowAlphaExt;
 use crate::{
-  animation_manager::AnimationTrigger,
+  animation_manager::{AnimationPlan, AnimationTrigger},
   models::{Container, WindowContainer},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
@@ -220,22 +220,16 @@ fn redraw_containers(
   // Get monitors by their optimal hide corner.
   let monitors_by_hide_corner = state.monitors_by_hide_corner();
 
-  // Decide which windows animate, and reveal and capture their frames
-  // before any of them moves.
+  // Decide which windows animate, and capture their frames before any
+  // of them moves.
   //
-  // Captures on Windows block for tens of milliseconds each, so capturing
-  // a window inside the apply loop below would stagger every animation's
-  // start time: the first window would be halfway across the screen
-  // before the last one begins, and a workspace slide would read as a
-  // wave instead of a sheet. Capturing here, in parallel, gives every
-  // animation of one sync the same starting instant.
-  //
-  // A window arriving with a slide is still cloaked at this point, and a
-  // cloaked window has nothing to capture. It is uncloaked, transparently,
-  // before the capture so the slide carries its content instead of an
-  // empty frame that pops into place at the end.
-  let mut animation_decisions: HashMap<Uuid, AnimationDecision> =
-    HashMap::new();
+  // A capture taken inside the apply loop below would see windows that
+  // earlier iterations have already moved, and on macOS, where a capture
+  // is a screenshot, would stagger every animation's start time.
+  // Capturing here gives every animation of one sync the same starting
+  // instant. On Windows the overlay is a live thumbnail and a capture
+  // costs nothing.
+  let mut animation_plans: HashMap<Uuid, AnimationPlan> = HashMap::new();
   let mut windows_to_capture: Vec<(Uuid, WindowId)> = vec![];
 
   for window in windows_to_update.iter().rev() {
@@ -297,7 +291,7 @@ fn redraw_containers(
     // window that silently declined to animate indistinguishable from one
     // that animated fine. Say which trigger fired and whether an effect
     // was found, so "nothing is animating" is a question the log answers.
-    let animation_effect = animation_trigger.and_then(|trigger| {
+    let animation = animation_trigger.and_then(|trigger| {
       let effect = state.animation_manager.animation_effect_for_window(
         window,
         trigger,
@@ -315,49 +309,20 @@ fn redraw_containers(
         }
       );
 
-      effect
+      effect.map(|effect| (trigger, effect))
     });
 
-    let Some(effect_config) = animation_effect else {
+    let Some((trigger, effect)) = animation else {
       continue;
     };
 
-    // Where the animation runs between, which is not always where the real
-    // window goes. A leaving workspace ends one screen away and is hidden
-    // there; an entering one starts one screen away. Everything else
-    // animates to the tile it actually occupies.
-    let monitor_rect = monitor.native_properties().bounds.clone();
-    let (anim_start, anim_target) = match animation_trigger {
-      Some(AnimationTrigger::WorkspaceLeaving(direction)) => {
-        (None, direction.offset(&target_rect, &monitor_rect))
-      }
-      Some(AnimationTrigger::WorkspaceEntering(direction)) => (
-        Some(direction.opposite().offset(&target_rect, &monitor_rect)),
-        target_rect.clone(),
-      ),
-      _ => (None, target_rect.clone()),
-    };
-
-    #[cfg(target_os = "windows")]
-    if let Some(trigger) = animation_trigger {
-      if let Err(err) = reveal_for_capture(window, trigger, config) {
-        tracing::warn!("Failed to reveal window for capture: {err}");
-      }
-    }
-
-    animation_decisions.insert(
+    animation_plans.insert(
       window.id(),
-      AnimationDecision {
-        effect: effect_config,
-        anim_start,
-        anim_target,
-        is_slide: matches!(
-          animation_trigger,
-          Some(
-            AnimationTrigger::WorkspaceEntering(_)
-              | AnimationTrigger::WorkspaceLeaving(_)
-          )
-        ),
+      AnimationPlan {
+        effect,
+        trigger,
+        path: trigger
+          .path(&target_rect, &monitor.native_properties().bounds),
       },
     );
 
@@ -444,16 +409,13 @@ fn redraw_containers(
     // is in flight, no tick timer to ever complete it. Hiding the real
     // window on `animation_effect.is_some()` then strands it: invisible,
     // out of the layout, until an unrelated redraw happens by.
-    let is_animating = match animation_decisions.get(&window.id()) {
-      Some(decision) => {
+    let is_animating = match animation_plans.get(&window.id()) {
+      Some(plan) => {
         match state.animation_manager.start_animation(
           window,
-          decision.effect,
-          decision.anim_target.clone(),
+          plan,
           &monitor.native_properties(),
           &state.dispatcher,
-          decision.anim_start.clone(),
-          decision.is_slide,
         ) {
           Ok(()) => true,
           Err(err) => {
@@ -545,42 +507,6 @@ struct Visibility {
   animating: bool,
   /// The window belongs to the workspace being displayed.
   visible: bool,
-}
-
-/// The animation to run for a window, decided before the apply pass.
-struct AnimationDecision<'a> {
-  effect: &'a AnimationEffectConfig,
-  anim_start: Option<Rect>,
-  anim_target: Rect,
-  is_slide: bool,
-}
-
-/// Uncloaks a window arriving with a slide, transparently, before its
-/// frame is captured.
-///
-/// A cloaked window has nothing to capture, so its overlay would slide in
-/// empty and the window would pop into place at the end. Keeping it
-/// transparent while uncloaked costs nothing on screen: the outgoing
-/// workspace is still covering its destination, and the real window only
-/// regains its opacity when the slide is over.
-#[cfg(target_os = "windows")]
-fn reveal_for_capture(
-  window: &WindowContainer,
-  trigger: AnimationTrigger,
-  config: &UserConfig,
-) -> anyhow::Result<()> {
-  if config.value.general.hide_method != HideMethod::Cloak {
-    return Ok(());
-  }
-
-  if !matches!(trigger, AnimationTrigger::WorkspaceEntering(_)) {
-    return Ok(());
-  }
-
-  window.set_alpha(OpacityValue::from_alpha(0))?;
-  window.native().set_cloaked(false)?;
-
-  Ok(())
 }
 
 fn reposition_window(
@@ -766,12 +692,9 @@ fn apply_visibility(
   // anywhere.
   window.set_alpha(OpacityValue::from_alpha(0))?;
 
-  // A window arriving from another workspace is still cloaked, and a
-  // cloaked window has nothing to capture. Its animation would play
-  // empty and the window would pop into place at the end, which is what
-  // a workspace switch looked like before this. Costs nothing where the
-  // window was already uncloaked, since set_cloaked only writes on a
-  // change.
+  // A window arriving from another workspace is still cloaked. Uncloak
+  // it now, while transparent, so the handover at the end of the
+  // animation is one alpha change rather than an uncloak racing it.
   if is_visible && config.value.general.hide_method == HideMethod::Cloak {
     window.native().set_cloaked(false)?;
   }

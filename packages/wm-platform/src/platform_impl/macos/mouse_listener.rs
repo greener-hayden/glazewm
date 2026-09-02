@@ -67,12 +67,18 @@ impl MouseListener {
   pub(crate) fn new(
     enabled_events: &[MouseEventKind],
     event_tx: mpsc::UnboundedSender<MouseEvent>,
-    dispatcher: &Dispatcher,
+    _dispatcher: &Dispatcher,
   ) -> crate::Result<Self> {
     let callback_data_ptr = {
       let data = Box::new(CallbackData::new(event_tx.clone()));
       Box::into_raw(data) as usize
     };
+
+    // Deliberately not the caller's dispatcher. That one drives the main
+    // run loop, where every blocking accessibility call also runs, and a
+    // tap sat behind those is one macOS disables for being slow to
+    // answer. See `TapRunLoop`.
+    let dispatcher = super::tap_run_loop()?.dispatcher();
 
     let tap_port = dispatcher
       .dispatch_sync(|| {

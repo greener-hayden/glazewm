@@ -13,12 +13,23 @@ use objc2_core_foundation::{
 
 use crate::{DispatchFn, Dispatcher};
 
+/// How the run loop behind an [`EventLoopSource`] is asked to stop.
+#[derive(Clone, Copy)]
+pub(crate) enum StopKind {
+  /// Stops `NSApplication`, which drives the main thread's run loop.
+  Application,
+
+  /// Stops a bare `CFRunLoop` on a secondary thread.
+  RunLoop,
+}
+
 /// Source for dispatching callbacks onto the event loop thread.
 #[derive(Clone)]
 pub(crate) struct EventLoopSource {
   dispatch_tx: mpsc::Sender<Box<DispatchFn>>,
   source: CFRetained<CFRunLoopSource>,
   run_loop: CFRetained<CFRunLoop>,
+  stop_kind: StopKind,
   pub(crate) thread_id: std::thread::ThreadId,
 }
 
@@ -72,6 +83,15 @@ impl EventLoopSource {
   }
 
   pub(crate) fn send_stop(&self) -> crate::Result<()> {
+    // A bare run loop is stopped directly. `CFRunLoopStop` is safe to
+    // call from another thread, and dispatching the stop onto a thread
+    // that is blocked would be the wrong way round anyway.
+    if matches!(self.stop_kind, StopKind::RunLoop) {
+      self.run_loop.stop();
+      self.run_loop.wake_up();
+      return Ok(());
+    }
+
     let (result_tx, result_rx) = std::sync::mpsc::channel();
 
     self.send_dispatch_sync(|| {
@@ -109,12 +129,15 @@ impl EventLoop {
   /// Implements [`EventLoop::new`].
   pub fn new() -> crate::Result<(Self, Dispatcher)> {
     // Accessibility calls are cross-process and block the caller, and
-    // they run on this thread — the one that also services the event
-    // taps. Waiting on a busy app therefore stalls input for everyone,
-    // and macOS answers a long enough stall by disabling the tap
-    // (`kCGEventTapDisabledByTimeout`). A reposition measured at a 29ms
-    // median, so this leaves ample headroom while capping the worst
-    // case. Timed-out writes are dropped; the next sync redraws them.
+    // they run on this thread. Input no longer rides on them — the event
+    // taps have their own run loop, see `TapRunLoop` — so this no longer
+    // guards against keys being dropped. What it still bounds is how
+    // long one wedged application can hold the thread that also carries
+    // animations, the tray, and every other window's layout.
+    //
+    // A reposition measured at a 29ms median, so this leaves ample
+    // headroom while capping the worst case. Timed-out writes are
+    // dropped; the next sync redraws them.
     //
     // Must be set on the system-wide element: on any other element it
     // applies to that element alone, not to the window elements that
@@ -155,8 +178,8 @@ impl EventLoop {
     Ok(())
   }
 
-  /// Adds a source (`CFRunLoopSource`) for allowing dispatches to
-  /// the current run loop.
+  /// Adds a source (`CFRunLoopSource`) for allowing dispatches to the
+  /// main run loop, and prepares `NSApplication` to drive it.
   ///
   /// Can only be called on the main thread.
   pub(crate) fn add_dispatch_source() -> crate::Result<EventLoopSource> {
@@ -165,11 +188,21 @@ impl EventLoop {
 
     // Initialize `NSApplication` on the main thread. This is necessary for
     // some AppKit components (e.g. system tray) to be functional.
-    // TODO: Skip this if not on the main thread, and instead run a normal
-    // run loop.
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+    Self::create_dispatch_source(StopKind::Application)
+  }
+
+  /// Adds a source (`CFRunLoopSource`) for allowing dispatches to the
+  /// current thread's run loop.
+  ///
+  /// Works on any thread. The caller is responsible for running that
+  /// thread's run loop; until it does, dispatches queue rather than
+  /// execute.
+  pub(crate) fn create_dispatch_source(
+    stop_kind: StopKind,
+  ) -> crate::Result<EventLoopSource> {
     let (dispatch_tx, dispatch_rx) = mpsc::channel();
     let dispatch_rx_ptr =
       Box::into_raw(Box::new(dispatch_rx)).cast::<std::ffi::c_void>();
@@ -205,6 +238,7 @@ impl EventLoop {
       dispatch_tx,
       source,
       run_loop,
+      stop_kind,
       thread_id: std::thread::current().id(),
     })
   }

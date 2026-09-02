@@ -13,6 +13,7 @@ mod mouse_listener;
 mod native_window;
 mod notification_center;
 mod single_instance;
+mod tap_run_loop;
 mod window_listener;
 
 pub(crate) use animation_window::*;
@@ -28,4 +29,5 @@ pub(crate) use mouse_listener::*;
 pub(crate) use native_window::*;
 pub(crate) use notification_center::*;
 pub(crate) use single_instance::*;
+pub(crate) use tap_run_loop::*;
 pub(crate) use window_listener::*;

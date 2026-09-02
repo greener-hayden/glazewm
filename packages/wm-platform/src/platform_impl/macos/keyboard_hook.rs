@@ -88,7 +88,7 @@ impl KeyboardHook {
   /// the event should be intercepted.
   pub fn new<F>(
     callback: F,
-    dispatcher: &Dispatcher,
+    _dispatcher: &Dispatcher,
   ) -> crate::Result<Self>
   where
     F: Fn(KeyEvent) -> bool + Send + Sync + 'static,
@@ -100,6 +100,12 @@ impl KeyboardHook {
       });
       Box::into_raw(data) as usize
     };
+
+    // Deliberately not the caller's dispatcher. That one drives the main
+    // run loop, where every blocking accessibility call also runs, and a
+    // tap sat behind those is one macOS disables for being slow to
+    // answer. See `TapRunLoop`.
+    let dispatcher = super::tap_run_loop()?.dispatcher();
 
     let tap_port = dispatcher
       .dispatch_sync(|| Self::create_event_tap(callback_ptr, dispatcher))

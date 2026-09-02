@@ -621,14 +621,26 @@ fn reposition_window(
         _ => {
           swp_flags |= SWP_FRAMECHANGED;
 
-          window.native().set_window_pos(z_order, &rect, swp_flags)?;
+          // A redraw that lands where the window already is leaves it
+          // be. An animation places the window at its target as it
+          // starts, and the redraw completing it would otherwise reissue
+          // the move with `SWP_FRAMECHANGED`, forcing a full repaint at
+          // the moment the overlay hands over. A z-order change or a
+          // restore still goes through.
+          let is_settled = !should_restore
+            && matches!(z_order, WindowZOrder::Normal)
+            && window.native().frame_with_shadows()? == rect;
 
-          // When there's a mismatch between the DPI of the monitor and the
-          // window, the window might be sized incorrectly after the first
-          // move. If we set the position twice, inconsistencies after the
-          // first move are resolved.
-          if window.has_pending_dpi_adjustment() {
+          if !is_settled {
             window.native().set_window_pos(z_order, &rect, swp_flags)?;
+
+            // When there's a mismatch between the DPI of the monitor and
+            // the window, the window might be sized incorrectly after the
+            // first move. If we set the position twice, inconsistencies
+            // after the first move are resolved.
+            if window.has_pending_dpi_adjustment() {
+              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+            }
           }
         }
       }

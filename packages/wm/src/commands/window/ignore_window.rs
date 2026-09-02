@@ -2,9 +2,7 @@ use anyhow::Context;
 use wm_common::WindowState;
 
 use crate::{
-  commands::container::{
-    detach_container, flatten_child_split_containers,
-  },
+  commands::container::{detach_tile, flatten_child_split_containers},
   models::WindowContainer,
   traits::{CommonGetters, WindowGetters},
   wm_state::WmState,
@@ -19,7 +17,7 @@ pub fn ignore_window(
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
 
   state.ignored_windows.push(window.native().clone());
-  detach_container(window.clone().into())?;
+  detach_tile(window.clone().into())?;
 
   // After detaching the container, flatten any redundant split containers.
   // For example, in the layout V[1 H[2]] where container 1 is detached to

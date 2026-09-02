@@ -14,6 +14,38 @@ pub fn attach_container(
   target_parent: &Container,
   target_index: Option<usize>,
 ) -> anyhow::Result<()> {
+  insert_container(child, target_parent, target_index)?;
+
+  // Resize the child and its siblings if it is a tiling container.
+  if let Ok(child) = child.as_tiling_container() {
+    let tiling_siblings = child.tiling_siblings().collect::<Vec<_>>();
+
+    if tiling_siblings.is_empty() {
+      child.set_tiling_size(1.0);
+      return Ok(());
+    }
+
+    // Set initial tiling size to 0, and then size up the container
+    // to the target size.
+    #[allow(clippy::cast_precision_loss)]
+    let target_size = 1.0 / (tiling_siblings.len() + 1) as f32;
+    child.set_tiling_size(0.0);
+    resize_tiling_container(&child, target_size);
+  }
+
+  Ok(())
+}
+
+/// Inserts a child container at the specified index, leaving every
+/// tiling size as it is.
+///
+/// The caller sizes the child and its siblings. Appends when no index is
+/// given.
+pub fn insert_container(
+  child: &Container,
+  target_parent: &Container,
+  target_index: Option<usize>,
+) -> anyhow::Result<()> {
   if !child.is_detached() {
     bail!("Cannot attach an already attached container.");
   }
@@ -35,23 +67,6 @@ pub fn attach_container(
     .push_back(child.id());
 
   *child.borrow_parent_mut() = Some(target_parent.clone());
-
-  // Resize the child and its siblings if it is a tiling container.
-  if let Ok(child) = child.as_tiling_container() {
-    let tiling_siblings = child.tiling_siblings().collect::<Vec<_>>();
-
-    if tiling_siblings.is_empty() {
-      child.set_tiling_size(1.0);
-      return Ok(());
-    }
-
-    // Set initial tiling size to 0, and then size up the container
-    // to the target size.
-    #[allow(clippy::cast_precision_loss)]
-    let target_size = 1.0 / (tiling_siblings.len() + 1) as f32;
-    child.set_tiling_size(0.0);
-    resize_tiling_container(&child, target_size);
-  }
 
   Ok(())
 }

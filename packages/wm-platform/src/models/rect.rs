@@ -277,11 +277,14 @@ impl Rect {
       (a as f32 + (b - a) as f32 * progress).round() as i32
     };
 
-    Rect::from_xy(
-      lerp(self.x(), other.x()),
-      lerp(self.y(), other.y()),
-      lerp(self.width(), other.width()),
-      lerp(self.height(), other.height()),
+    // Each edge is rounded on its own so it moves monotonically. Rounding
+    // an origin and a size separately lets the far edge wobble by a pixel
+    // between frames.
+    Rect::from_ltrb(
+      lerp(self.left, other.left),
+      lerp(self.top, other.top),
+      lerp(self.right, other.right),
+      lerp(self.bottom, other.bottom),
     )
   }
 

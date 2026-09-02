@@ -8,6 +8,7 @@ mod display;
 mod display_listener;
 mod error;
 mod event_loop;
+mod frame_clock;
 mod keybinding_listener;
 mod models;
 mod mouse_listener;
@@ -27,6 +28,7 @@ pub use display::*;
 pub use display_listener::*;
 pub use error::*;
 pub use event_loop::*;
+pub use frame_clock::*;
 pub use keybinding_listener::*;
 pub use models::*;
 pub use mouse_listener::*;
@@ -40,6 +42,6 @@ pub use window_listener::*;
 pub use windows::Win32::UI::WindowsAndMessaging::{
   SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
   SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, WINDOW_EX_STYLE,
-  WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-  WS_MAXIMIZEBOX,
+  WINDOW_STYLE, WS_CAPTION, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+  WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
 };

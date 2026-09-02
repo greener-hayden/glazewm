@@ -6,11 +6,17 @@ use windows::{
   core::PWSTR,
   Win32::{
     Foundation::{CloseHandle, BOOL, HWND, LPARAM, POINT, RECT},
-    Graphics::Dwm::{
-      DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-      DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
-      DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
-      DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
+    Graphics::{
+      Dwm::{
+        DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
+        DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
+        DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
+      },
+      Gdi::{
+        RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME,
+        RDW_INVALIDATE,
+      },
     },
     System::Threading::{
       OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -419,6 +425,30 @@ impl NativeWindow {
     Ok(())
   }
 
+  /// Implements [`NativeWindowWindowsExt::set_position_async`].
+  pub(crate) fn set_position_async(
+    &self,
+    rect: &Rect,
+  ) -> crate::Result<()> {
+    unsafe {
+      SetWindowPos(
+        self.hwnd(),
+        None,
+        rect.x(),
+        rect.y(),
+        rect.width(),
+        rect.height(),
+        SWP_ASYNCWINDOWPOS
+          | SWP_NOACTIVATE
+          | SWP_NOCOPYBITS
+          | SWP_NOSENDCHANGING
+          | SWP_NOZORDER,
+      )
+    }?;
+
+    Ok(())
+  }
+
   /// Implements [`NativeWindowWindowsExt::show`].
   pub(crate) fn show(&self) -> crate::Result<()> {
     unsafe { ShowWindowAsync(self.hwnd(), SW_SHOWNA) }.ok()?;
@@ -538,6 +568,29 @@ impl NativeWindow {
       let new_style = current_style | style.0 as isize;
 
       unsafe { SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, new_style) };
+    }
+  }
+
+  /// Implements [`NativeWindowWindowsExt::remove_window_style_ex`].
+  pub(crate) fn remove_window_style_ex(&self, style: WINDOW_EX_STYLE) {
+    let current_style =
+      unsafe { GetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE) };
+
+    #[allow(clippy::cast_possible_wrap)]
+    if current_style & style.0 as isize != 0 {
+      let new_style = current_style & !(style.0 as isize);
+
+      unsafe { SetWindowLongPtrW(self.hwnd(), GWL_EXSTYLE, new_style) };
+
+      // A cleared style takes effect once the window repaints.
+      unsafe {
+        RedrawWindow(
+          self.hwnd(),
+          None,
+          None,
+          RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN,
+        )
+      };
     }
   }
 

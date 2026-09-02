@@ -10,12 +10,14 @@ use uuid::Uuid;
 use wm_common::{
   BindingModeConfig, DisplayState, HideCorner, WindowState, WmEvent,
 };
+#[cfg(target_os = "windows")]
+use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
 };
-#[cfg(target_os = "windows")]
-use wm_platform::{NativeWindowWindowsExt, OpacityValue};
 
+#[cfg(target_os = "windows")]
+use crate::traits::WindowAlphaExt;
 use crate::{
   animation_manager::AnimationManager,
   commands::{
@@ -853,9 +855,7 @@ impl Drop for WmState {
 
         let _ = window.native().set_taskbar_visibility(true);
         let _ = window.native().set_border_color(None);
-        let _ = window
-          .native()
-          .set_transparency(&OpacityValue::from_alpha(u8::MAX));
+        let _ = window.restore_opacity();
       }
     }
   }

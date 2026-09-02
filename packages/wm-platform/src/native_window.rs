@@ -209,6 +209,17 @@ pub trait NativeWindowWindowsExt {
     flags: SET_WINDOW_POS_FLAGS,
   ) -> crate::Result<()>;
 
+  /// Moves and resizes the window without touching its z-order.
+  ///
+  /// Used to keep the real window under the animation layer: trackers
+  /// watching the window's bounds (e.g. `mover-borders`) then follow the
+  /// animation's motion instead of jumping to the endpoint.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn set_position_async(&self, rect: &Rect) -> crate::Result<()>;
+
   /// Shows the window asynchronously.
   ///
   /// NOTE: Cloaked windows do not get shown until uncloaked.
@@ -270,6 +281,16 @@ pub trait NativeWindowWindowsExt {
   ///
   /// This method is only available on Windows.
   fn add_window_style_ex(&self, style: WINDOW_EX_STYLE);
+
+  /// Removes the given extended window style flag(s) from the window.
+  ///
+  /// Repaints the window afterwards, since a cleared style is not
+  /// applied until the window redraws.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn remove_window_style_ex(&self, style: WINDOW_EX_STYLE);
 
   /// Sets the window's z-order.
   ///
@@ -366,6 +387,10 @@ impl NativeWindowWindowsExt for NativeWindow {
     self.inner.set_window_pos(z_order, rect, flags)
   }
 
+  fn set_position_async(&self, rect: &Rect) -> crate::Result<()> {
+    self.inner.set_position_async(rect)
+  }
+
   fn show(&self) -> crate::Result<()> {
     self.inner.show()
   }
@@ -392,6 +417,10 @@ impl NativeWindowWindowsExt for NativeWindow {
 
   fn add_window_style_ex(&self, style: WINDOW_EX_STYLE) {
     self.inner.add_window_style_ex(style);
+  }
+
+  fn remove_window_style_ex(&self, style: WINDOW_EX_STYLE) {
+    self.inner.remove_window_style_ex(style);
   }
 
   fn set_z_order(&self, z_order: &WindowZOrder) -> crate::Result<()> {

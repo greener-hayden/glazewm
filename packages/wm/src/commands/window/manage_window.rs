@@ -5,12 +5,15 @@ use wm_platform::{NativeWindow, RectDelta};
 
 use crate::{
   commands::{
-    container::{attach_container, set_focused_descendant},
+    container::{
+      attach_container, attach_to_tile, set_focused_descendant,
+      tile_split_direction,
+    },
     window::run_window_rules,
   },
   models::{
     Container, Monitor, NativeWindowProperties, NonTilingWindow,
-    TilingWindow, WindowContainer,
+    TilingContainer, TilingWindow, WindowContainer,
   },
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
@@ -172,14 +175,17 @@ fn create_window(
     window_state_to_create(&native_properties, &nearest_monitor, config)?;
 
   // Attach the new window as the first child of the target parent (if
-  // provided), otherwise, add as a sibling of the focused container.
-  let (target_parent, target_index) = match target_parent {
-    Some(parent) => (parent, 0),
+  // provided), otherwise, split the focused tile.
+  let insertion_target = match target_parent {
+    Some(parent) => InsertionTarget::Parent(parent, 0),
     None => insertion_target(&window_state, state)?,
   };
 
-  let target_workspace =
-    target_parent.workspace().context("No target workspace.")?;
+  let target_workspace = match &insertion_target {
+    InsertionTarget::Tile(tile) => tile.workspace(),
+    InsertionTarget::Parent(parent, _) => parent.workspace(),
+  }
+  .context("No target workspace.")?;
 
   let prefers_centered = config
     .value
@@ -244,11 +250,26 @@ fn create_window(
     .into(),
   };
 
-  attach_container(
-    &window_container.clone().into(),
-    &target_parent,
-    Some(target_index),
-  )?;
+  match insertion_target {
+    InsertionTarget::Tile(tile) => {
+      let tile: TilingContainer = tile.into();
+      let direction = tile_split_direction(&tile)?;
+
+      attach_to_tile(
+        &window_container.clone().into(),
+        &tile,
+        direction,
+        &config.value.gaps,
+      )?;
+    }
+    InsertionTarget::Parent(parent, index) => {
+      attach_container(
+        &window_container.clone().into(),
+        &parent,
+        Some(index),
+      )?;
+    }
+  }
 
   // The OS might spawn the window on a different monitor to the target
   // parent, so adjustments might need to be made because of DPI.
@@ -310,47 +331,49 @@ fn window_state_to_create(
   Ok(WindowState::default_from_config(&config.value))
 }
 
+/// Where a new window goes in the container tree.
+enum InsertionTarget {
+  /// Half of a tiling window's tile.
+  Tile(TilingWindow),
+  /// A child of the container, at the index.
+  Parent(Container, usize),
+}
+
 /// Gets where to insert a new window in the container tree.
 ///
 /// Rules:
 /// - For non-tiling windows: Always append to the workspace.
 /// - For tiling windows:
-///   1. Try to insert after the focused tiling window if one exists.
-///   2. If a non-tiling window is focused, try to insert after the first
+///   1. Split the focused tiling window's tile if one exists.
+///   2. If a non-tiling window is focused, split the tile of the first
 ///      tiling window found.
 ///   3. If no tiling windows exist, append to the workspace.
-///
-/// Returns tuple of (parent container, insertion index).
 fn insertion_target(
   window_state: &WindowState,
   state: &WmState,
-) -> anyhow::Result<(Container, usize)> {
+) -> anyhow::Result<InsertionTarget> {
   let focused_container =
     state.focused_container().context("No focused container.")?;
 
   let focused_workspace =
     focused_container.workspace().context("No workspace.")?;
 
-  // For tiling windows, try to find a suitable tiling window to insert
-  // next to.
+  // For tiling windows, try to find a suitable tile to split.
   if *window_state == WindowState::Tiling {
-    let sibling = match focused_container {
-      Container::TilingWindow(_) => Some(focused_container),
+    let tile = match focused_container {
+      Container::TilingWindow(window) => Some(window),
       _ => focused_workspace
         .descendant_focus_order()
-        .find(Container::is_tiling_window),
+        .find_map(|container| container.as_tiling_window().cloned()),
     };
 
-    if let Some(sibling) = sibling {
-      return Ok((
-        sibling.parent().context("No parent.")?,
-        sibling.index() + 1,
-      ));
+    if let Some(tile) = tile {
+      return Ok(InsertionTarget::Tile(tile));
     }
   }
 
   // Default to appending to workspace.
-  Ok((
+  Ok(InsertionTarget::Parent(
     focused_workspace.clone().into(),
     focused_workspace.child_count(),
   ))

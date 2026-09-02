@@ -1,4 +1,6 @@
-use crate::{platform_impl, Dispatcher, NativeWindow, OpacityValue, Rect};
+use crate::{
+  platform_impl, Dispatcher, NativeWindow, OpacityValue, Rect, WindowId,
+};
 
 /// Shared context used by [`AnimationWindow`] instances. Holds GPU
 /// resources that can be shared between animations.
@@ -16,6 +18,26 @@ impl AnimationContext {
     Ok(Self { inner })
   }
 
+  /// Captures a frame of `window` for use in an [`AnimationWindow`].
+  ///
+  /// The capture is taken from the window's own surface, so the overlay
+  /// can be positioned anywhere on screen independently of where the
+  /// window currently sits.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: A screenshot of the window as it is right now.
+  /// - Windows: Nothing is captured. The overlay is a live DWM thumbnail
+  ///   of the window, so this returns a token immediately.
+  pub fn capture_frame(
+    &self,
+    window_id: WindowId,
+  ) -> crate::Result<AnimationCapture> {
+    Ok(AnimationCapture {
+      inner: self.inner.capture_frame(window_id)?,
+    })
+  }
+
   /// Executes `update_fn` inside a compositor transaction.
   ///
   /// Used with [`AnimationWindow::update`] to commit all updates together
@@ -31,6 +53,17 @@ impl AnimationContext {
   {
     self.inner.transaction(update_fn, dispatcher)
   }
+}
+
+/// A captured frame of a [`NativeWindow`], ready to be shown in an
+/// [`AnimationWindow`].
+///
+/// Created via [`AnimationContext::capture_frame`]. Holding the capture
+/// apart from the overlay lets a batch of frames be captured before any
+/// animation clock starts, so every window of one sync begins from the
+/// same instant.
+pub struct AnimationCapture {
+  inner: platform_impl::AnimationCapture,
 }
 
 /// A screenshot of a [`NativeWindow`] that can be animated performantly.
@@ -70,6 +103,7 @@ impl AnimationWindow {
   pub fn new(
     context: &AnimationContext,
     window: &NativeWindow,
+    capture: AnimationCapture,
     inner_rect: &Rect,
     outer_rect: &Rect,
     opacity: Option<OpacityValue>,
@@ -78,6 +112,7 @@ impl AnimationWindow {
     let inner = platform_impl::AnimationWindow::new(
       &context.inner,
       window,
+      capture.inner,
       inner_rect,
       outer_rect,
       opacity,

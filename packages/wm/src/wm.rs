@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+  collections::HashMap,
+  time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context};
 use tokio::sync::mpsc::{self};
@@ -16,6 +19,8 @@ use wm_platform::{
   Dispatcher, LengthValue, PlatformEvent, RectDelta, WindowEvent,
 };
 
+#[cfg(target_os = "windows")]
+use crate::traits::WindowAlphaExt;
 use crate::{
   commands::{
     container::{
@@ -307,10 +312,23 @@ impl WindowManager {
     &mut self,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
+    // Ticks that queued behind a long sync are not more frames.
+    self.state.animation_manager.drain_ticks();
+
+    let animating_windows = self
+      .state
+      .windows()
+      .into_iter()
+      .filter(|window| {
+        self.state.animation_manager.is_animating(&window.id())
+      })
+      .map(|window| (window.id(), window))
+      .collect::<HashMap<_, _>>();
+
     self
       .state
       .animation_manager
-      .tick_update(&self.state.dispatcher)?;
+      .tick_update(&self.state.dispatcher, &animating_windows)?;
 
     let completed_ids = self.state.animation_manager.completed_ids();
 
@@ -808,11 +826,11 @@ impl WindowManager {
           #[cfg(target_os = "windows")]
           Ok(window) => {
             if let Some(opacity) = &args.opacity {
-              _ = window.native().set_transparency(opacity);
+              _ = window.set_alpha(*opacity);
             }
 
             if let Some(opacity_delta) = &args.opacity_delta {
-              _ = window.native().adjust_transparency(opacity_delta);
+              _ = window.adjust_alpha(*opacity_delta);
             }
 
             Ok(())

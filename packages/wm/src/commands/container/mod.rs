@@ -1,5 +1,7 @@
 mod attach_container;
+mod attach_to_tile;
 mod detach_container;
+mod detach_tile;
 mod flatten_child_split_containers;
 mod flatten_split_container;
 mod focus_container_by_id;
@@ -8,11 +10,15 @@ mod move_container_within_tree;
 mod replace_container;
 mod resize_tiling_container;
 mod set_focused_descendant;
+#[cfg(test)]
+mod test_tree;
 mod toggle_tiling_direction;
 mod wrap_in_split_container;
 
 pub use attach_container::*;
+pub use attach_to_tile::*;
 pub use detach_container::*;
+pub use detach_tile::*;
 pub use flatten_child_split_containers::*;
 pub use flatten_split_container::*;
 pub use focus_container_by_id::*;

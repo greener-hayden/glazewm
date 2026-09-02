@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use anyhow::Context;
+use uuid::Uuid;
 #[cfg(target_os = "windows")]
 use wm_common::WindowEffectConfig;
 use wm_common::{
@@ -11,10 +14,12 @@ use wm_platform::DispatcherExtMacOs;
 use wm_platform::NativeWindowWindowsExt;
 #[cfg(target_os = "windows")]
 use wm_platform::{CornerStyle, OpacityValue};
-use wm_platform::{Rect, WindowZOrder};
+use wm_platform::{Rect, WindowId, WindowZOrder};
 
+#[cfg(target_os = "windows")]
+use crate::traits::WindowAlphaExt;
 use crate::{
-  animation_manager::AnimationTrigger,
+  animation_manager::{AnimationPlan, AnimationTrigger},
   models::{Container, WindowContainer},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
@@ -263,6 +268,124 @@ fn redraw_containers(
   // Get monitors by their optimal hide corner.
   let monitors_by_hide_corner = state.monitors_by_hide_corner();
 
+  // Decide which windows animate, and capture their frames before any
+  // of them moves.
+  //
+  // A capture taken inside the apply loop below would see windows that
+  // earlier iterations have already moved, and on macOS, where a capture
+  // is a screenshot, would stagger every animation's start time.
+  // Capturing here gives every animation of one sync the same starting
+  // instant. On Windows the overlay is a live thumbnail and a capture
+  // costs nothing.
+  let mut animation_plans: HashMap<Uuid, AnimationPlan> = HashMap::new();
+  let mut windows_to_capture: Vec<(Uuid, WindowId)> = vec![];
+
+  for window in windows_to_update.iter().rev() {
+    // Skip updating the window's position if it only required a z-order
+    // change.
+    if !windows_to_redraw.contains(window) {
+      continue;
+    }
+
+    let workspace =
+      window.workspace().context("Window has no workspace.")?;
+    let monitor = window.monitor().context("No monitor.")?;
+
+    // Transition display state depending on whether window will be
+    // shown or hidden.
+    window.set_display_state(
+      match (window.display_state(), workspace.is_displayed()) {
+        (DisplayState::Hidden | DisplayState::Hiding, true) => {
+          DisplayState::Showing
+        }
+        (DisplayState::Shown | DisplayState::Showing, false) => {
+          DisplayState::Hiding
+        }
+        _ => window.display_state(),
+      },
+    );
+
+    let target_rect = window.to_rect()?;
+
+    let is_visible = matches!(
+      window.display_state(),
+      DisplayState::Showing | DisplayState::Shown
+    );
+
+    // Determine the animation effect to apply, if any.
+    let animation_trigger = if state.pending_sync.should_skip_animations()
+    {
+      tracing::debug!("Animations skipped for this sync: {window}");
+      None
+    } else if let Some(direction) =
+      state.pending_sync.workspace_slide_for(monitor.id())
+    {
+      // A switch moves both workspaces at once: the one being hidden
+      // leaves toward `direction`, the one being shown arrives from the
+      // other side. `is_visible` is derived from the display state
+      // transition set just above, so it already distinguishes them.
+      Some(if is_visible {
+        AnimationTrigger::WorkspaceEntering(direction)
+      } else {
+        AnimationTrigger::WorkspaceLeaving(direction)
+      })
+    } else if is_visible
+      && state.pending_sync.open_animation_windows().contains(window)
+    {
+      Some(AnimationTrigger::WindowOpened)
+    } else {
+      Some(AnimationTrigger::WindowMoved)
+    };
+
+    // The engine only ever logged animation *failures*, which makes a
+    // window that silently declined to animate indistinguishable from one
+    // that animated fine. Say which trigger fired and whether an effect
+    // was found, so "nothing is animating" is a question the log answers.
+    let animation = animation_trigger.and_then(|trigger| {
+      let effect = state.animation_manager.animation_effect_for_window(
+        window,
+        trigger,
+        &target_rect,
+        &monitor.native_properties(),
+        config,
+      );
+
+      tracing::debug!(
+        "Animation {trigger:?} for {window}: {}",
+        if effect.is_some() {
+          "applies"
+        } else {
+          "declined"
+        }
+      );
+
+      effect.map(|effect| (trigger, effect))
+    });
+
+    let Some((trigger, effect)) = animation else {
+      continue;
+    };
+
+    animation_plans.insert(
+      window.id(),
+      AnimationPlan {
+        effect,
+        trigger,
+        path: trigger
+          .path(&target_rect, &monitor.native_properties().bounds),
+      },
+    );
+
+    windows_to_capture.push((window.id(), window.native().id()));
+  }
+
+  if let Err(err) = state
+    .animation_manager
+    .pre_capture(&windows_to_capture, &state.dispatcher)
+  {
+    tracing::warn!("Failed to pre-capture window frames: {err}");
+  }
+
   for window in windows_to_update.iter().rev() {
     let should_bring_to_front = windows_to_bring_to_front.contains(window);
 
@@ -322,92 +445,12 @@ fn redraw_containers(
       continue;
     }
 
-    // Transition display state depending on whether window will be
-    // shown or hidden.
-    window.set_display_state(
-      match (window.display_state(), workspace.is_displayed()) {
-        (DisplayState::Hidden | DisplayState::Hiding, true) => {
-          DisplayState::Showing
-        }
-        (DisplayState::Shown | DisplayState::Showing, false) => {
-          DisplayState::Hiding
-        }
-        _ => window.display_state(),
-      },
-    );
-
     let target_rect = window.to_rect()?;
 
     let is_visible = matches!(
       window.display_state(),
       DisplayState::Showing | DisplayState::Shown
     );
-
-    // Determine the animation effect to apply, if any.
-    let animation_trigger = if state.pending_sync.should_skip_animations()
-    {
-      tracing::debug!("Animations skipped for this sync: {window}");
-      None
-    } else if let Some(direction) =
-      state.pending_sync.workspace_slide_for(monitor.id())
-    {
-      // A switch moves both workspaces at once: the one being hidden
-      // leaves toward `direction`, the one being shown arrives from the
-      // other side. `is_visible` is derived from the display state
-      // transition set just above, so it already distinguishes them.
-      Some(if is_visible {
-        AnimationTrigger::WorkspaceEntering(direction)
-      } else {
-        AnimationTrigger::WorkspaceLeaving(direction)
-      })
-    } else if is_visible
-      && state.pending_sync.open_animation_windows().contains(window)
-    {
-      Some(AnimationTrigger::WindowOpened)
-    } else {
-      Some(AnimationTrigger::WindowMoved)
-    };
-
-    // The engine only ever logged animation *failures*, which makes a
-    // window that silently declined to animate indistinguishable from one
-    // that animated fine. Say which trigger fired and whether an effect
-    // was found, so "nothing is animating" is a question the log answers.
-    let animation_effect = animation_trigger.and_then(|trigger| {
-      let effect = state.animation_manager.animation_effect_for_window(
-        window,
-        trigger,
-        &target_rect,
-        &monitor.native_properties(),
-        config,
-      );
-
-      tracing::debug!(
-        "Animation {trigger:?} for {window}: {}",
-        if effect.is_some() {
-          "applies"
-        } else {
-          "declined"
-        }
-      );
-
-      effect
-    });
-
-    // Where the animation runs between, which is not always where the real
-    // window goes. A leaving workspace ends one screen away and is hidden
-    // there; an entering one starts one screen away. Everything else
-    // animates to the tile it actually occupies.
-    let monitor_rect = monitor.native_properties().bounds.clone();
-    let (anim_start, anim_target) = match animation_trigger {
-      Some(AnimationTrigger::WorkspaceLeaving(direction)) => {
-        (None, direction.offset(&target_rect, &monitor_rect))
-      }
-      Some(AnimationTrigger::WorkspaceEntering(direction)) => (
-        Some(direction.opposite().offset(&target_rect, &monitor_rect)),
-        target_rect.clone(),
-      ),
-      _ => (None, target_rect.clone()),
-    };
 
     // Whether an animation is actually running, which is not the same as
     // one having been configured. `start_animation` registers the
@@ -416,22 +459,13 @@ fn redraw_containers(
     // is in flight, no tick timer to ever complete it. Hiding the real
     // window on `animation_effect.is_some()` then strands it: invisible,
     // out of the layout, until an unrelated redraw happens by.
-    let is_animating = match animation_effect {
-      Some(effect_config) => {
+    let is_animating = match animation_plans.get(&window.id()) {
+      Some(plan) => {
         match state.animation_manager.start_animation(
           window,
-          effect_config,
-          anim_target.clone(),
+          plan,
           &monitor.native_properties(),
           &state.dispatcher,
-          anim_start.clone(),
-          matches!(
-            animation_trigger,
-            Some(
-              AnimationTrigger::WorkspaceEntering(_)
-                | AnimationTrigger::WorkspaceLeaving(_)
-            )
-          ),
         ) {
           Ok(()) => true,
           Err(err) => {
@@ -453,18 +487,6 @@ fn redraw_containers(
     let animation_owns_window =
       is_animating || state.animation_manager.is_animating(&window.id());
 
-    // A switch reveals its incoming windows across more than one sync, and
-    // the reveal does not always land in the sync that starts the slide. A
-    // window uncloaked opaque before its animation begins is on screen at
-    // its destination while the outgoing workspace is still leaving, which
-    // is the workspace being visible twice. So while a slide is pending,
-    // uncloak but stay transparent; the animation, or the first sync after
-    // the slide is over, brings the opacity back.
-    let slide_pending = state
-      .pending_sync
-      .workspace_slide_for(monitor.id())
-      .is_some();
-
     tracing::debug!("Updating window position: {window}");
 
     // Hide the real window when an animation layer is active.
@@ -476,7 +498,6 @@ fn redraw_containers(
       Visibility {
         animating: animation_owns_window,
         visible: is_visible,
-        slide_pending,
       },
       config,
     ) {
@@ -557,7 +578,7 @@ fn redraw_containers(
   Ok(())
 }
 
-/// The three facts that decide whether the real window is on screen, as
+/// The two facts that decide whether the real window is on screen, as
 /// opposed to a captured copy of it standing in.
 #[derive(Clone, Copy)]
 struct Visibility {
@@ -566,10 +587,6 @@ struct Visibility {
   animating: bool,
   /// The window belongs to the workspace being displayed.
   visible: bool,
-  /// This sync is part of a workspace switch that slides.
-  // LINT: only read on Windows, where cloaking is the hide method.
-  #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-  slide_pending: bool,
 }
 
 /// Returns the rect actually written to the window, which is the corner
@@ -684,14 +701,26 @@ fn reposition_window(
         _ => {
           swp_flags |= SWP_FRAMECHANGED;
 
-          window.native().set_window_pos(z_order, &rect, swp_flags)?;
+          // A redraw that lands where the window already is leaves it
+          // be. An animation places the window at its target as it
+          // starts, and the redraw completing it would otherwise reissue
+          // the move with `SWP_FRAMECHANGED`, forcing a full repaint at
+          // the moment the overlay hands over. A z-order change or a
+          // restore still goes through.
+          let is_settled = !should_restore
+            && matches!(z_order, WindowZOrder::Normal)
+            && window.native().frame_with_shadows()? == rect;
 
-          // When there's a mismatch between the DPI of the monitor and the
-          // window, the window might be sized incorrectly after the first
-          // move. If we set the position twice, inconsistencies after the
-          // first move are resolved.
-          if window.has_pending_dpi_adjustment() {
+          if !is_settled {
             window.native().set_window_pos(z_order, &rect, swp_flags)?;
+
+            // When there's a mismatch between the DPI of the monitor and
+            // the window, the window might be sized incorrectly after the
+            // first move. If we set the position twice, inconsistencies
+            // after the first move are resolved.
+            if window.has_pending_dpi_adjustment() {
+              window.native().set_window_pos(z_order, &rect, swp_flags)?;
+            }
           }
         }
       }
@@ -714,35 +743,36 @@ fn apply_visibility(
   let is_visible = vis.visible;
 
   if !vis.animating {
-    // Held back only while the window is arriving. One that is leaving
-    // keeps its pixels until its own animation hides it.
-    let hold_for_slide = vis.slide_pending && is_visible;
-
-    let alpha = if hold_for_slide { 0 } else { u8::MAX };
-
     if config.value.general.hide_method == HideMethod::Cloak {
       window.native().set_cloaked(!is_visible)?;
-
-      // Only a window that will be seen needs its opacity back. Restoring
-      // it on one being hidden is not merely redundant, it flashes:
-      // the cloak and the alpha both land on the compositor's next
-      // frame, and if the alpha wins the race the window is briefly
-      // opaque and uncloaked at its old tile. That is the outgoing
-      // workspace showing through at the end of a switch. Every path
-      // that shows a window sets alpha itself, so leaving a hidden
-      // one transparent costs nothing.
-      if is_visible {
-        window
-          .native()
-          .set_transparency(&OpacityValue::from_alpha(alpha))?;
-      }
     } else if is_visible {
       window.native().show()?;
-      window
-        .native()
-        .set_transparency(&OpacityValue::from_alpha(alpha))?;
     } else {
       window.native().hide()?;
+    }
+
+    // Only a window that will be seen needs its opacity back. Restoring
+    // it on one being hidden is not merely redundant, it flashes:
+    // the cloak and the alpha both land on the compositor's next
+    // frame, and if the alpha wins the race the window is briefly
+    // opaque and uncloaked at its old tile. That is the outgoing
+    // workspace showing through at the end of a switch. Every path
+    // that shows a window sets alpha itself, so leaving a hidden
+    // one transparent costs nothing.
+    if is_visible {
+      let effects = &config.value.window_effects;
+      let wants_translucency = effects.focused_window.transparency.enabled
+        || effects.other_windows.transparency.enabled;
+
+      // A transparency effect owns the final alpha, but the effects pass
+      // only visits the focused pair, so hand back full alpha here rather
+      // than leave the animation's zero behind. Otherwise undo everything
+      // the WM did, layered style included.
+      if wants_translucency {
+        window.set_alpha(OpacityValue::from_alpha(u8::MAX))?;
+      } else {
+        window.restore_opacity()?;
+      }
     }
 
     return Ok(());
@@ -752,16 +782,11 @@ fn apply_visibility(
   // is already sitting at its destination, so uncloaking it while opaque
   // shows it there for a frame before the animation has travelled
   // anywhere.
-  window
-    .native()
-    .set_transparency(&OpacityValue::from_alpha(0))?;
+  window.set_alpha(OpacityValue::from_alpha(0))?;
 
-  // A window arriving from another workspace is still cloaked, and a
-  // cloaked window has nothing to capture. Its animation would play
-  // empty and the window would pop into place at the end, which is what
-  // a workspace switch looked like before this. Costs nothing where the
-  // window was already uncloaked, since set_cloaked only writes on a
-  // change.
+  // A window arriving from another workspace is still cloaked. Uncloak
+  // it now, while transparent, so the handover at the end of the
+  // animation is one alpha change rather than an uncloak racing it.
   if is_visible && config.value.general.hide_method == HideMethod::Cloak {
     window.native().set_cloaked(false)?;
   }
@@ -906,12 +931,10 @@ fn apply_transparency_effect(
   window: &WindowContainer,
   effect_config: &WindowEffectConfig,
 ) {
-  let transparency = if effect_config.transparency.enabled {
-    &effect_config.transparency.opacity
+  if effect_config.transparency.enabled {
+    _ = window.set_alpha(effect_config.transparency.opacity);
   } else {
-    // Reset the transparency to default.
-    &OpacityValue::from_alpha(u8::MAX)
-  };
-
-  _ = window.native().set_transparency(transparency);
+    // Undo the effect entirely rather than pin the window at full alpha.
+    _ = window.restore_opacity();
+  }
 }

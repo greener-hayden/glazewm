@@ -3,8 +3,7 @@ use wm_common::{WindowState, WmEvent};
 
 use crate::{
   commands::container::{
-    detach_container, flatten_child_split_containers,
-    set_focused_descendant,
+    detach_tile, flatten_child_split_containers, set_focused_descendant,
   },
   models::WindowContainer,
   traits::{CommonGetters, WindowGetters},
@@ -25,7 +24,7 @@ pub fn unmanage_window(
   // Get container to switch focus to after the window has been removed.
   let focus_target = state.focus_target_after_removal(&window.clone());
 
-  detach_container(window.clone().into())?;
+  detach_tile(window.clone().into())?;
 
   // Cancel ongoing animation, if any.
   state.animation_manager.destroy_animation(&window.id());

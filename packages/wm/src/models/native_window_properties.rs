@@ -10,11 +10,13 @@ use wm_platform::{NativeWindowWindowsExt, RectDelta};
 pub struct NativeWindowProperties {
   pub title: String,
 
-  /// When `title` was last read from the platform.
+  /// When a read of `title` was last attempted.
   ///
   /// Reading a title is a blocking call into the owning app, and a
   /// terminal rewrites its title several times a second while busy, so
-  /// the reads land exactly when that app is slowest to answer.
+  /// the reads land exactly when that app is slowest to answer. Attempts
+  /// rather than successes, because a read that times out is the
+  /// expensive one and must still count against the next.
   pub title_read_at: Instant,
   #[cfg(target_os = "windows")]
   pub class_name: String,

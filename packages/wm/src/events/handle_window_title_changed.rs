@@ -34,13 +34,21 @@ pub fn handle_window_title_changed(
       return Ok(());
     }
 
+    // Stamped before the read, not after. A read that fails returns
+    // early, and a window whose title will not answer is the one whose
+    // reads cost the most — a full messaging timeout on the thread that
+    // also carries input. Stamping on success alone would open the gate
+    // for exactly that window and close it for everyone else.
+    window.update_native_properties(|properties| {
+      properties.title_read_at = Instant::now();
+    });
+
     info!("Window title changed: {window}");
 
     let title = try_warn!(window.native().title());
 
     window.update_native_properties(|properties| {
       properties.title = title;
-      properties.title_read_at = Instant::now();
     });
 
     // Run window rules for title change events.

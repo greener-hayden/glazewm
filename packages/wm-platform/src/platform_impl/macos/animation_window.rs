@@ -27,6 +27,17 @@ impl AnimationContext {
     Ok(Self)
   }
 
+  /// Implements [`AnimationContext::capture_frame`].
+  #[allow(clippy::unused_self)]
+  pub(crate) fn capture_frame(
+    &self,
+    window_id: WindowId,
+  ) -> crate::Result<AnimationCapture> {
+    Ok(AnimationCapture {
+      frame: CapturedFrame::new(window_id)?,
+    })
+  }
+
   /// Implements [`AnimationContext::transaction`].
   #[allow(clippy::unused_self)]
   pub(crate) fn transaction<F, R>(
@@ -65,6 +76,7 @@ impl AnimationWindow {
   pub(crate) fn new(
     _context: &AnimationContext,
     window: &NativeWindow,
+    capture: AnimationCapture,
     inner_rect: &Rect,
     outer_rect: &Rect,
     opacity: Option<OpacityValue>,
@@ -76,7 +88,7 @@ impl AnimationWindow {
       i32,
     )>;
 
-    let captured = CapturedFrame::new(window.id())?;
+    let captured = capture.frame;
 
     let (ns_window, layer, display_height) =
       dispatcher.dispatch_sync(|| -> DispatchResult {
@@ -225,6 +237,11 @@ impl AnimationWindow {
       layer.setOpacity(opacity.0);
     }
   }
+}
+
+/// A screen capture of a window via `CGWindowListCreateImage`.
+pub(crate) struct AnimationCapture {
+  frame: CapturedFrame,
 }
 
 /// A screen capture of a window via `CGWindowListCreateImage`.

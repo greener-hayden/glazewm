@@ -225,6 +225,13 @@ pub fn handle_window_moved_or_resized(
       }
     }
 
+    // Each tick moves an animating window's real frame along its
+    // overlay's path. Those moves are the WM's own, so they must not be
+    // read back as a floating placement or a change of monitor.
+    if state.animation_manager.is_animating(&window.id()) {
+      return Ok(());
+    }
+
     let should_fullscreen = {
       let workspace = nearest_monitor
         .displayed_workspace()

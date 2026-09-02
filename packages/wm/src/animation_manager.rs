@@ -6,12 +6,16 @@ use std::{
 use anyhow::Context;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use wm_common::{AnimationEffectConfig, AnimationsConfig};
+#[cfg(target_os = "windows")]
+use wm_common::DisplayState;
+use wm_common::{AnimationEffectConfig, AnimationsConfig, WindowState};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
+#[cfg(target_os = "windows")]
+use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{
-  AnimationContext, AnimationWindow, Dispatcher, EasingFunction,
-  OpacityValue, Rect,
+  AnimationCapture, AnimationContext, AnimationWindow, Dispatcher,
+  EasingFunction, OpacityValue, Rect, WindowId,
 };
 
 use crate::{
@@ -99,6 +103,12 @@ struct WindowAnimationState {
   start_rect: Rect,
   target_rect: Rect,
 
+  /// Whether the animation is part of a workspace slide. A slide
+  /// animation is never interrupted by a non-slide redraw, which would
+  /// otherwise restart a leaving window's travel mid-flight when an
+  /// unrelated `wm-redraw` lands during the slide.
+  is_slide: bool,
+
   /// Start and target opacity for the animation, or `None` if no opacity
   /// animation is active.
   start_opacity: Option<OpacityValue>,
@@ -112,6 +122,7 @@ impl WindowAnimationState {
     target_rect: Rect,
     config: &AnimationEffectConfig,
     frame_rate: u32,
+    is_slide: bool,
   ) -> Self {
     Self {
       start_time: Instant::now(),
@@ -120,6 +131,7 @@ impl WindowAnimationState {
       easing: config.easing.clone(),
       start_rect,
       target_rect,
+      is_slide,
       start_opacity: None,
       target_opacity: None,
     }
@@ -180,12 +192,16 @@ pub struct AnimationManager {
   /// Per-window overlay windows keyed by window ID.
   windows: HashMap<Uuid, AnimationWindow>,
 
+  /// Pre-captured frames, keyed by window ID, waiting for their
+  /// animations to start.
+  pending_captures: HashMap<Uuid, AnimationCapture>,
+
   /// Shared GPU context for animation overlay windows. Lazily
   /// initialized on the first animation.
   context: Option<AnimationContext>,
 
-  /// Handle to the running tick task, if any.
-  tick_task: Option<tokio::task::JoinHandle<()>>,
+  /// The running tick task and the frame rate it ticks at, if any.
+  tick_task: Option<(u32, tokio::task::JoinHandle<()>)>,
 
   /// Whether "Displays have separate Spaces" setting is enabled.
   #[cfg(target_os = "macos")]
@@ -205,6 +221,7 @@ impl AnimationManager {
       tick_tx,
       tick_rx,
       windows: HashMap::new(),
+      pending_captures: HashMap::new(),
       context: None,
       tick_task: None,
       #[cfg(target_os = "macos")]
@@ -231,6 +248,7 @@ impl AnimationManager {
   /// Destroys the animation window and clears animation state.
   pub fn destroy_animation(&mut self, window_id: &Uuid) {
     self.animations.remove(window_id);
+    self.pending_captures.remove(window_id);
     self.update_tick_rate();
 
     if let Some(anim_window) = self.windows.remove(window_id) {
@@ -247,13 +265,25 @@ impl AnimationManager {
   /// Updates all active animations during a single tick.
   ///
   /// Updates get batched into a single compositor transaction.
+  /// `animating_windows` holds the windows with a running animation,
+  /// keyed by ID, so their real frames can follow the overlays.
   pub fn tick_update(
     &mut self,
     dispatcher: &Dispatcher,
+    // LINT: `animating_windows` is only used on Windows.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    animating_windows: &HashMap<Uuid, WindowContainer>,
   ) -> anyhow::Result<()> {
     if self.animations.is_empty() {
       return Ok(());
     }
+
+    let rects = self
+      .animations
+      .iter()
+      .filter(|(_, anim)| !anim.is_complete())
+      .map(|(id, anim)| (*id, anim.current_rect(), anim.current_opacity()))
+      .collect::<Vec<_>>();
 
     self
       .context
@@ -261,20 +291,65 @@ impl AnimationManager {
       .context("Animation context not initialized.")?
       .transaction(
         || {
-          for (id, anim) in &self.animations {
-            if !anim.is_complete() {
-              if let Some(anim_window) = self.windows.get(id) {
-                anim_window.update(
-                  &anim.current_rect(),
-                  anim.current_opacity().as_ref(),
-                )?;
-              }
+          // One overlay failing must not stall the rest of the frame.
+          for (id, rect, opacity) in &rects {
+            let Some(anim_window) = self.windows.get(id) else {
+              continue;
+            };
+
+            if let Err(err) = anim_window.update(rect, opacity.as_ref()) {
+              tracing::warn!("Failed to update animation window: {err}");
             }
           }
-          anyhow::Ok(())
         },
         dispatcher,
-      )?
+      )
+      .context("Animation update failed.")?;
+
+    // After the overlays commit, keep the real windows under them. They
+    // are transparent, so this is invisible; what it buys is that
+    // trackers watching the window's bounds (mover-borders) follow the
+    // animation's motion instead of jumping to the endpoint.
+    #[cfg(target_os = "windows")]
+    for (id, rect, _) in &rects {
+      let Some(window) = animating_windows.get(id) else {
+        continue;
+      };
+
+      // Only a shown window follows. A hidden one is cloaked or parked
+      // in the corner, and pulling it out of the corner opaque would put
+      // it on screen under the overlay.
+      if !matches!(
+        window.display_state(),
+        DisplayState::Showing | DisplayState::Shown
+      ) {
+        continue;
+      }
+
+      // Only a pure translation follows. A size change would resize the
+      // app every tick, which games in particular resent.
+      let is_translation = self.animations.get(id).is_some_and(|anim| {
+        anim.start_rect.width() == anim.target_rect.width()
+          && anim.start_rect.height() == anim.target_rect.height()
+      });
+
+      if !is_translation {
+        continue;
+      }
+
+      // Land on the frame the completing redraw will use, borders
+      // included, so the handover does not jump by the border delta.
+      let result = window.total_border_delta().and_then(|delta| {
+        let frame = rect.apply_delta(&delta, None);
+        Ok(window.native().set_position_async(&frame)?)
+      });
+
+      if let Err(err) = result {
+        tracing::warn!("Failed to move window under animation: {err}");
+      }
+    }
+
+    Ok(())
   }
 
   /// Returns the animation effect config if an animation should be
@@ -289,12 +364,16 @@ impl AnimationManager {
   ) -> Option<&'a AnimationEffectConfig> {
     // Skip animation if:
     //  - The window is minimized.
+    //  - The window is fullscreen. Games and video players live here, and
+    //    an animation would capture, layer, cloak, overlay and move them.
+    //    They get the hard cut a desktop normally gives them.
     //  - The window is maximized (macOS only - can't override the OS's
     //    animation).
     //  - The window is hidden in the corner, but not animating. Safeguards
     //    against race condition where window finished an animation, but
     //    hasn't been moved to the real window position yet.
     if window.native_properties().is_minimized
+      || matches!(window.state(), WindowState::Fullscreen(_))
       || (window.native_properties().is_maximized
         && cfg!(target_os = "macos"))
       || (!self.is_animating(&window.id())
@@ -332,6 +411,19 @@ impl AnimationManager {
           ..
         },
       ) => {
+        // A slide owns its windows for its whole duration. A redraw
+        // landing mid-slide targets the windows' tiles, which differ from
+        // the slide targets (a leaving window's target is off screen), so
+        // the distance check alone would restart the slide mid-flight.
+        // The slide finishes, and the redraw re-runs after it anyway.
+        if self
+          .animations
+          .get(&window.id())
+          .is_some_and(|anim| anim.is_slide)
+        {
+          return None;
+        }
+
         // If the window is mid-animation, compare the previous animation
         // target to the new target.
         let frame = window.native_properties().frame;
@@ -359,6 +451,79 @@ impl AnimationManager {
     }
   }
 
+  /// Captures frames for a batch of windows concurrently.
+  ///
+  /// The frames are stored until their animations start, so every
+  /// animation started by one sync begins from an already-captured frame.
+  /// On Windows a capture blocks for tens of milliseconds, so capturing
+  /// sequentially would stagger each animation's start time and break the
+  /// motion of a workspace switch into a wave.
+  pub fn pre_capture(
+    &mut self,
+    windows: &[(Uuid, WindowId)],
+    dispatcher: &Dispatcher,
+  ) -> anyhow::Result<()> {
+    // Drop captures from a sync that never started their animations.
+    self.pending_captures.clear();
+
+    // A window whose overlay is still up keeps its frame, so a fresh
+    // capture would only be discarded.
+    let windows = windows
+      .iter()
+      .filter(|(id, _)| !self.windows.contains_key(id))
+      .collect::<Vec<_>>();
+
+    if windows.is_empty() {
+      return Ok(());
+    }
+
+    let context = match &self.context {
+      Some(ctx) => ctx,
+      None => self
+        .context
+        .get_or_insert(AnimationContext::new(dispatcher)?),
+    };
+
+    let capture_t0 = Instant::now();
+    let results = std::thread::scope(|scope| {
+      // Spawn every capture before joining any, or they run one at a
+      // time.
+      let handles = windows
+        .iter()
+        .map(|(id, window_id)| {
+          (id, scope.spawn(move || context.capture_frame(*window_id)))
+        })
+        .collect::<Vec<_>>();
+
+      handles
+        .into_iter()
+        .map(|(id, handle)| (id, handle.join()))
+        .collect::<Vec<_>>()
+    });
+
+    tracing::debug!(
+      "Captured {} window frames in {:?}.",
+      results.len(),
+      capture_t0.elapsed()
+    );
+
+    for (id, result) in results {
+      match result {
+        Ok(Ok(capture)) => {
+          self.pending_captures.insert(*id, capture);
+        }
+        Ok(Err(err)) => {
+          tracing::warn!("Failed to capture window frame: {err}");
+        }
+        Err(_) => {
+          tracing::warn!("Capture thread panicked for window {id}.");
+        }
+      }
+    }
+
+    Ok(())
+  }
+
   /// Starts a new animation, or extends an existing animation.
   #[allow(clippy::too_many_arguments)]
   /// `start_override` forces where the animation begins, for a window that
@@ -374,6 +539,7 @@ impl AnimationManager {
     monitor_properties: &NativeMonitorProperties,
     dispatcher: &Dispatcher,
     start_override: Option<Rect>,
+    is_slide: bool,
   ) -> anyhow::Result<()> {
     let existing_animation = self.animations.get(&window.id());
 
@@ -393,6 +559,7 @@ impl AnimationManager {
       target_rect,
       effect_config,
       frame_rate,
+      is_slide,
     );
 
     self.animations.insert(window.id(), animation.clone());
@@ -419,6 +586,8 @@ impl AnimationManager {
       outer_rect
     };
 
+    let capture = self.pending_captures.remove(&window.id());
+
     let context = match &self.context {
       Some(ctx) => ctx,
       None => self
@@ -444,9 +613,15 @@ impl AnimationManager {
         dispatcher,
       )??;
     } else {
+      let capture = match capture {
+        Some(capture) => capture,
+        None => context.capture_frame(window.native().id())?,
+      };
+
       let anim_window = AnimationWindow::new(
         context,
         &window.native(),
+        capture,
         &animation.start_rect,
         &outer_rect,
         animation.current_opacity(),
@@ -470,26 +645,42 @@ impl AnimationManager {
 
   /// Spawns a task for emitting ticks at the target frame rate.
   ///
-  /// Cancels existing tick task if there is one. The ticks are emitted at
-  /// the highest frame rate among the animated windows.
+  /// The ticks are emitted at the highest frame rate among the animated
+  /// windows. A running task is only replaced when that rate changes.
   ///
   /// Called on animation start and completion.
   fn update_tick_rate(&mut self) {
-    if let Some(handle) = self.tick_task.take() {
-      handle.abort();
-    }
-
     // Get the highest frame rate among the animated windows.
     let Some(frame_rate) =
       self.animations.values().map(|anim| anim.frame_rate).max()
     else {
+      if let Some((_, handle)) = self.tick_task.take() {
+        handle.abort();
+      }
       return;
     };
+
+    // Keep a task already ticking at this rate. Animations of one sync
+    // start together, and restarting the task per window would emit an
+    // immediate tick per window, rendering as a burst of duplicate
+    // frames. A monitor with a faster refresh rate joining the batch is
+    // what does change the rate, and only then is the task replaced.
+    if self
+      .tick_task
+      .as_ref()
+      .is_some_and(|(rate, _)| *rate == frame_rate)
+    {
+      return;
+    }
+
+    if let Some((_, handle)) = self.tick_task.take() {
+      handle.abort();
+    }
 
     let frame_time = Duration::from_millis(u64::from(1000 / frame_rate));
     let tick_tx = self.tick_tx.clone();
 
-    self.tick_task = Some(tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
       let mut interval = tokio::time::interval(frame_time);
       interval
         .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -500,6 +691,8 @@ impl AnimationManager {
           break;
         }
       }
-    }));
+    });
+
+    self.tick_task = Some((frame_rate, handle));
   }
 }

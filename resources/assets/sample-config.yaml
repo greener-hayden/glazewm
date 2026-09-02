@@ -56,6 +56,11 @@ gaps:
 
 # *Experimental* animation support!
 # Uncomment to enable window move/open animations.
+#
+# Fullscreen windows never animate. Windows matched by an `ignore` rule
+# (see `window_rules` below) are never touched by any animation at all:
+# no capture, no overlay, no style changes. Recommended for games with
+# anti-cheat.
 animations:
   # window_move:
   #   duration_ms: 180

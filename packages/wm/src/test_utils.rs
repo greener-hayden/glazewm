@@ -135,6 +135,8 @@ impl NativeWindowProperties {
       class_name: String::new(),
       #[cfg(target_os = "windows")]
       shadow_borders: mock_border_delta(),
+      #[cfg(target_os = "windows")]
+      alpha_state: crate::models::AlphaState::default(),
     }
   }
 }

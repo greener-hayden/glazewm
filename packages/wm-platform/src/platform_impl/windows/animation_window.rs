@@ -48,7 +48,7 @@ use windows::{
 
 use crate::{
   platform_impl::com::COM_INIT, Dispatcher, NativeWindow, OpacityValue,
-  Rect, ThreadBound,
+  Rect, ThreadBound, WindowId,
 };
 
 struct Direct3DDevice(IDirect3DDevice);
@@ -101,6 +101,22 @@ impl AnimationContext {
         })
       })
     })?
+  }
+
+  /// Implements [`AnimationContext::capture_frame`].
+  ///
+  /// Safe to call from any thread; `WGC` captures are free-threaded and
+  /// the shared device is only read here. Does not need the dispatcher,
+  /// unlike overlay creation.
+  pub(crate) fn capture_frame(
+    &self,
+    window_id: WindowId,
+  ) -> crate::Result<AnimationCapture> {
+    COM_INIT.with(|_| {
+      Ok(AnimationCapture {
+        frame: CapturedFrame::new(window_id.0, self)?,
+      })
+    })
   }
 
   /// Implements [`AnimationContext::transaction`].
@@ -184,12 +200,13 @@ impl AnimationWindow {
   pub(crate) fn new(
     context: &AnimationContext,
     window: &NativeWindow,
+    capture: AnimationCapture,
     inner_rect: &Rect,
     outer_rect: &Rect,
     opacity: Option<OpacityValue>,
     dispatcher: &Dispatcher,
   ) -> crate::Result<Self> {
-    let captured = CapturedFrame::new(window.inner.hwnd().0, context)?;
+    let captured = capture.frame;
 
     dispatcher.dispatch_sync(|| {
       COM_INIT.with(|_| {
@@ -412,6 +429,14 @@ impl AnimationWindow {
     }
 
     // Order the animation window just above the source window and show it.
+    //
+    // Two constraints, both deliberate. The overlay sits at the source's
+    // own z-position, never `HWND_TOPMOST`, and it is torn down shortly
+    // after its animation ends (see
+    // `AnimationManager::destroy_animation`). A topmost, long-lived,
+    // click-through popup over a game is the shape of a cheat overlay,
+    // and anti-cheat heuristics look for exactly that. A brief one at
+    // the source's own depth is not.
     unsafe {
       SetWindowPos(
         hwnd,
@@ -472,6 +497,11 @@ impl AnimationWindow {
 
     Ok(())
   }
+}
+
+/// A screen capture of a window via `Windows.Graphics.Capture`.
+pub(crate) struct AnimationCapture {
+  frame: CapturedFrame,
 }
 
 /// A screen capture of a window via `Windows.Graphics.Capture`.

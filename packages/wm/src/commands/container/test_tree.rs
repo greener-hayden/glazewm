@@ -3,8 +3,6 @@
 use wm_common::{GapsConfig, TilingDirection, WorkspaceConfig};
 use wm_platform::{NativeWindow, Rect, RectDelta};
 
-#[cfg(target_os = "windows")]
-use crate::models::AlphaState;
 use crate::{
   models::{Container, NativeWindowProperties, TilingWindow, Workspace},
   traits::{CommonGetters, TilingSizeGetters},
@@ -28,24 +26,11 @@ pub fn workspace() -> Workspace {
 pub fn window() -> TilingWindow {
   let frame = Rect::from_xy(0, 0, 100, 100);
 
-  let properties = NativeWindowProperties {
-    title: String::new(),
-    title_read_at: std::time::Instant::now(),
-    #[cfg(target_os = "windows")]
-    class_name: String::new(),
-    #[cfg(target_os = "macos")]
-    bundle_id: None,
-    process_name: String::new(),
-    frame: frame.clone(),
-    is_minimized: false,
-    is_maximized: false,
-    is_resizable: true,
-    min_size: None,
-    #[cfg(target_os = "windows")]
-    shadow_borders: RectDelta::zero(),
-    #[cfg(target_os = "windows")]
-    alpha_state: AlphaState::default(),
-  };
+  // The builder, not a literal: it carries the platform-specific fields
+  // itself, so a new one does not break this fixture on the platform it
+  // was not written on.
+  let properties =
+    NativeWindowProperties::mock().frame(frame.clone()).call();
 
   TilingWindow::new(
     None,

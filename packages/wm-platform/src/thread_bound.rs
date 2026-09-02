@@ -59,6 +59,28 @@ unsafe impl<T> Send for ThreadBound<T> {}
 unsafe impl<T> Sync for ThreadBound<T> {}
 
 impl<T> ThreadBound<T> {
+  /// Binds a value to the current thread without an event loop.
+  ///
+  /// For tests, which have no running event loop to bind to. The value is
+  /// never handed back and is leaked rather than dropped, because
+  /// dropping it would need the thread its dispatcher cannot reach.
+  #[cfg(feature = "test_utils")]
+  #[must_use]
+  pub fn mock(inner: T) -> Self {
+    // Marked stopped, so the drop below dispatches nowhere instead of
+    // reaching for an event loop source that does not exist.
+    let dispatcher = Dispatcher::new(
+      None,
+      std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    );
+
+    Self {
+      value: ManuallyDrop::new(inner),
+      thread_id: std::thread::current().id(),
+      dispatcher,
+    }
+  }
+
   /// Binds a value to the current event loop thread.
   ///
   /// # Panics

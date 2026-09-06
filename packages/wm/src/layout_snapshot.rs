@@ -41,11 +41,6 @@ impl LayoutSnapshot {
     Ok(snapshot)
   }
 
-  /// Reports an uninitialized layout snapshot.
-  pub fn is_empty(&self) -> bool {
-    self.rects.is_empty()
-  }
-
   /// Returns an immutable committed rectangle.
   pub fn rect(&self, id: Uuid) -> anyhow::Result<&Rect> {
     self.rects.get(&id).context("No layout rectangle.")

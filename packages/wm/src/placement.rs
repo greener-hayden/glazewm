@@ -321,15 +321,12 @@ pub fn platform_sync(
   config: &UserConfig,
 ) -> anyhow::Result<()> {
   let layout_changed = std::mem::take(&mut state.native_sync.layout_dirty);
-  if layout_changed
-    || !state.pending_sync.containers_to_redraw().is_empty()
-    || state.layout_snapshot.is_empty()
-  {
-    state.layout_snapshot =
-      crate::layout_snapshot::LayoutSnapshot::capture(
-        &state.root_container,
-      )?;
-  }
+  // Every commit solves the layout again. A queued redraw is not the only
+  // thing that moves a rect: a dropped floating window writes its own
+  // placement and asks for no redraw, and reconciling that window against
+  // a snapshot from before the drag puts it back where it started.
+  state.layout_snapshot =
+    crate::layout_snapshot::LayoutSnapshot::capture(&state.root_container)?;
   let focused =
     state.focused_container().context("No focused container.")?;
   let redraw = if layout_changed {

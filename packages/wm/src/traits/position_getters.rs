@@ -30,86 +30,91 @@ pub fn resolve_lengths(
   mins: &[i32],
   total: i32,
 ) -> Vec<i32> {
+  let total = i64::from(total.max(0));
+  let mins = (0..sizes.len())
+    .map(|index| mins.get(index).copied().unwrap_or(0).max(0))
+    .collect::<Vec<_>>();
+  if mins.iter().map(|value| i64::from(*value)).sum::<i64>() >= total {
+    return mins;
+  }
+  let weights = sizes
+    .iter()
+    .map(|size| {
+      if size.is_finite() && *size > 0.0 {
+        f64::from(*size)
+      } else {
+        0.0
+      }
+    })
+    .collect::<Vec<_>>();
   let mut pinned = vec![false; sizes.len()];
-
+  let mut exact = vec![0.0; sizes.len()];
   loop {
-    let free_total = total
+    let remaining = total
       - mins
         .iter()
         .zip(&pinned)
-        .filter(|(_, is_pinned)| **is_pinned)
-        .map(|(min, _)| *min)
-        .sum::<i32>();
-
-    let free_size = sizes
+        .filter(|(_, pinned)| **pinned)
+        .map(|(min, _)| i64::from(*min))
+        .sum::<i64>();
+    let free = pinned.iter().filter(|pinned| !**pinned).count();
+    if free == 0 {
+      return mins;
+    }
+    let weight = weights
       .iter()
       .zip(&pinned)
-      .filter(|(_, is_pinned)| !**is_pinned)
-      .map(|(size, _)| *size)
-      .sum::<f32>();
-
-    // Every child is pinned, or there is no share left to divide.
-    if free_size <= 0. {
-      break;
-    }
-
-    let mut pinned_any = false;
-
-    for (index, is_pinned) in pinned.iter_mut().enumerate() {
-      if *is_pinned {
+      .filter(|(_, pinned)| !**pinned)
+      .map(|(weight, _)| *weight)
+      .sum::<f64>();
+    let mut changed = false;
+    for index in 0..sizes.len() {
+      if pinned[index] {
+        exact[index] = f64::from(mins[index]);
         continue;
       }
-
-      #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation
-      )]
-      let length =
-        (free_total as f32 * (sizes[index] / free_size)).round() as i32;
-
-      if length < mins[index] {
-        *is_pinned = true;
-        pinned_any = true;
+      #[allow(clippy::cast_precision_loss)]
+      let share = if weight > 0.0 {
+        weights[index] / weight
+      } else {
+        1.0 / free as f64
+      };
+      #[allow(clippy::cast_precision_loss)]
+      {
+        exact[index] = remaining as f64 * share;
+      }
+      if exact[index] < f64::from(mins[index]) {
+        pinned[index] = true;
+        changed = true;
       }
     }
-
-    if !pinned_any {
+    if !changed {
       break;
     }
   }
-
-  let free_total = total
-    - mins
-      .iter()
-      .zip(&pinned)
-      .filter(|(_, is_pinned)| **is_pinned)
-      .map(|(min, _)| *min)
-      .sum::<i32>();
-
-  let free_size = sizes
+  #[allow(clippy::cast_possible_truncation)]
+  let mut lengths = exact
     .iter()
-    .zip(&pinned)
-    .filter(|(_, is_pinned)| !**is_pinned)
-    .map(|(size, _)| *size)
-    .sum::<f32>();
-
-  sizes
-    .iter()
-    .enumerate()
-    .map(|(index, size)| {
-      if pinned[index] || free_size <= 0. {
-        mins[index]
-      } else {
-        #[allow(
-          clippy::cast_precision_loss,
-          clippy::cast_possible_truncation
-        )]
-        let length =
-          (free_total as f32 * (size / free_size)).round() as i32;
-        length
-      }
-    })
-    .collect()
+    .map(|value| value.floor() as i32)
+    .collect::<Vec<_>>();
+  let mut order = (0..sizes.len())
+    .filter(|index| !pinned[*index])
+    .collect::<Vec<_>>();
+  order.sort_by(|left, right| {
+    exact[*right]
+      .fract()
+      .total_cmp(&exact[*left].fract())
+      .then(left.cmp(right))
+  });
+  let remaining =
+    total - lengths.iter().map(|length| i64::from(*length)).sum::<i64>();
+  for index in order
+    .into_iter()
+    .take(usize::try_from(remaining).unwrap_or(0))
+  {
+    lengths[index] += 1;
+  }
+  lengths
 }
 
 /// Keeps a child's rect inside its parent.
@@ -119,12 +124,17 @@ pub fn resolve_lengths(
 /// honouring size writes.
 #[must_use]
 pub fn contain_in_parent(rect: &Rect, parent: &Rect) -> Rect {
-  let width = rect.width().min(parent.width());
-  let height = rect.height().min(parent.height());
-
+  let parent_width = parent.width().max(0);
+  let parent_height = parent.height().max(0);
+  let width = rect.width().clamp(0, parent_width);
+  let height = rect.height().clamp(0, parent_height);
   Rect::from_xy(
-    rect.x().min(parent.right - width),
-    rect.y().min(parent.bottom - height),
+    rect
+      .x()
+      .clamp(parent.left, parent.left + parent_width - width),
+    rect
+      .y()
+      .clamp(parent.top, parent.top + parent_height - height),
     width,
     height,
   )
@@ -143,89 +153,12 @@ macro_rules! impl_position_getters_as_resizable {
         let parent = self
           .parent()
           .and_then(|parent| parent.as_direction_container().ok())
-          .context("Parent does not have a tiling direction.")?;
-
-        let parent_rect = parent.to_rect()?;
-
-        let (horizontal_gap, vertical_gap) = self.inner_gaps()?;
-        let inner_gap = match parent.tiling_direction() {
-          TilingDirection::Vertical => vertical_gap,
-          TilingDirection::Horizontal => horizontal_gap,
-        };
-
-        // Siblings are resolved together rather than each from its own
-        // tiling size, because a child pinned to its minimum changes what
-        // is left for the others.
-        let siblings = parent.tiling_children().collect::<Vec<_>>();
-        let sizes = siblings
-          .iter()
-          .map(TilingSizeGetters::tiling_size)
-          .collect::<Vec<_>>();
-
-        let is_horizontal =
-          matches!(parent.tiling_direction(), TilingDirection::Horizontal);
-
-        let mins = siblings
-          .iter()
-          .map(|sibling| sibling.min_length(is_horizontal))
-          .collect::<Vec<_>>();
-
-        let index = siblings
-          .iter()
-          .position(|sibling| sibling.id() == self.id())
-          .context("Container is not among its parent's children.")?;
-
-        #[allow(
-          clippy::cast_possible_truncation,
-          clippy::cast_possible_wrap
-        )]
-        let (width, height) = {
-          let available = match parent.tiling_direction() {
-            TilingDirection::Vertical => parent_rect.height(),
-            TilingDirection::Horizontal => parent_rect.width(),
-          } - inner_gap
-            * (siblings.len().saturating_sub(1)) as i32;
-
-          let length =
-            $crate::traits::resolve_lengths(&sizes, &mins, available)
-              .get(index)
-              .copied()
-              .unwrap_or(0);
-
-          match parent.tiling_direction() {
-            TilingDirection::Vertical => (parent_rect.width(), length),
-            TilingDirection::Horizontal => (length, parent_rect.height()),
-          }
-        };
-
-        let (x, y) = {
-          let mut prev_siblings = self
-            .prev_siblings()
-            .filter_map(|sibling| sibling.as_tiling_container().ok());
-
-          match prev_siblings.next() {
-            None => (parent_rect.x(), parent_rect.y()),
-            Some(sibling) => {
-              let sibling_rect = sibling.to_rect()?;
-
-              match parent.tiling_direction() {
-                TilingDirection::Vertical => (
-                  parent_rect.x(),
-                  sibling_rect.y() + sibling_rect.height() + inner_gap,
-                ),
-                TilingDirection::Horizontal => (
-                  sibling_rect.x() + sibling_rect.width() + inner_gap,
-                  parent_rect.y(),
-                ),
-              }
-            }
-          }
-        };
-
-        Ok($crate::traits::contain_in_parent(
-          &Rect::from_xy(x, y, width, height),
-          &parent_rect,
-        ))
+          .context("Parent lacks tiling direction.")?;
+        $crate::layout_snapshot::child_rects(&parent, &parent.to_rect()?)?
+          .into_iter()
+          .find(|(child, _)| child.id() == self.id())
+          .map(|(_, rect)| rect)
+          .context("Missing tiling child.")
       }
     }
   };
@@ -234,6 +167,27 @@ macro_rules! impl_position_getters_as_resizable {
 #[cfg(test)]
 mod tests {
   use super::resolve_lengths;
+
+  /// Distributes rounding residuals deterministically.
+  #[test]
+  fn distributes_residual_pixels() {
+    assert_eq!(resolve_lengths(&[1.0; 3], &[0; 3], 100), vec![34, 33, 33]);
+    assert_eq!(resolve_lengths(&[0.0; 3], &[0; 3], 100), vec![34, 33, 33]);
+    assert_eq!(resolve_lengths(&[f32::NAN, 0.0], &[0; 2], 3), vec![2, 1]);
+  }
+
+  /// Conserves available pixels across many layouts.
+  #[test]
+  fn conserves_layout_pixels() {
+    for count in 1..16 {
+      for total in 0..1000 {
+        let sizes = vec![1.0; count];
+        let lengths = resolve_lengths(&sizes, &vec![0; count], total);
+        assert_eq!(lengths.iter().sum::<i32>(), total);
+        assert!(lengths.iter().all(|length| *length >= 0));
+      }
+    }
+  }
 
   #[test]
   fn splits_evenly_without_minimums() {

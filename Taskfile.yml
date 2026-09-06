@@ -1,0 +1,59 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build release binaries for this platform
+    cmds:
+      - cargo build --release --locked -p wm -p wm-cli {{if eq OS "windows"}}-p wm-watcher{{end}}
+
+  fmt:
+    desc: Format all crates
+    cmds:
+      - cargo fmt --all
+
+  lint:
+    desc: Clippy with warnings as errors
+    cmds:
+      - cargo clippy --workspace {{if ne OS "windows"}}--exclude wm-watcher{{end}} --all-targets --all-features --locked -- -D warnings
+
+  test:
+    desc: Run workspace tests (macOS desktop harness is separate)
+    cmds:
+      - cargo test --workspace {{if ne OS "windows"}}--exclude wm-watcher --exclude wm-platform{{end}} --locked
+
+  test:desktop:
+    desc: Run the platform tests in a desktop session
+    cmds:
+      - cargo test -p wm-platform --locked {{if eq OS "darwin"}}-- --test-threads=1{{end}}
+
+  check:
+    desc: Full local gate (format, lint, tests)
+    aliases: [ci]
+    cmds:
+      - task: fmt
+      - task: lint
+      - task: test
+
+  install:
+    desc: Build, install, and restart using the platform packaging helper
+    aliases: [dogfood]
+    cmds:
+      - task: install:{{OS}}
+
+  install:windows:
+    internal: true
+    platforms: [windows]
+    preconditions:
+      - sh: test -f "$HOME/.local/bin/glazewm-package.ps1"
+        msg: "glazewm-package.ps1 not found. Run 'chezmoi apply' first."
+    cmds:
+      - powershell -NoProfile -ExecutionPolicy Bypass -File "$HOME/.local/bin/glazewm-package.ps1" -Repo "{{.ROOT_DIR}}"
+
+  install:darwin:
+    internal: true
+    platforms: [darwin]
+    preconditions:
+      - sh: test -f "$HOME/.local/bin/glazewm-package.sh"
+        msg: "glazewm-package.sh not found. Run 'chezmoi apply' first."
+    cmds:
+      - sh "$HOME/.local/bin/glazewm-package.sh" "{{.ROOT_DIR}}"

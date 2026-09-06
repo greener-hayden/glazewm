@@ -13,6 +13,10 @@ pub fn ignore_window(
   window: WindowContainer,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  state
+    .native_sync
+    .release(window.id(), window.native().is_valid());
+
   // Create iterator of parent, grandparent, and great-grandparent.
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
 

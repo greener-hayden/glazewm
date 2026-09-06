@@ -18,6 +18,19 @@ impl OpacityValue {
     Self(f32::from(alpha) / 255.0)
   }
 
+  /// Applies a relative delta, saturating at both ends.
+  #[must_use]
+  pub fn adjust(&self, delta: &crate::Delta<OpacityValue>) -> Self {
+    let alpha = self.to_alpha();
+    let step = delta.inner.to_alpha();
+
+    Self::from_alpha(if delta.is_negative {
+      alpha.saturating_sub(step)
+    } else {
+      alpha.saturating_add(step)
+    })
+  }
+
   /// Interpolates between this and another [`OpacityValue`].
   ///
   /// `progress` should be a value between 0.0 (this opacity) and 1.0

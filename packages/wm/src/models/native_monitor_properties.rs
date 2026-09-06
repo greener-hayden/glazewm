@@ -2,7 +2,7 @@ use wm_platform::{Display, Rect};
 #[cfg(target_os = "windows")]
 use wm_platform::{DisplayDeviceExtWindows, DisplayExtWindows};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NativeMonitorProperties {
   #[cfg(target_os = "macos")]
   pub device_uuid: String,

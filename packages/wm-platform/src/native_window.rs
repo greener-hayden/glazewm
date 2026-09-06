@@ -14,7 +14,7 @@ use windows::Win32::{
 use crate::platform_impl::AXUIElementExt;
 use crate::{platform_impl, Rect};
 #[cfg(target_os = "windows")]
-use crate::{Color, CornerStyle, Delta, OpacityValue, RectDelta};
+use crate::{Color, CornerStyle, OpacityValue, RectDelta};
 
 /// Unique identifier of a window.
 ///
@@ -332,16 +332,6 @@ pub trait NativeWindowWindowsExt {
     &self,
     opacity_value: &OpacityValue,
   ) -> crate::Result<()>;
-
-  /// Adjusts the window's transparency by a relative delta.
-  ///
-  /// # Platform-specific
-  ///
-  /// This method is only available on Windows.
-  fn adjust_transparency(
-    &self,
-    opacity_delta: &Delta<OpacityValue>,
-  ) -> crate::Result<()>;
 }
 
 #[cfg(target_os = "windows")]
@@ -447,13 +437,6 @@ impl NativeWindowWindowsExt for NativeWindow {
     opacity_value: &OpacityValue,
   ) -> crate::Result<()> {
     self.inner.set_transparency(opacity_value)
-  }
-
-  fn adjust_transparency(
-    &self,
-    opacity_delta: &Delta<OpacityValue>,
-  ) -> crate::Result<()> {
-    self.inner.adjust_transparency(opacity_delta)
   }
 }
 

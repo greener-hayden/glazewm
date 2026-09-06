@@ -1,5 +1,5 @@
 use anyhow::Context;
-use tracing::{info, warn};
+use tracing::info;
 use wm_common::WindowState;
 
 use crate::{
@@ -140,11 +140,8 @@ fn set_non_tiling(
   {
     info!("No window state update. Minimizing window.");
 
-    // TODO: Instead of doing the platform call directly here, instead add
-    // a `queue_state_change` method to `PendingSync`.
-    if let Err(err) = window.native().minimize() {
-      warn!("Failed to minimize window: {}", err);
-    }
+    state.native_sync.minimize(window.id());
+    state.pending_sync.queue_container_to_redraw(window.clone());
 
     return Ok(window);
   }

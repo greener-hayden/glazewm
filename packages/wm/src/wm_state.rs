@@ -10,14 +10,10 @@ use uuid::Uuid;
 use wm_common::{
   BindingModeConfig, DisplayState, HideCorner, WindowState, WmEvent,
 };
-#[cfg(target_os = "windows")]
-use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
 };
 
-#[cfg(target_os = "windows")]
-use crate::traits::WindowAlphaExt;
 use crate::{
   animation_manager::AnimationManager,
   commands::{
@@ -57,19 +53,6 @@ struct PendingFollow {
   requested_at: Instant,
 }
 
-/// A frame written to a window, awaiting confirmation that it took.
-#[derive(Clone, Debug)]
-pub struct ExpectedFrame {
-  /// The rect last written to the window.
-  pub rect: Rect,
-
-  /// When it was written.
-  pub written_at: Instant,
-
-  /// How many times it has been written.
-  pub attempts: u8,
-}
-
 pub struct WmState {
   /// Root node of the container tree. Monitors are the children of the
   /// root node, followed by workspaces, then split containers/windows.
@@ -78,6 +61,10 @@ pub struct WmState {
   pub dispatcher: Dispatcher,
 
   pub pending_sync: PendingSync,
+
+  pub layout_snapshot: crate::layout_snapshot::LayoutSnapshot,
+
+  pub native_sync: crate::placement::PlacementCoordinator,
 
   /// Manager for window animations.
   pub animation_manager: AnimationManager,
@@ -88,13 +75,6 @@ pub struct WmState {
   /// workspace focus.
   pub recent_workspace_name: Option<String>,
 
-  /// The previously focused window that had focus effects applied.
-  ///
-  /// Used to efficiently update window effects by only removing focus
-  /// effects from the previous window rather than all windows when focus
-  /// changes.
-  pub prev_effects_window: Option<WindowContainer>,
-
   /// Time since a previously focused window was unmanaged or minimized.
   ///
   /// Used to decide whether to override incoming focus events.
@@ -102,15 +82,6 @@ pub struct WmState {
 
   /// Deferred off-screen focus follow awaiting churn confirmation.
   pending_follow: Option<PendingFollow>,
-
-  /// Frames written to windows that have yet to be confirmed.
-  ///
-  /// An accessibility resize reports success and is then dropped by an
-  /// app that is busy, and the app sends no event when it does so. There
-  /// is therefore nothing to react to: the window keeps a size nobody
-  /// asked for until an unrelated layout change happens to write again.
-  /// Holding what was written is what lets a timer notice and re-ask.
-  pub expected_frames: HashMap<Uuid, ExpectedFrame>,
 
   /// Configs of currently enabled binding modes.
   pub binding_modes: Vec<BindingModeConfig>,
@@ -153,11 +124,11 @@ impl WmState {
       animation_manager: AnimationManager::new(&dispatcher),
       dispatcher,
       pending_sync: PendingSync::default(),
-      prev_effects_window: None,
+      layout_snapshot: crate::layout_snapshot::LayoutSnapshot::default(),
+      native_sync: crate::placement::PlacementCoordinator::default(),
       recent_workspace_name: None,
       unmanaged_or_minimized_timestamp: None,
       pending_follow: None,
-      expected_frames: HashMap::new(),
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       is_paused: false,
@@ -342,7 +313,9 @@ impl WmState {
   /// bottom-left and bottom-right of the monitor's working area, then
   /// picking the side that overlaps the least with other monitors'
   /// working areas (ties favor bottom-right).
-  pub fn monitors_by_hide_corner(&self) -> Vec<(Monitor, HideCorner)> {
+  ///
+  /// Returns a map keyed by monitor ID.
+  pub fn monitors_by_hide_corner(&self) -> HashMap<Uuid, HideCorner> {
     const TEST_FRAME_SIZE: i32 = 400;
     const VISIBLE_SLIVER: i32 = 1;
 
@@ -391,7 +364,7 @@ impl WmState {
           HideCorner::BottomRight
         };
 
-        (monitor, corner)
+        (monitor.id(), corner)
       })
       .collect()
   }
@@ -835,28 +808,7 @@ impl WmState {
 
 impl Drop for WmState {
   fn drop(&mut self) {
-    let managed_windows = self.windows();
-
-    for window in &managed_windows {
-      // Redraw windows to their intended positions. On macOS, this will
-      // unhide windows that are on other workspaces.
-      if let Ok(rect) = window.to_rect() {
-        if let Err(err) = window.native().set_frame(&rect) {
-          warn!("Failed to redraw window on cleanup: {:?}", err);
-        }
-      }
-
-      // Reset any effects on Windows.
-      #[cfg(target_os = "windows")]
-      {
-        if let Err(err) = window.native().show() {
-          warn!("Failed to show window: {:?}", err);
-        }
-
-        let _ = window.native().set_taskbar_visibility(true);
-        let _ = window.native().set_border_color(None);
-        let _ = window.restore_opacity();
-      }
-    }
+    self.native_sync.release_all();
+    self.native_sync.cleanup(&mut self.animation_manager);
   }
 }

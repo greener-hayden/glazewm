@@ -36,10 +36,15 @@ use crate::{
 
 mod animation_manager;
 mod commands;
+mod event_batch;
 mod events;
 mod ipc_server;
+mod layout_snapshot;
 mod models;
+mod native_reconciler;
 mod pending_sync;
+mod placement;
+mod presentation;
 mod sys_tray;
 mod traits;
 mod user_config;
@@ -180,21 +185,19 @@ async fn start_wm(
     dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
   }
 
-  // Create an interval for periodically cleaning up invalid windows.
-  // Polls for resizes an app accepted and dropped. See
-  // `Wm::reassert_frames`; a dropped write raises no event, so the only
-  // way to notice is to look.
-  let mut reassert_interval =
-    tokio::time::interval(Duration::from_millis(250));
-  reassert_interval
-    .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
   let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
   cleanup_interval
     .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+  let mut topology = event_batch::TopologyDebounce::default();
   loop {
+    window_listener.set_opening_concealment(
+      !wm.state.is_paused && config.value.animations.window_open.is_some(),
+    );
+    let topology_deadline = topology.deadline();
     let follow_deadline = wm.state.pending_follow_deadline();
+    let placement_deadline =
+      wm.state.native_sync.deadline(wm.state.is_paused);
 
     let res = tokio::select! {
       _ = signal::ctrl_c() => {
@@ -215,18 +218,25 @@ async fn start_wm(
       },
       Some(event) = window_listener.next_event() => {
         tracing::debug!("Received window event: {:?}", event);
-        wm.process_event(PlatformEvent::Window(event), &mut config)
+        let mut batch = event_batch::WindowBatch::default();
+        batch.push(event);
+        for _ in 1..64 {
+          let Some(event) = window_listener.try_next_event() else { break; };
+          batch.push(event);
+        }
+        wm.process_window_batch(batch, &mut config)
       },
       Some(()) = display_listener.next_event() => {
         tracing::debug!("Received display settings changed event.");
-        wm.process_event(PlatformEvent::DisplaySettingsChanged, &mut config)
+        topology.notify(std::time::Instant::now());
+        Ok(())
       },
       Some(event) = keybinding_listener.next_event() => {
         tracing::debug!("Received keyboard event: {:?}", event);
         wm.process_event(PlatformEvent::Keybinding(event), &mut config)
       }
-      _ = reassert_interval.tick() => {
-        wm.reassert_frames(&config)
+      () = wait_until(placement_deadline) => {
+        wm.recover_placement(&config)
       },
       _ = cleanup_interval.tick() => {
         if wm.state.is_paused {
@@ -234,6 +244,11 @@ async fn start_wm(
         } else {
           wm.state.cleanup_invalid_windows()
         }
+      },
+      () = wait_until(topology_deadline) => {
+        if topology.take_due(std::time::Instant::now()) {
+          wm.process_event(PlatformEvent::DisplaySettingsChanged, &mut config)
+        } else { Ok(()) }
       },
       () = wait_until(follow_deadline) => {
         if wm.state.is_paused {
@@ -243,8 +258,8 @@ async fn start_wm(
           wm.commit_pending_follow(&config)
         }
       },
-      Some(()) = wm.state.animation_manager.tick_rx.recv() => {
-        wm.update_animations(&config)
+      Some(signal) = wm.state.animation_manager.tick_rx.recv() => {
+        wm.update_animations(signal, &config)
       },
       Some((
         message,

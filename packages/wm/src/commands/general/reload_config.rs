@@ -1,10 +1,6 @@
 use anyhow::Context;
 use tracing::{info, warn};
-#[cfg(target_os = "windows")]
-use wm_common::{HideMethod, ParsedConfig};
 use wm_common::{WindowRuleEvent, WmEvent};
-#[cfg(target_os = "windows")]
-use wm_platform::NativeWindowWindowsExt;
 
 use crate::{
   commands::{window::run_window_rules, workspace::sort_workspaces},
@@ -20,10 +16,6 @@ pub fn reload_config(
 ) -> anyhow::Result<()> {
   info!("Config reloaded.");
 
-  // Keep reference to old config for comparison.
-  #[cfg(target_os = "windows")]
-  let old_config = config.value.clone();
-
   // Re-evaluate user config file and set its values in state.
   config.reload()?;
 
@@ -37,30 +29,8 @@ pub fn reload_config(
 
   update_container_gaps(state, config);
 
-  #[cfg(target_os = "windows")]
-  update_window_effects(&old_config, state, config)?;
-
-  // Ensure all windows are shown when hide method is changed.
-  #[cfg(target_os = "windows")]
-  if old_config.general.hide_method != config.value.general.hide_method
-    && config.value.general.hide_method == HideMethod::Cloak
-  {
-    for window in state.windows() {
-      let _ = window.native().show();
-    }
-  }
-
-  // Ensure all windows are shown in taskbar when `show_all_in_taskbar` is
-  // changed.
-  #[cfg(target_os = "windows")]
-  if old_config.general.show_all_in_taskbar
-    != config.value.general.show_all_in_taskbar
-    && config.value.general.show_all_in_taskbar
-  {
-    for window in state.windows() {
-      let _ = window.native().set_taskbar_visibility(true);
-    }
-  }
+  state.native_sync.invalidate();
+  state.pending_sync.queue_all_effects_update();
 
   // Clear active binding modes.
   state.binding_modes = Vec::new();
@@ -153,45 +123,4 @@ fn update_container_gaps(state: &mut WmState, config: &UserConfig) {
   for workspace in state.workspaces() {
     workspace.set_gaps_config(config.value.gaps.clone());
   }
-}
-
-#[cfg(target_os = "windows")]
-fn update_window_effects(
-  old_config: &ParsedConfig,
-  state: &mut WmState,
-  config: &UserConfig,
-) -> anyhow::Result<()> {
-  let focused_container =
-    state.focused_container().context("No focused container.")?;
-
-  let window_effects = &config.value.window_effects;
-  let old_window_effects = &old_config.window_effects;
-
-  // Window border effects are left at system defaults if disabled in the
-  // config. However, when transitioning from colored borders to having
-  // them disabled, it's best to reset to the system defaults.
-  if !window_effects.focused_window.border.enabled
-    && old_window_effects.focused_window.border.enabled
-  {
-    if let Ok(window) = focused_container.as_window_container() {
-      _ = window.native().set_border_color(None);
-    }
-  }
-
-  if !window_effects.other_windows.border.enabled
-    && old_window_effects.other_windows.border.enabled
-  {
-    let unfocused_windows = state
-      .windows()
-      .into_iter()
-      .filter(|window| window.id() != focused_container.id());
-
-    for window in unfocused_windows {
-      _ = window.native().set_border_color(None);
-    }
-  }
-
-  state.pending_sync.queue_all_effects_update();
-
-  Ok(())
 }

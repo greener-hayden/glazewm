@@ -36,6 +36,7 @@ pub fn handle_window_moved_or_resized(
   let found_window = state.window_from_native(native_window);
 
   if let Some(window) = found_window {
+    state.native_sync.observe(window.id());
     let old_frame_position = window.native_properties().frame;
     let frame_position = try_warn!(window.native().frame());
 
@@ -43,7 +44,9 @@ pub fn handle_window_moved_or_resized(
       properties.frame = frame_position.clone();
     });
 
-    release_disproved_floor(&window, &frame_position, state);
+    if !state.native_sync.owns_geometry(window.id()) {
+      release_disproved_floor(&window, &frame_position, state);
+    }
 
     // Handle windows that are actively being dragged.
     if !state.is_paused && window.active_drag().is_some() {
@@ -75,19 +78,11 @@ pub fn handle_window_moved_or_resized(
       return update_drag_state(&window, &frame_position, state, config);
     }
 
-    // An animating window on macOS is parked in the corner by us, and
-    // that write comes back as a move event. The parked frame is not
-    // where the window belongs, so every inference below — corner
-    // detection, fullscreen, drag state — would read a lie. Swallowing
-    // the event here is what keeps the rest of this handler free of
-    // animation checks.
-    //
-    // Below the drag handling on purpose: a drag is the user moving a
-    // window that happens to be animating, and swallowing those events
-    // leaves the drag untracked, so the window never re-enters the grid
-    // when it is dropped.
-    #[cfg(target_os = "macos")]
-    if state.animation_manager.is_animating(&window.id()) {
+    // Reconciliation owns its observations through source handoff. Native
+    // interactive starts still supersede that ownership on Windows.
+    if state.native_sync.owns_geometry(window.id())
+      && !is_interactive_start
+    {
       return Ok(());
     }
 
@@ -186,6 +181,7 @@ pub fn handle_window_moved_or_resized(
     };
 
     if is_drag_start {
+      state.native_sync.suspend(window.id());
       tracing::info!("Window started dragging: {window}");
 
       window.set_active_drag(Some(ActiveDrag {
@@ -236,13 +232,6 @@ pub fn handle_window_moved_or_resized(
         window.set_display_state(display_state);
         return Ok(());
       }
-    }
-
-    // Each tick moves an animating window's real frame along its
-    // overlay's path. Those moves are the WM's own, so they must not be
-    // read back as a floating placement or a change of monitor.
-    if state.animation_manager.is_animating(&window.id()) {
-      return Ok(());
     }
 
     let should_fullscreen = {
@@ -389,7 +378,11 @@ pub fn handle_window_moved_or_resized(
       // finishing the reveal. Correcting drift needs a signal that
       // separates an app resizing itself from our own machinery moving
       // the window, which this event does not carry.
-      WindowState::Tiling | WindowState::Minimized => {}
+      WindowState::Tiling => {
+        #[cfg(target_os = "windows")]
+        state.pending_sync.queue_container_to_redraw(window);
+      }
+      WindowState::Minimized => {}
     }
   }
 

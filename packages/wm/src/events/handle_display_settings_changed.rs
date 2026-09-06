@@ -34,6 +34,19 @@ pub fn handle_display_settings_changed(
         .try_collect::<Vec<_>>()
     }));
 
+  let current = state.monitors();
+  if displays.len() == current.len()
+    && displays
+      .iter()
+      .zip(&current)
+      .all(|((_, properties), monitor)| {
+        *properties == monitor.native_properties()
+      })
+  {
+    return Ok(());
+  }
+  state.native_sync.invalidate();
+
   let mut pending_monitors = state.monitors();
   let mut unmatched_displays = Vec::new();
 
@@ -85,6 +98,8 @@ pub fn handle_display_settings_changed(
     // Display setting changes can spread windows out sporadically, so mark
     // all windows as needing a DPI adjustment (just in case).
     window.set_has_pending_dpi_adjustment(true);
+    window
+      .update_native_properties(|properties| properties.min_size = None);
 
     // Need to update floating position of moved windows when a monitor is
     // disconnected or if the primary display is changed. The primary
@@ -138,6 +153,7 @@ fn find_matching_monitor<'a>(
         existing.device_uuid == properties.device_uuid
       }
 
+      #[cfg(target_os = "windows")]
       // On Windows, match the monitor by:
       // 1. Its handle
       // 2. Its device path
@@ -146,7 +162,6 @@ fn find_matching_monitor<'a>(
       // Monitor handles and device paths are unique, but can change over
       // time. The hardware ID is not guaranteed to be unique, so we
       // match against that last.
-      #[cfg(target_os = "windows")]
       {
         existing.handle == properties.handle
           || existing.device_path.as_deref().is_some_and(|device_path| {

@@ -1,6 +1,3 @@
-use std::time::Duration;
-
-use tokio::task;
 use tracing::warn;
 use windows::{
   core::PWSTR,
@@ -28,20 +25,19 @@ use windows::{
       },
       WindowsAndMessaging::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
-        GetForegroundWindow, GetLayeredWindowAttributes, GetShellWindow,
-        GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+        GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW,
+        GetWindowPlacement, GetWindowRect, GetWindowTextW,
         GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
         IsZoomed, SendNotifyMessageW, SetForegroundWindow,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
         GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
-        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
-        LWA_COLORKEY, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
+        HWND_TOPMOST, LWA_ALPHA, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-        SW_SHOWNA, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
+        SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA,
+        WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
         WS_THICKFRAME,
       },
     },
@@ -50,8 +46,8 @@ use windows::{
 
 use super::com::{IApplicationView, COM_INIT};
 use crate::{
-  Color, CornerStyle, Delta, Dispatcher, LengthValue, OpacityValue, Point,
-  Rect, RectDelta, WindowId, WindowZOrder,
+  Color, CornerStyle, Dispatcher, LengthValue, OpacityValue, Point, Rect,
+  RectDelta, WindowId, WindowZOrder,
 };
 
 /// Magic number used to identify programmatic mouse inputs from our own
@@ -213,12 +209,7 @@ impl NativeWindow {
         rect.y(),
         rect.width(),
         rect.height(),
-        SWP_NOACTIVATE
-          | SWP_NOZORDER
-          | SWP_NOCOPYBITS
-          | SWP_NOSENDCHANGING
-          | SWP_ASYNCWINDOWPOS
-          | SWP_FRAMECHANGED,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
       )
     }?;
 
@@ -239,13 +230,7 @@ impl NativeWindow {
         0,
         width,
         height,
-        SWP_NOACTIVATE
-          | SWP_NOZORDER
-          | SWP_NOMOVE
-          | SWP_NOCOPYBITS
-          | SWP_NOSENDCHANGING
-          | SWP_ASYNCWINDOWPOS
-          | SWP_FRAMECHANGED,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOMOVE | SWP_ASYNCWINDOWPOS,
       )
     }?;
 
@@ -262,13 +247,7 @@ impl NativeWindow {
         y,
         0,
         0,
-        SWP_NOACTIVATE
-          | SWP_NOZORDER
-          | SWP_NOSIZE
-          | SWP_NOCOPYBITS
-          | SWP_NOSENDCHANGING
-          | SWP_ASYNCWINDOWPOS
-          | SWP_FRAMECHANGED,
+        SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE | SWP_ASYNCWINDOWPOS,
       )
     }?;
 
@@ -359,6 +338,22 @@ impl NativeWindow {
   pub(crate) fn shadow_borders(&self) -> crate::Result<RectDelta> {
     let border_pos = self.frame_with_shadows()?;
     let frame_pos = self.frame()?;
+    let after = self.frame_with_shadows()?;
+    let borders = [
+      frame_pos.left - border_pos.left,
+      frame_pos.top - border_pos.top,
+      border_pos.right - frame_pos.right,
+      border_pos.bottom - frame_pos.bottom,
+    ];
+    if border_pos != after
+      || borders
+        .into_iter()
+        .any(|border| !(0..=128).contains(&border))
+    {
+      return Err(crate::Error::Platform(
+        "Window borders are settling.".into(),
+      ));
+    }
 
     Ok(RectDelta::new(
       LengthValue::from_px(frame_pos.left - border_pos.left),
@@ -472,18 +467,26 @@ impl NativeWindow {
         Ok(())
       }
       Some(rect) => {
-        let placement = WINDOWPLACEMENT {
+        let mut placement = WINDOWPLACEMENT {
           #[allow(clippy::cast_possible_truncation)]
           length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-          flags: WPF_ASYNCWINDOWPLACEMENT,
-          showCmd: SW_RESTORE.0 as u32,
-          rcNormalPosition: RECT {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.bottom,
-          },
           ..Default::default()
+        };
+        // SAFETY: Initialized placement receives window data.
+        unsafe { GetWindowPlacement(self.hwnd(), &raw mut placement)? };
+        let normal = crate::windows_session::placement_rect(
+          rect,
+          self.has_window_style_ex(
+            windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW,
+          ),
+        )?;
+        placement.flags = WPF_ASYNCWINDOWPLACEMENT;
+        placement.showCmd = SW_RESTORE.0 as u32;
+        placement.rcNormalPosition = RECT {
+          left: normal.left,
+          top: normal.top,
+          right: normal.right,
+          bottom: normal.bottom,
         };
 
         unsafe { SetWindowPlacement(self.hwnd(), &raw const placement) }?;
@@ -606,23 +609,10 @@ impl NativeWindow {
       WindowZOrder::AfterWindow(window_id) => HWND(window_id.0),
     };
 
-    let flags = SWP_NOACTIVATE
-      | SWP_NOCOPYBITS
-      | SWP_ASYNCWINDOWPOS
-      | SWP_SHOWWINDOW
-      | SWP_NOMOVE
-      | SWP_NOSIZE;
+    let flags =
+      SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS | SWP_NOMOVE | SWP_NOSIZE;
 
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
-
-    // Z-order can sometimes still be incorrect after the above call.
-    let handle = self.handle;
-    task::spawn(async move {
-      tokio::time::sleep(Duration::from_millis(10)).await;
-      let _ = unsafe {
-        SetWindowPos(HWND(handle), z_order_hwnd, 0, 0, 0, 0, flags)
-      };
-    });
 
     Ok(())
   }
@@ -736,44 +726,11 @@ impl NativeWindow {
     Ok(())
   }
 
-  /// Implements [`NativeWindowWindowsExt::adjust_transparency`].
-  pub(crate) fn adjust_transparency(
-    &self,
-    opacity_delta: &Delta<OpacityValue>,
-  ) -> crate::Result<()> {
-    let mut alpha = u8::MAX;
-    let mut flag = LAYERED_WINDOW_ATTRIBUTES_FLAGS::default();
-
-    unsafe {
-      GetLayeredWindowAttributes(
-        self.hwnd(),
-        None,
-        Some(&raw mut alpha),
-        Some(&raw mut flag),
-      )?;
-    }
-
-    if flag.contains(LWA_COLORKEY) {
-      return Err(crate::Error::Platform(
-        "Window uses color key for its transparency and cannot be adjusted."
-          .to_string(),
-      ));
-    }
-
-    let target_alpha = if opacity_delta.is_negative {
-      alpha.saturating_sub(opacity_delta.inner.to_alpha())
-    } else {
-      alpha.saturating_add(opacity_delta.inner.to_alpha())
-    };
-
-    self.set_transparency(&OpacityValue::from_alpha(target_alpha))
-  }
-
   /// Whether the window is cloaked. For some UWP apps, `WS_VISIBLE` will
   /// be present even if the window isn't actually visible. The
   /// `DWMWA_CLOAKED` attribute is used to check whether these apps are
   /// visible.
-  fn is_cloaked(&self) -> crate::Result<bool> {
+  pub(crate) fn is_cloaked(&self) -> crate::Result<bool> {
     let mut cloaked = 0u32;
 
     unsafe {

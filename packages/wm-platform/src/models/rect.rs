@@ -71,6 +71,15 @@ impl Rect {
     self.bottom - self.top
   }
 
+  /// Converts screen coordinates to Windows placement.
+  #[must_use]
+  pub fn to_workspace(&self, monitor: &Rect, working: &Rect) -> Self {
+    self.translate_to_coordinates(
+      self.x() - (working.left - monitor.left),
+      self.y() - (working.top - monitor.top),
+    )
+  }
+
   #[must_use]
   pub fn translate_to_coordinates(&self, x: i32, y: i32) -> Self {
     Self::from_xy(x, y, self.width(), self.height())
@@ -370,6 +379,19 @@ impl From<Rect> for CGRect {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Converts negative-monitor placement with both appbars.
+  #[test]
+  fn converts_workspace_placement() {
+    let monitor = Rect::from_xy(-1920, -200, 1920, 1080);
+    let working = Rect::from_xy(-1870, -160, 1870, 1040);
+    let outer = Rect::from_xy(-1800, -100, 600, 400);
+    assert_eq!(
+      outer.to_workspace(&monitor, &working),
+      Rect::from_xy(-1850, -140, 600, 400)
+    );
+    assert_eq!(outer.to_workspace(&monitor, &monitor), outer);
+  }
 
   #[test]
   fn intersection_area() {

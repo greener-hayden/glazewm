@@ -6,6 +6,10 @@ use crate::wm_state::WmState;
 pub fn toggle_pause(state: &mut WmState) {
   let is_paused = !state.is_paused;
   state.is_paused = is_paused;
+  if is_paused {
+    state.native_sync.release_all();
+    state.native_sync.cleanup(&mut state.animation_manager);
+  }
 
   // Redraw full container tree on unpause.
   if !is_paused {

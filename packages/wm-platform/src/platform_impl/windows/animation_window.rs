@@ -5,16 +5,17 @@ use windows::{
   Win32::{
     Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Dwm::{
-      DwmRegisterThumbnail, DwmUnregisterThumbnail,
-      DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
-      DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
-      DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+      DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+      DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
+      DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
+      DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
     },
     UI::WindowsAndMessaging::{
       CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW,
       SetWindowPos, HTTRANSPARENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-      SWP_SHOWWINDOW, WM_NCHITTEST, WNDCLASSW, WS_EX_NOACTIVATE,
-      WS_EX_NOREDIRECTIONBITMAP, WS_EX_TRANSPARENT, WS_POPUP,
+      SWP_NOZORDER, SWP_SHOWWINDOW, WM_NCHITTEST, WNDCLASSW,
+      WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TRANSPARENT,
+      WS_POPUP,
     },
   },
 };
@@ -94,28 +95,62 @@ impl AnimationWindow {
     dispatcher: &Dispatcher,
   ) -> crate::Result<Self> {
     let source_hwnd = window.inner.hwnd();
-    let props =
-      Self::thumbnail_properties(inner_rect, outer_rect, opacity.as_ref());
-
     let (handle, thumbnail) = dispatcher.dispatch_sync(|| {
-      // Window is spawned on the main thread - avoids having to create a
-      // new message loop.
       let handle = Self::create_window(outer_rect)?;
-
-      // SAFETY: Both handles are live windows; the destination is ours.
+      // SAFETY: Source and destination are live windows.
       let thumbnail =
-        unsafe { DwmRegisterThumbnail(HWND(handle), source_hwnd)? };
-
-      // SAFETY: The thumbnail was registered just above.
-      unsafe {
-        DwmUpdateThumbnailProperties(thumbnail, &raw const props)?;
+        match unsafe { DwmRegisterThumbnail(HWND(handle), source_hwnd) } {
+          Ok(thumbnail) => thumbnail,
+          Err(err) => {
+            // SAFETY: Rolls back our new window.
+            if let Err(cleanup) = unsafe { DestroyWindow(HWND(handle)) } {
+              tracing::warn!("Overlay rollback failed: {cleanup}");
+            }
+            return Err(crate::Error::from(err));
+          }
+        };
+      let prepare = || -> crate::Result<(i32, i32)> {
+        // SAFETY: Registered thumbnail supplies source dimensions.
+        let size = unsafe { DwmQueryThumbnailSourceSize(thumbnail)? };
+        let source_size = (size.cx, size.cy);
+        let props = Self::thumbnail_properties(
+          inner_rect,
+          outer_rect,
+          source_size,
+          opacity.as_ref(),
+        );
+        // SAFETY: Properties target our registered thumbnail.
+        unsafe {
+          DwmUpdateThumbnailProperties(thumbnail, &raw const props)?;
+        }
+        tracing::debug!(
+          "Overlay source {source_size:?} visible {} dest {:?}",
+          props.fVisible.0 != 0,
+          [
+            props.rcDestination.left,
+            props.rcDestination.top,
+            props.rcDestination.right,
+            props.rcDestination.bottom
+          ]
+        );
+        Self::show_beneath(handle, source_hwnd)?;
+        Ok(source_size)
+      };
+      match prepare() {
+        Ok(_) => Ok((handle, thumbnail)),
+        Err(err) => {
+          // SAFETY: Rolls back both owned resources.
+          unsafe {
+            if let Err(cleanup) = DwmUnregisterThumbnail(thumbnail) {
+              tracing::warn!("Thumbnail rollback failed: {cleanup}");
+            }
+            if let Err(cleanup) = DestroyWindow(HWND(handle)) {
+              tracing::warn!("Overlay rollback failed: {cleanup}");
+            }
+          }
+          Err(err)
+        }
       }
-
-      // Configured before it is shown, so its first composed frame
-      // already carries the window.
-      Self::show_beneath(handle, source_hwnd)?;
-
-      Ok::<_, crate::Error>((handle, thumbnail))
     })??;
 
     Ok(Self {
@@ -128,21 +163,23 @@ impl AnimationWindow {
 
   /// Implements [`AnimationWindow::resize`].
   pub(crate) fn resize(&mut self, outer_rect: &Rect) -> crate::Result<()> {
+    let handle = self.handle;
+    self.dispatcher.dispatch_sync(|| {
+      // SAFETY: Resizes our window without restacking.
+      unsafe {
+        SetWindowPos(
+          HWND(handle),
+          None,
+          outer_rect.x(),
+          outer_rect.y(),
+          outer_rect.width(),
+          outer_rect.height(),
+          SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+      }
+    })??;
     self.outer_rect = outer_rect.clone();
-
-    // SAFETY: The handle is a window this instance created.
-    unsafe {
-      SetWindowPos(
-        HWND(self.handle),
-        None,
-        outer_rect.x(),
-        outer_rect.y(),
-        outer_rect.width(),
-        outer_rect.height(),
-        SWP_NOACTIVATE,
-      )
-    }
-    .map_err(crate::Error::from)
+    Ok(())
   }
 
   /// Implements [`AnimationWindow::update`].
@@ -151,34 +188,47 @@ impl AnimationWindow {
     inner_rect: &Rect,
     opacity: Option<&OpacityValue>,
   ) -> crate::Result<()> {
-    let props =
-      Self::thumbnail_properties(inner_rect, &self.outer_rect, opacity);
     let thumbnail = self.thumbnail;
-
-    self.dispatcher.dispatch_sync(move || {
-      // SAFETY: The thumbnail stays registered until `destroy`.
+    if opacity.is_some() {
+      tracing::debug!(
+        "Overlay frame {inner_rect:?} at {:?}",
+        opacity.map(OpacityValue::to_alpha)
+      );
+    }
+    self.dispatcher.dispatch_sync(|| {
+      // SAFETY: Reads current registered source dimensions.
+      let size = unsafe { DwmQueryThumbnailSourceSize(thumbnail)? };
+      let props = Self::thumbnail_properties(
+        inner_rect,
+        &self.outer_rect,
+        (size.cx, size.cy),
+        opacity,
+      );
+      // SAFETY: Updates our registered thumbnail.
       unsafe { DwmUpdateThumbnailProperties(thumbnail, &raw const props) }
         .map_err(crate::Error::from)
     })?
   }
 
   /// Implements [`AnimationWindow::destroy`].
-  pub(crate) fn destroy(self) -> crate::Result<()> {
-    let handle = HWND(self.handle);
-    let thumbnail = self.thumbnail;
-
-    self.dispatcher.dispatch_sync(move || {
-      // SAFETY: Both were created by this instance and not yet released.
-      unsafe {
-        if let Err(err) = DwmUnregisterThumbnail(thumbnail) {
-          tracing::warn!("Failed to unregister thumbnail: {err}");
-        }
-
-        if let Err(err) = DestroyWindow(handle) {
-          tracing::warn!("Failed to destroy overlay HWND: {err}");
-        }
-      }
-    })
+  pub(crate) fn destroy(&mut self) -> crate::Result<()> {
+    if self.thumbnail != 0 {
+      let thumbnail = self.thumbnail;
+      self.dispatcher.dispatch_sync(move || {
+        // SAFETY: Unregisters our still-owned thumbnail.
+        unsafe { DwmUnregisterThumbnail(thumbnail) }
+      })??;
+      self.thumbnail = 0;
+    }
+    if self.handle != 0 {
+      let handle = HWND(self.handle);
+      self.dispatcher.dispatch_sync(move || {
+        // SAFETY: Destroys our still-owned window.
+        unsafe { DestroyWindow(handle) }
+      })??;
+      self.handle = 0;
+    }
+    Ok(())
   }
 
   /// Where and how opaque DWM draws the thumbnail within the window.
@@ -188,32 +238,37 @@ impl AnimationWindow {
   fn thumbnail_properties(
     inner_rect: &Rect,
     outer_rect: &Rect,
+    source_size: (i32, i32),
     opacity: Option<&OpacityValue>,
   ) -> DWM_THUMBNAIL_PROPERTIES {
-    let mut props = DWM_THUMBNAIL_PROPERTIES {
+    let clipped =
+      crate::thumbnail_rects(inner_rect, outer_rect, source_size);
+    let visible = clipped.is_some();
+    let (destination, source) = clipped.unwrap_or_else(|| {
+      (Rect::from_xy(0, 0, 0, 0), Rect::from_xy(0, 0, 0, 0))
+    });
+    DWM_THUMBNAIL_PROPERTIES {
       dwFlags: DWM_TNP_RECTDESTINATION
+        | DWM_TNP_RECTSOURCE
+        | DWM_TNP_OPACITY
         | DWM_TNP_VISIBLE
         | DWM_TNP_SOURCECLIENTAREAONLY,
       rcDestination: RECT {
-        left: inner_rect.left - outer_rect.left,
-        top: inner_rect.top - outer_rect.top,
-        right: inner_rect.right - outer_rect.left,
-        bottom: inner_rect.bottom - outer_rect.top,
+        left: destination.left,
+        top: destination.top,
+        right: destination.right,
+        bottom: destination.bottom,
       },
-      rcSource: RECT::default(),
-      opacity: u8::MAX,
-      fVisible: BOOL(1),
-      // The whole frame, title bar included, matching the frame rect the
-      // animation is computed from.
+      rcSource: RECT {
+        left: source.left,
+        top: source.top,
+        right: source.right,
+        bottom: source.bottom,
+      },
+      opacity: opacity.map_or(u8::MAX, OpacityValue::to_alpha),
+      fVisible: BOOL(i32::from(visible)),
       fSourceClientAreaOnly: BOOL(0),
-    };
-
-    if let Some(opacity) = opacity {
-      props.dwFlags |= DWM_TNP_OPACITY;
-      props.opacity = opacity.to_alpha();
     }
-
-    props
   }
 
   /// Creates the window, hidden, at `rect`.
@@ -305,3 +360,12 @@ impl AnimationWindow {
 
 /// A token standing in for a capture; the overlay draws the window live.
 pub(crate) struct AnimationCapture;
+
+impl Drop for AnimationWindow {
+  /// Releases resources on every exit path.
+  fn drop(&mut self) {
+    if let Err(err) = self.destroy() {
+      tracing::warn!("Overlay cleanup failed: {err}");
+    }
+  }
+}

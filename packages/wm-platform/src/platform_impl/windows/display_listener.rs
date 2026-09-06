@@ -36,6 +36,9 @@ impl DisplayListener {
               // System is resuming from sleep/hibernation.
               PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
                 is_system_suspended.store(false, Ordering::Relaxed);
+                if let Err(err) = event_tx.send(()) {
+                  tracing::warn!("Display notification failed: {err}");
+                }
               }
               // System is entering sleep/hibernation.
               PBT_APMSUSPEND => {

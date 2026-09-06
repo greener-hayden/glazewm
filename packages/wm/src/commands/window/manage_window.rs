@@ -96,7 +96,9 @@ pub fn manage_window(
 fn check_is_manageable(
   native_window: &NativeWindow,
 ) -> anyhow::Result<Option<NativeWindowProperties>> {
-  if !native_window.is_visible()? {
+  if !native_window.is_visible()?
+    && !wm_platform::WindowListener::is_opening_window(native_window)
+  {
     return Ok(None);
   }
 

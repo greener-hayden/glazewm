@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use block2::RcBlock;
 use objc2::{
   rc::Retained, runtime::AnyObject, MainThreadMarker, MainThreadOnly,
 };
@@ -251,13 +252,17 @@ impl AnimationWindow {
   ///   animation, rather than one per frame. That matters because
   ///   accessibility calls are confined to that same thread, and a move
   ///   issues several of them while the animation is running.
-  pub(crate) fn animate_to(
+  pub(crate) fn animate_to<F>(
     &self,
     target_rect: &Rect,
     duration: Duration,
     easing: &EasingFunction,
     opacity: Option<&OpacityValue>,
-  ) -> crate::Result<()> {
+    on_complete: F,
+  ) -> crate::Result<()>
+  where
+    F: Fn() + Send + Sync + 'static,
+  {
     let outer_rect = self.outer_rect.clone();
     let target_rect = target_rect.clone();
     let easing = easing.clone();
@@ -267,6 +272,10 @@ impl AnimationWindow {
       let (c1x, c1y, c2x, c2y) = control_points(&easing);
 
       CATransaction::begin();
+      let completion = RcBlock::new(on_complete);
+      // SAFETY: The transaction copies the owned, static callback. This
+      // reports completion/removal only, never a presentation fence.
+      unsafe { CATransaction::setCompletionBlock(Some(&completion)) };
       CATransaction::setAnimationDuration(duration.as_secs_f64());
       CATransaction::setAnimationTimingFunction(Some(
         &CAMediaTimingFunction::functionWithControlPoints(
@@ -286,8 +295,41 @@ impl AnimationWindow {
     })
   }
 
+  /// Cancels active animations and writes a stationary frame atomically.
+  pub(crate) fn stop_at(
+    &self,
+    rect: &Rect,
+    opacity: Option<&OpacityValue>,
+  ) -> crate::Result<()> {
+    self.layer.with(|layer| {
+      CATransaction::begin();
+      CATransaction::setDisableActions(true);
+      layer.removeAllAnimations();
+      Self::update_layer(layer, rect, &self.outer_rect, opacity);
+      CATransaction::commit();
+    })
+  }
+
+  /// Samples the presentation layer in global screen coordinates.
+  pub(crate) fn current_frame(&self) -> crate::Result<Option<Rect>> {
+    self.layer.with(|layer| {
+      // SAFETY: Access occurs on the owning AppKit thread; the returned
+      // presentation layer is read only and retained for this snapshot.
+      unsafe { layer.presentationLayer() }.map(|presented| {
+        let local =
+          Rect::from(presented.frame()).flip_y(self.outer_rect.height());
+        Rect::from_xy(
+          self.outer_rect.x() + local.x(),
+          self.outer_rect.y() + local.y(),
+          local.width(),
+          local.height(),
+        )
+      })
+    })
+  }
+
   /// Implements [`AnimationWindow::destroy`].
-  pub(crate) fn destroy(self) -> crate::Result<()> {
+  pub(crate) fn destroy(&mut self) -> crate::Result<()> {
     self.ns_window.with(|ns_window| ns_window.close())
   }
 

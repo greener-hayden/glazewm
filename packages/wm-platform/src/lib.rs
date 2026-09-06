@@ -13,11 +13,23 @@ mod keybinding_listener;
 mod models;
 mod mouse_listener;
 mod native_window;
+#[cfg(target_os = "windows")]
+mod opening_windows;
+mod placement_session;
 mod platform_event;
 mod platform_impl;
 mod single_instance;
 mod thread_bound;
+mod thumbnail_layout;
+pub use thumbnail_layout::thumbnail_rects;
 mod window_listener;
+#[cfg(target_os = "windows")]
+mod windows_session;
+#[cfg(target_os = "windows")]
+pub use windows_session::{
+  alpha_is_safe, composition_frame, opacity_action, recover_owned_windows,
+  NativeSession, OpacityAction,
+};
 
 #[cfg(feature = "test_utils")]
 pub mod test_utils;
@@ -33,6 +45,7 @@ pub use keybinding_listener::*;
 pub use models::*;
 pub use mouse_listener::*;
 pub use native_window::*;
+pub use placement_session::*;
 pub use platform_event::*;
 pub use single_instance::*;
 pub use thread_bound::*;

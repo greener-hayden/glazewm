@@ -8,44 +8,66 @@ use std::{
 
 use crate::platform_impl;
 
-/// Ticks once per composed frame, on a thread of its own.
+/// A native display scheduling boundary or a non-presentation wakeup.
 ///
-/// Timers are the wrong tool for pacing an animation. A tokio interval
-/// on Windows resolves to the 15.6ms system timer whatever it asks for,
-/// so a 155Hz monitor got nine frames of a 140ms animation and the odd
-/// 31ms hitch. The compositor's own clock is what frames are made to.
+/// A presented frame establishes compositor progress, not evidence that
+/// another application has painted its latest requested geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSignal {
+  /// Native compositor/display progress, with a monotonic frame serial.
+  Presented(u64),
+  /// The native clock is unavailable or has stopped producing signals.
+  Unavailable,
+  /// Work completed without establishing a presentation boundary.
+  Wake,
+}
+
+/// Observes native display progress on a dedicated worker.
 ///
-/// # Platform-specific
-///
-/// - Windows: waits on the DirectComposition compositor clock, so a tick
-///   lands right after each vblank and an update issued from it is
-///   composed on the very next frame.
-/// - macOS: sleeps for one frame at `fallback_rate`. `thread::sleep` is
-///   precise to well under a millisecond there.
+/// Windows uses DirectComposition and DWM timing; macOS uses a Core Video
+/// display link. A timeout never becomes presentation evidence.
 pub struct FrameClock {
   stopped: Arc<AtomicBool>,
 }
 
 impl FrameClock {
-  /// Starts ticking, calling `on_tick` after each frame until it returns
-  /// `false` or the clock is stopped.
-  ///
-  /// `fallback_rate` paces the clock where no compositor clock is
-  /// available.
+  /// Samples the native frame serial after issuing a presentation change.
+  /// Compare subsequent signals against this value, rather than the last
+  /// consumed event: older display notifications can still be queued.
+  pub fn current_frame() -> crate::Result<u64> {
+    platform_impl::NativeFrameClock::current_frame()
+  }
+
+  /// Starts observing native frames until `on_tick` returns `false` or
+  /// the clock is stopped. `fallback_rate` only bounds interruptible
+  /// waits.
   pub fn start<F>(fallback_rate: u32, mut on_tick: F) -> Self
   where
-    F: FnMut() -> bool + Send + 'static,
+    F: FnMut(FrameSignal) -> bool + Send + 'static,
   {
     let stopped = Arc::new(AtomicBool::new(false));
     let frame =
       Duration::from_secs_f64(1.0 / f64::from(fallback_rate.max(1)));
-
     let thread_stopped = stopped.clone();
-    std::thread::spawn(move || {
-      while !thread_stopped.load(Ordering::Relaxed) {
-        platform_impl::wait_for_frame(frame);
 
-        if thread_stopped.load(Ordering::Relaxed) || !on_tick() {
+    std::thread::spawn(move || {
+      let mut clock = match platform_impl::NativeFrameClock::new(frame) {
+        Ok(clock) => clock,
+        Err(err) => {
+          tracing::warn!(?err, "Native presentation clock unavailable.");
+          if !thread_stopped.load(Ordering::Acquire) {
+            on_tick(FrameSignal::Unavailable);
+          }
+          return;
+        }
+      };
+
+      while !thread_stopped.load(Ordering::Acquire) {
+        let signal = clock.wait();
+        if thread_stopped.load(Ordering::Acquire) || !on_tick(signal) {
+          break;
+        }
+        if signal == FrameSignal::Unavailable {
           break;
         }
       }
@@ -54,9 +76,9 @@ impl FrameClock {
     Self { stopped }
   }
 
-  /// Stops the clock. Its thread exits after the frame it is waiting on.
+  /// Requests shutdown; native resources are released by the worker.
   pub fn stop(&self) {
-    self.stopped.store(true, Ordering::Relaxed);
+    self.stopped.store(true, Ordering::Release);
   }
 }
 

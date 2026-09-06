@@ -1,26 +1,15 @@
-use std::{
-  collections::HashMap,
-  time::{Duration, Instant},
-};
-
 use anyhow::{bail, Context};
 use tokio::sync::mpsc::{self};
 use tracing::warn;
 use uuid::Uuid;
-#[cfg(target_os = "windows")]
-use wm_common::TitleBarVisibility;
 use wm_common::{
-  FloatingStateConfig, FullscreenStateConfig, InvokeCommand, WindowState,
-  WmEvent,
+  FloatingStateConfig, FullscreenStateConfig, InvokeCommand,
+  TitleBarVisibility, WindowState, WmEvent,
 };
-#[cfg(target_os = "windows")]
-use wm_platform::NativeWindowWindowsExt;
 use wm_platform::{
   Dispatcher, LengthValue, PlatformEvent, RectDelta, WindowEvent,
 };
 
-#[cfg(target_os = "windows")]
-use crate::traits::WindowAlphaExt;
 use crate::{
   commands::{
     container::{
@@ -80,7 +69,45 @@ impl WindowManager {
     })
   }
 
+  /// Applies one event before committing queued intent.
   pub fn process_event(
+    &mut self,
+    event: PlatformEvent,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    // Keep provisional source ownership through layout and native sync.
+    let _notification = match &event {
+      PlatformEvent::Window(event) => Some(event.notification().clone()),
+      _ => None,
+    };
+    self.apply_event(event, config)?;
+    Self::flush_pending_sync(&mut self.state, config)
+  }
+
+  /// Commits one bounded, ordered window-event batch.
+  pub fn process_window_batch(
+    &mut self,
+    batch: crate::event_batch::WindowBatch,
+    config: &mut UserConfig,
+  ) -> anyhow::Result<()> {
+    let mut notifications = Vec::new();
+    for event in batch.finish() {
+      notifications.push(event.notification().clone());
+      if let Err(err) =
+        self.apply_event(PlatformEvent::Window(event), config)
+      {
+        tracing::warn!("Window event failed: {err}");
+      }
+    }
+    let result = Self::flush_pending_sync(&mut self.state, config);
+    // Placement has adopted managed sources. Dropping the remaining
+    // notifications restores ignored windows and failed management.
+    drop(notifications);
+    result
+  }
+
+  /// Updates intent without committing intermediate layouts.
+  fn apply_event(
     &mut self,
     event: PlatformEvent,
     config: &mut UserConfig,
@@ -150,7 +177,7 @@ impl WindowManager {
       },
     }?;
 
-    Self::flush_pending_sync(state, config)
+    Ok(())
   }
 
   /// Flushes queued state changes to the OS, unless the WM is paused.
@@ -158,208 +185,62 @@ impl WindowManager {
     state: &mut WmState,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
-    if !state.is_paused && state.pending_sync.has_changes() {
+    if !state.is_paused
+      && (state.pending_sync.has_changes()
+        || state.native_sync.has_pending())
+    {
       platform_sync(state, config)?;
     }
 
     Ok(())
   }
 
-  /// How long a written frame is given before it is asked for again.
-  ///
-  /// Long enough that an app which merely needed a moment is not asked
-  /// twice for the same thing, short enough that a dropped write is not
-  /// left standing where the user can see it.
-  const FRAME_SETTLE: Duration = Duration::from_millis(250);
-
-  /// How many re-asks a frame gets before the app is taken at its word.
-  const FRAME_ATTEMPTS: u8 = 5;
-
-  /// Writes again any frame an app accepted and then quietly dropped.
-  ///
-  /// A resize returns success whether or not the app acts on it, and an
-  /// app that drops one sends no event to say so — so there is no signal
-  /// to react to, only the absence of the change. This polls for that
-  /// absence, which is why it runs on a timer rather than from an event
-  /// handler.
-  ///
-  /// Nothing here touches the layout. The only write is the same rect
-  /// `platform_sync` already decided on, so the worst a spurious re-ask
-  /// can do is repeat a write the window has already taken.
-  pub fn reassert_frames(
+  /// Recovers silent requests at their individual deadlines.
+  pub fn recover_placement(
     &mut self,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
-    /// Rounding and a settling window both land within this.
-    const TOLERANCE_PX: i32 = 20;
-
-    if self.state.is_paused || self.state.expected_frames.is_empty() {
-      return Ok(());
-    }
-
-    let now = Instant::now();
-
-    let due = self
-      .state
-      .expected_frames
-      .iter()
-      .filter(|(_, expected)| {
-        now.duration_since(expected.written_at) >= Self::FRAME_SETTLE
-      })
-      .map(|(id, expected)| (*id, expected.clone()))
-      .collect::<Vec<_>>();
-
-    for (id, expected) in due {
-      let Some(window) =
-        self.state.windows().into_iter().find(|w| w.id() == id)
-      else {
-        self.state.expected_frames.remove(&id);
-        continue;
-      };
-
-      // An animating window is mid-flight between two frames of ours and
-      // is not answerable for either yet.
-      if self.state.animation_manager.is_animating(&id) {
-        continue;
-      }
-
-      let Ok(frame) = window.native().frame() else {
-        self.state.expected_frames.remove(&id);
-        continue;
-      };
-
-      let took_it = (frame.width() - expected.rect.width()).abs()
-        <= TOLERANCE_PX
-        && (frame.height() - expected.rect.height()).abs() <= TOLERANCE_PX;
-
-      if took_it {
-        self.state.expected_frames.remove(&id);
-        continue;
-      }
-
-      if expected.attempts >= Self::FRAME_ATTEMPTS {
-        warn!(
-          "Window kept {}x{} against the {}x{} it was given, after {} \
-           attempts: {window}",
-          frame.width(),
-          frame.height(),
-          expected.rect.width(),
-          expected.rect.height(),
-          expected.attempts
-        );
-
-        // Asked five times over more than a second and refused every
-        // time: this is the app's own floor, not a write that went
-        // missing. Recording it lets the layout reserve the space
-        // instead of handing out a slot the window will overhang.
-        //
-        // Per axis, because a refusal is per axis. A window that would
-        // not narrow says nothing about how short it can be, and taking
-        // its current height as a floor too would pin the height it
-        // happened to have — which is the whole row, so nothing could
-        // ever be stacked under it.
-        let floor = |actual: i32, asked: i32| {
-          if actual > asked + TOLERANCE_PX {
-            actual
-          } else {
-            0
-          }
-        };
-
-        let min_size = (
-          floor(frame.width(), expected.rect.width()),
-          floor(frame.height(), expected.rect.height()),
-        );
-
-        window.update_native_properties(|properties| {
-          properties.min_size = Some(min_size);
-        });
-
-        self.state.expected_frames.remove(&id);
-
-        // The parent, not the window: reserving this floor changes what
-        // every sibling is owed, and the window itself is already the
-        // size it insisted on.
-        let to_redraw =
-          window.parent().unwrap_or_else(|| window.clone().into());
-
-        self.state.pending_sync.queue_container_to_redraw(to_redraw);
-
-        continue;
-      }
-
-      // Counted here, not per redraw: only a re-ask after a settle
-      // says anything about the app.
-      if let Some(expected) = self.state.expected_frames.get_mut(&id) {
-        expected.attempts = expected.attempts.saturating_add(1);
-      }
-
-      // Animating the re-ask would park the window and restore it a
-      // frame later, which is the pair of writes that loses a size in the
-      // first place. A correction has to be the one write.
-      self
-        .state
-        .pending_sync
-        .set_skip_animations(true)
-        .queue_container_to_redraw(window);
-    }
-
-    Self::flush_pending_sync(&mut self.state, config)
-  }
-
-  /// Updates all active animations and redraws windows that are animating.
-  pub fn update_animations(
-    &mut self,
-    config: &UserConfig,
-  ) -> anyhow::Result<()> {
-    // Ticks that queued behind a long sync are not more frames.
-    self.state.animation_manager.drain_ticks();
-
-    let animating_windows = self
-      .state
-      .windows()
-      .into_iter()
-      .filter(|window| {
-        self.state.animation_manager.is_animating(&window.id())
-      })
-      .map(|window| (window.id(), window))
-      .collect::<HashMap<_, _>>();
-
     self
       .state
-      .animation_manager
-      .tick_update(&self.state.dispatcher, &animating_windows)?;
-
-    let completed_ids = self.state.animation_manager.completed_ids();
-
-    if !completed_ids.is_empty() {
-      let windows = self
-        .state
-        .windows()
-        .into_iter()
-        .filter(|window| completed_ids.contains(&window.id()));
-
-      // Redraw windows with completed animations to their target position.
-      self
-        .state
-        .pending_sync
-        .queue_containers_to_redraw(windows)
-        .set_skip_animations(true);
-
-      // Retire the animations first. The redraw below is what restores the
-      // real window, and it now refuses to do that while an animation is
-      // still registered, so leaving them in the map until afterwards
-      // would hide the window permanently. The overlay is
-      // unaffected: it is torn down on a short delay of its own,
-      // which is what keeps the handover from flickering.
-      for completed_id in &completed_ids {
-        self.state.animation_manager.destroy_animation(completed_id);
-      }
-
+      .native_sync
+      .cleanup(&mut self.state.animation_manager);
+    if !self.state.is_paused {
       platform_sync(&mut self.state, config)?;
     }
-
     Ok(())
+  }
+
+  /// Advances presentation from native signals, never a polling interval.
+  pub fn update_animations(
+    &mut self,
+    signal: wm_platform::FrameSignal,
+    config: &UserConfig,
+  ) -> anyhow::Result<()> {
+    let mut signal = Some(signal);
+    while let Some(current) = signal {
+      match current {
+        wm_platform::FrameSignal::Presented(frame) => {
+          self.state.native_sync.presented(frame);
+        }
+        wm_platform::FrameSignal::Unavailable => {
+          self.state.native_sync.presentation_failed();
+        }
+        wm_platform::FrameSignal::Wake => {}
+      }
+      signal = self.state.animation_manager.tick_rx.try_recv().ok();
+    }
+    if let Err(err) = self
+      .state
+      .animation_manager
+      .tick_update(&self.state.dispatcher)
+    {
+      tracing::warn!("Presentation update failed: {err}");
+      self.state.native_sync.presentation_failed();
+    }
+    for id in self.state.animation_manager.take_failures() {
+      self.state.native_sync.cancel_presentation(id);
+    }
+    self.recover_placement(config)
   }
 
   pub fn process_commands(
@@ -805,32 +686,32 @@ impl WindowManager {
           _ => Ok(()),
         }
       }
-      InvokeCommand::SetTitleBarVisibility {
-        // LINT: `visibility` is only used on Windows.
-        #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
-        visibility,
-      } => match subject_container.as_window_container() {
-        #[cfg(target_os = "windows")]
-        Ok(window) => {
-          _ = window.native().set_title_bar_visibility(
-            *visibility == TitleBarVisibility::Shown,
-          );
-          Ok(())
+      InvokeCommand::SetTitleBarVisibility { visibility } => {
+        match subject_container.as_window_container() {
+          Ok(window) => {
+            state.native_sync.title_bar(
+              window.id(),
+              *visibility == TitleBarVisibility::Shown,
+            );
+            state.pending_sync.queue_container_to_redraw(window);
+            Ok(())
+          }
+          _ => Ok(()),
         }
-        _ => Ok(()),
-      },
-      // LINT: `args` is only used on Windows.
-      #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+      }
       InvokeCommand::SetTransparency(args) => {
         match subject_container.as_window_container() {
-          #[cfg(target_os = "windows")]
           Ok(window) => {
             if let Some(opacity) = &args.opacity {
-              _ = window.set_alpha(*opacity);
+              state.native_sync.opacity(window.id(), *opacity);
+              state.pending_sync.queue_container_to_redraw(window.clone());
             }
 
             if let Some(opacity_delta) = &args.opacity_delta {
-              _ = window.adjust_alpha(*opacity_delta);
+              state
+                .native_sync
+                .adjust_opacity(window.id(), *opacity_delta);
+              state.pending_sync.queue_container_to_redraw(window.clone());
             }
 
             Ok(())

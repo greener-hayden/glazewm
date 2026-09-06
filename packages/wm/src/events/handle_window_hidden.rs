@@ -3,8 +3,10 @@ use wm_common::{DisplayState, HideMethod};
 use wm_platform::NativeWindow;
 
 use crate::{
-  commands::window::unmanage_window, traits::WindowGetters,
-  user_config::UserConfig, wm_state::WmState,
+  commands::window::unmanage_window,
+  traits::{CommonGetters, WindowGetters},
+  user_config::UserConfig,
+  wm_state::WmState,
 };
 
 pub fn handle_window_hidden(
@@ -22,6 +24,14 @@ pub fn handle_window_hidden(
       && window.display_state() == DisplayState::Hiding
     {
       window.set_display_state(DisplayState::Hidden);
+      return Ok(());
+    }
+
+    // A source cloaked for its own animation is hidden by us, not the
+    // application; the shell still reports it as a hide.
+    if state.native_sync.owns_visibility(window.id())
+      || wm_platform::WindowListener::is_opening_window(native_window)
+    {
       return Ok(());
     }
 

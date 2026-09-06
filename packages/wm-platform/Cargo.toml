@@ -53,6 +53,15 @@ windows = { version = "0.52", features = [
 windows-interface = { version = "0.52" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.1"
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "CVBase",
+  "CVDisplayLink",
+  "CVReturn",
+  "block2",
+  "objc2",
+] }
 objc2-core-graphics = { version = "0.3.2", features = [
   "CGAffineTransform",
   "CGImage",
@@ -84,6 +93,7 @@ objc2-core-foundation = { version = "0.3.2", features = [
   "CFUUID",
 ] }
 objc2-quartz-core = { version = "0.3.2", features = [
+  "block2",
   "CALayer",
   "CATransaction",
   "objc2-core-graphics",

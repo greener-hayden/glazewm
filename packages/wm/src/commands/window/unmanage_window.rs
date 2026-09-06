@@ -15,6 +15,10 @@ pub fn unmanage_window(
   window: WindowContainer,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
+  state
+    .native_sync
+    .release(window.id(), window.native().is_valid());
+
   // Create iterator of parent, grandparent, and great-grandparent.
   let ancestors = window.ancestors().take(3).collect::<Vec<_>>();
 
@@ -25,9 +29,6 @@ pub fn unmanage_window(
   let focus_target = state.focus_target_after_removal(&window.clone());
 
   detach_tile(window.clone().into())?;
-
-  // Cancel ongoing animation, if any.
-  state.animation_manager.destroy_animation(&window.id());
 
   // After detaching the container, flatten any redundant split containers.
   // For example, in the layout V[1 H[2]] where container 1 is detached to

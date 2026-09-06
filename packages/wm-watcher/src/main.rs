@@ -8,7 +8,7 @@
 use anyhow::Context;
 use wm_common::{ClientResponseData, ContainerDto, WindowDto, WmEvent};
 use wm_ipc_client::IpcClient;
-use wm_platform::{NativeWindow, NativeWindowWindowsExt, OpacityValue};
+use wm_platform::recover_owned_windows;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,18 +37,9 @@ async fn main() -> anyhow::Result<()> {
         err
       );
 
-      let managed_windows =
-        managed_handles.into_iter().map(NativeWindow::from_handle);
-
-      for window in managed_windows {
-        if let Err(err) = window.show() {
-          tracing::warn!("Failed to show window: {:?}", err);
-        }
-
-        let _ = window.set_taskbar_visibility(true);
-        let _ = window.set_border_color(None);
-        let _ =
-          window.set_transparency(&OpacityValue::from_alpha(u8::MAX));
+      while let Err(err) = recover_owned_windows() {
+        tracing::warn!("Window recovery pending: {err}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
       }
     }
   }

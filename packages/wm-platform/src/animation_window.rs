@@ -153,6 +153,9 @@ impl AnimationWindow {
   /// soon as the animation is handed to the compositor.
   ///
   /// Only meaningful when [`AnimationWindow::SELF_ANIMATING`] is `true`.
+  /// `on_complete` runs when the submitted motion completes or is removed;
+  /// callers must reject obsolete callbacks after retargeting. Completion
+  /// does not establish that source visibility changes were presented.
   ///
   /// # Platform-specific
   ///
@@ -160,29 +163,67 @@ impl AnimationWindow {
   ///   on the render server. One hop to the main thread covers the whole
   ///   animation instead of one per frame.
   /// - Windows: unimplemented; the caller ticks `update` instead.
-  pub fn animate_to(
+  pub fn animate_to<F>(
     &self,
     target_rect: &Rect,
     duration: std::time::Duration,
     easing: &crate::EasingFunction,
     opacity: Option<&OpacityValue>,
-  ) -> crate::Result<()> {
+    on_complete: F,
+  ) -> crate::Result<()>
+  where
+    F: Fn() + Send + Sync + 'static,
+  {
     #[cfg(target_os = "macos")]
     {
-      self
-        .inner
-        .animate_to(target_rect, duration, easing, opacity)
+      self.inner.animate_to(
+        target_rect,
+        duration,
+        easing,
+        opacity,
+        on_complete,
+      )
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-      let _ = (target_rect, duration, easing, opacity);
+      let _ = (target_rect, duration, easing, opacity, on_complete);
       Ok(())
     }
   }
 
+  /// Cancels compositor motion and retains a stationary overlay.
+  pub fn stop_at(
+    &self,
+    rect: &Rect,
+    opacity: Option<&OpacityValue>,
+  ) -> crate::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+      self.inner.stop_at(rect, opacity)
+    }
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.update(rect, opacity)
+    }
+  }
+
+  /// Returns the compositor's currently presented geometry if available.
+  /// Windows motion is driven by the caller, which already knows this
+  /// frame.
+  pub fn current_frame(&self) -> crate::Result<Option<Rect>> {
+    #[cfg(target_os = "macos")]
+    {
+      self.inner.current_frame()
+    }
+    #[cfg(target_os = "windows")]
+    {
+      Ok(None)
+    }
+  }
+
   /// Destroys the window and releases GPU resources.
-  pub fn destroy(self) -> crate::Result<()> {
+  pub fn destroy(&mut self) -> crate::Result<()> {
     self.inner.destroy()
   }
 }

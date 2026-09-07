@@ -361,6 +361,8 @@ pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  let timing = tracing::enabled!(tracing::Level::DEBUG);
+  let sync_started = timing.then(Instant::now);
   let layout_changed = std::mem::take(&mut state.native_sync.layout_dirty);
   // Every commit solves the layout again. A queued redraw is not the only
   // thing that moves a rect: a dropped floating window writes its own
@@ -369,6 +371,7 @@ pub fn platform_sync(
   state.layout_snapshot = crate::layout_snapshot::LayoutSnapshot::capture(
     &state.root_container,
   )?;
+  let t_snapshot = sync_started.map(|at| at.elapsed());
   let focused =
     state.focused_container().context("No focused container.")?;
   let redraw = if layout_changed {
@@ -404,8 +407,11 @@ pub fn platform_sync(
       order.get(&window.id()).copied().unwrap_or(usize::MAX),
     )
   });
+  let t_order = sync_started.map(|at| at.elapsed());
   let dirty = std::mem::take(&mut state.native_sync.dirty);
   let now = Instant::now();
+  // Once per commit; see `ReconcilePass::sampled_frame`.
+  let sampled_frame = wm_platform::FrameClock::current_frame()?;
   state.native_sync.cleanup(&mut state.animation_manager);
   let compositor_frame = state.native_sync.presented_frame;
   let plans = plan_animations(&windows, &redraw, state, config)?;
@@ -445,6 +451,7 @@ pub fn platform_sync(
       owner: &monitor,
       now,
       compositor_frame,
+      sampled_frame,
       reorder: needs_reorder,
       hide_corner: hide_corners
         .get(&monitor.id())
@@ -516,6 +523,26 @@ pub fn platform_sync(
   release_ready(state);
   state.animation_manager.begin_pending();
   state.pending_sync.clear();
+  if let (Some(started), Some(snapshot), Some(order)) =
+    (sync_started, t_snapshot, t_order)
+  {
+    let total = started.elapsed();
+    tracing::debug!(
+      "platform_sync {}us snapshot={}us order={}us reconcile={}us \
+       windows={} settling={}",
+      total.as_micros(),
+      snapshot.as_micros(),
+      order.saturating_sub(snapshot).as_micros(),
+      total.saturating_sub(order).as_micros(),
+      windows.len(),
+      state
+        .native_sync
+        .windows
+        .values()
+        .filter(|entry| entry.settling())
+        .count(),
+    );
+  }
   Ok(())
 }
 
@@ -630,6 +657,13 @@ struct ReconcilePass<'a> {
   owner: &'a Monitor,
   now: Instant,
   compositor_frame: u64,
+  /// The compositor's serial, sampled once for the whole commit.
+  ///
+  /// Reading it is a round-trip to the compositor, and the answer is a
+  /// global counter rather than anything about one window, so sampling it
+  /// per window paid that round-trip once per settling window per frame
+  /// for the same number.
+  sampled_frame: u64,
   reorder: bool,
   hide_corner: HideCorner,
 }
@@ -765,8 +799,24 @@ fn apply_cloak(
   entry: &mut ManagedWindow,
   cloaked: bool,
 ) -> anyhow::Result<()> {
-  if entry.native.is_cloaked()? != cloaked {
+  let timing = tracing::enabled!(tracing::Level::DEBUG);
+  let started = timing.then(Instant::now);
+  let observed = entry.native.is_cloaked()?;
+  let t_read = started.map(|at| at.elapsed());
+  if observed != cloaked {
     entry.native.cloak(cloaked)?;
+  }
+  if let (Some(at), Some(read)) = (started, t_read) {
+    let total = at.elapsed();
+    if total >= Duration::from_micros(500) {
+      tracing::debug!(
+        "cloak_slow total={}us read={}us write={}us changed={}",
+        total.as_micros(),
+        read.as_micros(),
+        total.saturating_sub(read).as_micros(),
+        observed != cloaked,
+      );
+    }
   }
   Ok(())
 }
@@ -775,6 +825,7 @@ fn begin_handoff(
   entry: &mut ManagedWindow,
   id: &Uuid,
   state: &mut WmState,
+  sampled_frame: u64,
 ) -> anyhow::Result<()> {
   if matches!(entry.motion, Some(MotionOwner::Native)) {
     entry.frame.restart();
@@ -785,10 +836,7 @@ fn begin_handoff(
   if let Some(source) = &mut entry.source {
     source.restoring = true;
   } else if state.animation_manager.has_overlay(id) {
-    entry.retire_after.get_or_insert(
-      wm_platform::FrameClock::current_frame()
-        .unwrap_or(state.native_sync.presented_frame),
-    );
+    entry.retire_after.get_or_insert(sampled_frame);
   }
   Ok(())
 }
@@ -900,6 +948,7 @@ fn reconcile_managed(
     owner,
     now,
     compositor_frame,
+    sampled_frame,
     reorder,
     hide_corner,
   } = pass;
@@ -962,7 +1011,7 @@ fn reconcile_managed(
           entry.motion =
             Some(MotionOwner::Overlay(MotionPreparation::new(
               state.native_sync.batch,
-              wm_platform::FrameClock::current_frame()?,
+              sampled_frame,
               now,
               !opening,
             )));
@@ -1012,7 +1061,7 @@ fn reconcile_managed(
     || state.animation_manager.is_complete(&id)
     || entry.cancelled
   {
-    begin_handoff(entry, &id, state)?;
+    begin_handoff(entry, &id, state, sampled_frame)?;
   }
   // Existing content needs a presented cover. Opening content must stay
   // invisible throughout preparation, including its first native frame.
@@ -1151,7 +1200,7 @@ fn reconcile_managed(
     window.set_has_pending_dpi_adjustment(false);
   }
   if entry.frame.phase == ReconcilePhase::Failed {
-    begin_handoff(entry, &id, state)?;
+    begin_handoff(entry, &id, state, sampled_frame)?;
     if !parked
       && !dragging
       && visible
@@ -1228,7 +1277,7 @@ fn reconcile_managed(
     motion.observe(
       entry.frame.generation,
       suppressing && converged && !entry.visibility_pending,
-      wm_platform::FrameClock::current_frame()?,
+      sampled_frame,
     );
   }
   let restoring =
@@ -1280,10 +1329,7 @@ fn reconcile_managed(
     // overlay. There is then nothing to retire and no running frame clock
     // to acknowledge a retirement fence.
     entry.retire_after =
-      state.animation_manager.has_overlay(&id).then(|| {
-        wm_platform::FrameClock::current_frame()
-          .unwrap_or(compositor_frame)
-      });
+      state.animation_manager.has_overlay(&id).then_some(sampled_frame);
     tracing::debug!(window = %id, "Presentation source restored.");
   }
   if entry.retire_after.is_some_and(|after| {

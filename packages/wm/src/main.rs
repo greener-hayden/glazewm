@@ -167,13 +167,10 @@ async fn start_wm(
     },
     dispatcher,
   )?;
-  let mut keybinding_listener = KeybindingListener::new(
-    &config
-      .active_keybinding_configs(&[], false)
-      .flat_map(|kb| kb.bindings)
-      .collect::<Vec<_>>(),
-    dispatcher,
-  )?;
+  let mut keybinding_listener =
+    KeybindingListener::new(&config.listener_bindings(&[]), dispatcher)?;
+
+  start_event_loop_watchdog(dispatcher);
 
   // Run user's startup commands.
   if let Err(err) = wm.process_commands(
@@ -190,6 +187,7 @@ async fn start_wm(
     .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
   let mut topology = event_batch::TopologyDebounce::default();
+  let mut input_failure = None;
   loop {
     window_listener.set_opening_concealment(
       !wm.state.is_paused && config.value.animations.window_open.is_some(),
@@ -231,7 +229,11 @@ async fn start_wm(
         topology.notify(std::time::Instant::now());
         Ok(())
       },
-      Some(event) = keybinding_listener.next_event() => {
+      event = keybinding_listener.next_event() => {
+        let Some(event) = event else {
+          input_failure = Some(anyhow::anyhow!("Keyboard input stopped."));
+          break;
+        };
         tracing::debug!("Received keyboard event: {:?}", event);
         wm.process_event(PlatformEvent::Keybinding(event), &mut config)
       }
@@ -239,6 +241,10 @@ async fn start_wm(
         wm.recover_placement(&config)
       },
       _ = cleanup_interval.tick() => {
+        let dropped = keybinding_listener.take_dropped();
+        if dropped != 0 {
+          tracing::warn!("Dropped {dropped} keyboard commands.");
+        }
         if wm.state.is_paused {
           Ok(())
         } else {
@@ -295,12 +301,12 @@ async fn start_wm(
             | WmEvent::BindingModesChanged { .. }
             | WmEvent::PauseChanged { .. }
         ) {
-          keybinding_listener.update(
-            &config
-              .active_keybinding_configs(&wm.state.binding_modes, false)
-              .flat_map(|kb| kb.bindings)
-              .collect::<Vec<_>>(),
-          );
+          if let Err(error) = keybinding_listener.update(
+            &config.listener_bindings(&wm.state.binding_modes),
+          ) {
+            input_failure = Some(error.into());
+            break;
+          }
 
           mouse_listener.set_enabled_events(
             if config.value.general.focus_follows_cursor {
@@ -333,9 +339,48 @@ async fn start_wm(
   }
 
   tracing::info!("Window manager shutting down.");
+  #[cfg(target_os = "windows")]
+  if let Err(error) = keybinding_listener.terminate() {
+    input_failure = Some(error.into());
+  }
   wm.cleanup(&mut config, &mut ipc_server);
 
-  Ok(())
+  input_failure.map_or(Ok(()), Err)
+}
+
+/// Threshold for reporting window-dispatch stalls.
+const STALL_THRESHOLD: Duration = Duration::from_millis(2500);
+
+/// Reports window-dispatch stalls, not keyboard delivery.
+fn start_event_loop_watchdog(dispatcher: &Dispatcher) {
+  let dispatcher = dispatcher.clone();
+  std::thread::spawn(move || {
+    let mut stalled_since: Option<std::time::Instant> = None;
+    loop {
+      std::thread::sleep(Duration::from_secs(1));
+      let started = std::time::Instant::now();
+      let answered = dispatcher.dispatch_sync(|| {}).is_ok();
+      let waited = started.elapsed();
+
+      if !answered || waited >= STALL_THRESHOLD {
+        // Report the leading edge once, not every second, so a long stall
+        // is one line rather than a flood.
+        if stalled_since.is_none() {
+          stalled_since = Some(started);
+          tracing::error!(
+            "Window dispatcher stalled: {}ms{}.",
+            waited.as_millis(),
+            if answered { "" } else { " (timed out)" }
+          );
+        }
+      } else if let Some(since) = stalled_since.take() {
+        tracing::error!(
+          "Event loop recovered after {}ms.",
+          since.elapsed().as_millis()
+        );
+      }
+    }
+  });
 }
 
 /// Waits until `deadline`, or never resolves when no deadline exists.

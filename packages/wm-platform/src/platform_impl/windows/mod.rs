@@ -4,6 +4,7 @@ mod display;
 mod display_listener;
 mod event_loop;
 mod frame_clock;
+mod keybinding_matcher;
 mod keyboard_hook;
 mod mouse_listener;
 mod native_window;

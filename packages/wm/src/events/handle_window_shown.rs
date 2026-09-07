@@ -3,8 +3,10 @@ use wm_common::{DisplayState, HideMethod};
 use wm_platform::NativeWindow;
 
 use crate::{
-  commands::window::manage_window, traits::WindowGetters,
-  user_config::UserConfig, wm_state::WmState,
+  commands::window::manage_window,
+  traits::{CommonGetters, WindowGetters},
+  user_config::UserConfig,
+  wm_state::WmState,
 };
 
 pub fn handle_window_shown(
@@ -18,12 +20,25 @@ pub fn handle_window_shown(
     info!("Window shown: {window}");
 
     // Update display state if window is already managed.
-    if config.value.general.hide_method != HideMethod::PlaceInCorner
-      && window.display_state() == DisplayState::Showing
-    {
-      window.set_display_state(DisplayState::Shown);
-    } else {
-      state.pending_sync.queue_container_to_redraw(window);
+    match window.display_state() {
+      DisplayState::Showing
+        if config.value.general.hide_method
+          != HideMethod::PlaceInCorner =>
+      {
+        window.set_display_state(DisplayState::Shown);
+      }
+      // Uncloaking a source after its animation echoes back as a show.
+      // The window is already placed, so reconciliation re-verifies it
+      // under its write budget; a redraw would animate it again.
+      DisplayState::Shown
+        if config.value.general.hide_method
+          != HideMethod::PlaceInCorner =>
+      {
+        state.native_sync.observe(window.id());
+      }
+      _ => {
+        state.pending_sync.queue_container_to_redraw(window);
+      }
     }
   } else if !state.ignored_windows.contains(&native_window) {
     // New-window churn cancels deferred off-screen focus follows.

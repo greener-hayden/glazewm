@@ -78,6 +78,8 @@ impl AnimationContext {
 pub(crate) struct AnimationWindow {
   handle: isize,
   thumbnail: isize,
+  /// The source's invisible frame insets, measured once at registration.
+  source_origin: (i32, i32),
   /// Frame of the `AnimationWindow`.
   outer_rect: Rect,
   dispatcher: Dispatcher,
@@ -95,7 +97,10 @@ impl AnimationWindow {
     dispatcher: &Dispatcher,
   ) -> crate::Result<Self> {
     let source_hwnd = window.inner.hwnd();
-    let (handle, thumbnail) = dispatcher.dispatch_sync(|| {
+    // Measured here, on the caller's thread and once per overlay. See
+    // `source_rect`.
+    let source_origin = Self::source_origin(window)?;
+    let (handle, thumbnail) = dispatcher.dispatch_sync(move || {
       let handle = Self::create_window(outer_rect)?;
       // SAFETY: Source and destination are live windows.
       let thumbnail =
@@ -109,14 +114,12 @@ impl AnimationWindow {
             return Err(crate::Error::from(err));
           }
         };
-      let prepare = || -> crate::Result<(i32, i32)> {
-        // SAFETY: Registered thumbnail supplies source dimensions.
-        let size = unsafe { DwmQueryThumbnailSourceSize(thumbnail)? };
-        let source_size = (size.cx, size.cy);
+      let prepare = || -> crate::Result<()> {
+        let source_rect = Self::source_rect(source_origin, thumbnail)?;
         let props = Self::thumbnail_properties(
           inner_rect,
           outer_rect,
-          source_size,
+          &source_rect,
           opacity.as_ref(),
         );
         // SAFETY: Properties target our registered thumbnail.
@@ -124,7 +127,7 @@ impl AnimationWindow {
           DwmUpdateThumbnailProperties(thumbnail, &raw const props)?;
         }
         tracing::debug!(
-          "Overlay source {source_size:?} visible {} dest {:?}",
+          "Overlay source {source_rect:?} visible {} dest {:?}",
           props.fVisible.0 != 0,
           [
             props.rcDestination.left,
@@ -134,10 +137,10 @@ impl AnimationWindow {
           ]
         );
         Self::show_beneath(handle, source_hwnd)?;
-        Ok(source_size)
+        Ok(())
       };
       match prepare() {
-        Ok(_) => Ok((handle, thumbnail)),
+        Ok(()) => Ok((handle, thumbnail)),
         Err(err) => {
           // SAFETY: Rolls back both owned resources.
           unsafe {
@@ -156,6 +159,7 @@ impl AnimationWindow {
     Ok(Self {
       handle,
       thumbnail,
+      source_origin,
       outer_rect: outer_rect.clone(),
       dispatcher: dispatcher.clone(),
     })
@@ -196,12 +200,11 @@ impl AnimationWindow {
       );
     }
     self.dispatcher.dispatch_sync(|| {
-      // SAFETY: Reads current registered source dimensions.
-      let size = unsafe { DwmQueryThumbnailSourceSize(thumbnail)? };
+      let source_rect = Self::source_rect(self.source_origin, thumbnail)?;
       let props = Self::thumbnail_properties(
         inner_rect,
         &self.outer_rect,
-        (size.cx, size.cy),
+        &source_rect,
         opacity,
       );
       // SAFETY: Updates our registered thumbnail.
@@ -231,6 +234,26 @@ impl AnimationWindow {
     Ok(())
   }
 
+  /// Reads the source's invisible frame insets, in source coordinates.
+  ///
+  /// Called once per overlay, off the event loop thread. `shadow_borders`
+  /// costs two `GetWindowRect` calls and a `DwmGetWindowAttribute`, and
+  /// the last is a round-trip to the compositor.
+  fn source_origin(window: &NativeWindow) -> crate::Result<(i32, i32)> {
+    let borders = window.inner.shadow_borders()?;
+    Ok((borders.left.to_px(0, None), borders.top.to_px(0, None)))
+  }
+
+  /// Maps thumbnail dimensions using cached frame insets.
+  fn source_rect(
+    origin: (i32, i32),
+    thumbnail: isize,
+  ) -> crate::Result<Rect> {
+    // SAFETY: Reads our registered thumbnail's dimensions.
+    let size = unsafe { DwmQueryThumbnailSourceSize(thumbnail)? };
+    Ok(Rect::from_xy(origin.0, origin.1, size.cx, size.cy))
+  }
+
   /// Where and how opaque DWM draws the thumbnail within the window.
   ///
   /// `inner_rect` is in screen coordinates and lands relative to
@@ -238,11 +261,21 @@ impl AnimationWindow {
   fn thumbnail_properties(
     inner_rect: &Rect,
     outer_rect: &Rect,
-    source_size: (i32, i32),
+    source_rect: &Rect,
     opacity: Option<&OpacityValue>,
   ) -> DWM_THUMBNAIL_PROPERTIES {
-    let clipped =
-      crate::thumbnail_rects(inner_rect, outer_rect, source_size);
+    let clipped = crate::thumbnail_rects(
+      inner_rect,
+      outer_rect,
+      (source_rect.width(), source_rect.height()),
+    )
+    .map(|(destination, source)| {
+      let source = source.translate_to_coordinates(
+        source.x() + source_rect.x(),
+        source.y() + source_rect.y(),
+      );
+      (destination, source)
+    });
     let visible = clipped.is_some();
     let (destination, source) = clipped.unwrap_or_else(|| {
       (Rect::from_xy(0, 0, 0, 0), Rect::from_xy(0, 0, 0, 0))
@@ -367,5 +400,54 @@ impl Drop for AnimationWindow {
     if let Err(err) = self.destroy() {
       tracing::warn!("Overlay cleanup failed: {err}");
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Preserves the entire visible source frame.
+  #[test]
+  fn thumbnail_preserves_frame_origin() {
+    let properties = AnimationWindow::thumbnail_properties(
+      &Rect::from_xy(351, 64, 186, 173),
+      &Rect::from_xy(55, 48, 498, 205),
+      &Rect::from_xy(7, 0, 186, 173),
+      None,
+    );
+    let source = properties.rcSource;
+    let destination = properties.rcDestination;
+    let client_only = properties.fSourceClientAreaOnly;
+    assert_eq!(source.left, 7);
+    assert_eq!(source.right, 193);
+    assert_eq!(source.bottom, 173);
+    assert_eq!(destination.left, 296);
+    assert_eq!(destination.right, 482);
+    assert_eq!(client_only, BOOL(0));
+  }
+
+  /// Crops scaled content without losing source insets.
+  #[test]
+  fn thumbnail_clips_offset_source() {
+    let properties = AnimationWindow::thumbnail_properties(
+      &Rect::from_xy(-100, -50, 200, 100),
+      &Rect::from_xy(0, 0, 500, 500),
+      &Rect::from_xy(7, 2, 400, 200),
+      Some(&OpacityValue(0.5)),
+    );
+    let source = properties.rcSource;
+    let destination = properties.rcDestination;
+    let visible = properties.fVisible;
+    assert_eq!(source.left, 207);
+    assert_eq!(source.top, 102);
+    assert_eq!(source.right, 407);
+    assert_eq!(source.bottom, 202);
+    assert_eq!(destination.left, 0);
+    assert_eq!(destination.top, 0);
+    assert_eq!(destination.right, 100);
+    assert_eq!(destination.bottom, 50);
+    assert_eq!(properties.opacity, OpacityValue(0.5).to_alpha());
+    assert_eq!(visible, BOOL(1));
   }
 }

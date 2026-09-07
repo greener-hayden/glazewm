@@ -78,16 +78,16 @@ pub fn handle_window_moved_or_resized(
       return update_drag_state(&window, &frame_position, state, config);
     }
 
-    // Reconciliation owns its observations through source handoff. Native
-    // interactive starts still supersede that ownership on Windows.
+    let old_is_maximized = window.native_properties().is_maximized;
+    let is_maximized = try_warn!(window.native().is_maximized());
+
+    // Native state changes supersede animated geometry.
     if state.native_sync.owns_geometry(window.id())
       && !is_interactive_start
+      && old_is_maximized == is_maximized
     {
       return Ok(());
     }
-
-    let old_is_maximized = window.native_properties().is_maximized;
-    let is_maximized = try_warn!(window.native().is_maximized());
 
     // Ignore duplicate move/resize events. Window position changes can
     // trigger multiple events. For example, restoring from maximized can
@@ -105,14 +105,24 @@ pub fn handle_window_moved_or_resized(
 
     // If the window is not maximized, update its cached shadow borders.
     // Maximized windows temporarily have 0 shadow borders, in which case
-    // we should use its previous value for redraws.
+    // we should use its previous value for redraws. A measurement taken
+    // mid-motion is rejected; the cached value stays and the rest of the
+    // event is still handled.
     #[cfg(target_os = "windows")]
     {
-      let shadow_borders = try_warn!(window.native().shadow_borders());
       if !is_maximized {
-        window.update_native_properties(|properties| {
-          properties.shadow_borders = shadow_borders;
-        });
+        // Bind first; a match holds the native borrow.
+        let measured = window.native().shadow_borders();
+        match measured {
+          Ok(shadow_borders) => {
+            window.update_native_properties(|properties| {
+              properties.shadow_borders = shadow_borders;
+            });
+          }
+          Err(err) => {
+            tracing::debug!("Kept cached shadow borders: {err}");
+          }
+        }
       }
     }
 
@@ -371,18 +381,13 @@ pub fn handle_window_moved_or_resized(
           )?;
         }
       }
-      // A tiling window that drifts off its tile is left alone. Snapping
-      // it back from here fights the reveal: a window mid-`Showing` is
-      // parked in the corner at its old size, which reads as drift, and
-      // the redraw that answers it re-parks the window instead of
-      // finishing the reveal. Correcting drift needs a signal that
-      // separates an app resizing itself from our own machinery moving
-      // the window, which this event does not carry.
-      WindowState::Tiling => {
-        #[cfg(target_os = "windows")]
-        state.pending_sync.queue_container_to_redraw(window);
-      }
-      WindowState::Minimized => {}
+      // A tiling window that drifts off its tile gets no redraw. The
+      // observation queued at the top of this handler already makes
+      // reconciliation re-verify the tile under its bounded write budget.
+      // A redraw would add an animated pass, and an animation retargets
+      // the frame twice, which refunds that budget: a window that refuses
+      // its tile would then be re-animated after every self-resize.
+      WindowState::Tiling | WindowState::Minimized => {}
     }
   }
 

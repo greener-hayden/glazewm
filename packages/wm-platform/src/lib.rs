@@ -9,6 +9,8 @@ mod display_listener;
 mod error;
 mod event_loop;
 mod frame_clock;
+#[cfg(all(test, target_os = "windows"))]
+mod input_test_allocator;
 mod keybinding_listener;
 mod models;
 mod mouse_listener;

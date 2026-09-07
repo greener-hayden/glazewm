@@ -24,7 +24,7 @@ tasks:
   test:desktop:
     desc: Run the platform tests in a desktop session
     cmds:
-      - cargo test -p wm-platform --locked {{if eq OS "darwin"}}-- --test-threads=1{{end}}
+      - cargo test -p wm-platform --locked -- {{if eq OS "darwin"}}--test-threads=1{{end}} {{.CLI_ARGS}}
 
   check:
     desc: Full local gate (format, lint, tests)

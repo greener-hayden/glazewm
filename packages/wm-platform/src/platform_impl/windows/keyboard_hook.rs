@@ -1,202 +1,581 @@
-use std::cell::Cell;
+use std::{
+  cell::RefCell,
+  sync::{
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    Arc, Mutex, TryLockError,
+  },
+  thread::{self, JoinHandle},
+};
 
+use rtrb::{Consumer, Producer, RingBuffer};
+use tokio::sync::mpsc;
 use windows::Win32::{
-  Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
-  UI::{
-    Input::KeyboardAndMouse::{
-      GetKeyState, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
-      VK_RMENU, VK_RSHIFT, VK_RWIN,
-    },
-    WindowsAndMessaging::{
-      CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-      KBDLLHOOKSTRUCT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
-    },
+  Foundation::{
+    CloseHandle, BOOL, HANDLE, HINSTANCE, LPARAM, LRESULT, WPARAM,
+  },
+  System::Threading::{CreateEventW, GetCurrentThreadId, INFINITE},
+  UI::WindowsAndMessaging::{
+    CallNextHookEx, DispatchMessageW, MsgWaitForMultipleObjectsEx,
+    PeekMessageW, HHOOK, HOOKPROC, KBDLLHOOKSTRUCT, MSG,
+    MWMO_INPUTAVAILABLE, PM_NOREMOVE, PM_REMOVE, QS_ALLINPUT,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
   },
 };
 
-use crate::{Dispatcher, Key, KeyCode};
+use super::keybinding_matcher::{CompiledBindings, KeySnapshot};
+use crate::{Keybinding, KeybindingEvent};
 
-/// Callback stored in [`HOOK`] for intercepting keyboard events.
-type HookCallback = Box<dyn Fn(KeyEvent) -> bool>;
+#[cfg(test)]
+#[path = "keyboard_hook_tests.rs"]
+mod tests;
 
-thread_local! {
-  /// Stores the hook callback for the current thread.
-  ///
-  /// The hook callback is called for every keyboard event and returns
-  /// `true` if the event should be intercepted.
-  static HOOK: Cell<Option<HookCallback>> = Cell::default();
+const CAPACITY: usize = 256;
+const FAILED: u32 = 31;
+
+#[link(name = "kernel32")]
+extern "system" {
+  #[link_name = "GetLastError"]
+  fn last_error() -> u32;
+  #[link_name = "SetEvent"]
+  fn signal_event(handle: HANDLE) -> BOOL;
+  #[link_name = "ResetEvent"]
+  fn reset_event(handle: HANDLE) -> BOOL;
+  #[link_name = "WaitForSingleObject"]
+  fn wait_event(handle: HANDLE, timeout: u32) -> u32;
 }
 
-/// A key event received from the keyboard hook.
-#[derive(Clone, Debug)]
-pub struct KeyEvent {
-  /// The key that was pressed or released.
-  pub key: Key,
-
-  /// Key code that generated this event.
-  #[allow(dead_code)]
-  pub key_code: KeyCode,
-
-  /// Whether the event is for a key press or release.
-  pub is_keypress: bool,
+#[link(name = "user32")]
+extern "system" {
+  #[link_name = "SetWindowsHookExW"]
+  fn install_hook(
+    kind: i32,
+    callback: HOOKPROC,
+    module: HINSTANCE,
+    thread: u32,
+  ) -> HHOOK;
+  #[link_name = "UnhookWindowsHookEx"]
+  fn remove_hook(hook: HHOOK) -> BOOL;
 }
 
-impl KeyEvent {
-  /// Gets whether the specified key is currently pressed.
-  #[allow(clippy::unused_self)]
-  pub fn is_key_down(&self, key: Key) -> bool {
-    match key {
-      Key::Cmd | Key::Win => {
-        Self::is_key_down_raw(VK_LWIN.0)
-          || Self::is_key_down_raw(VK_RWIN.0)
-      }
-      Key::Alt => {
-        Self::is_key_down_raw(VK_LMENU.0)
-          || Self::is_key_down_raw(VK_RMENU.0)
-      }
-      Key::Ctrl => {
-        Self::is_key_down_raw(VK_LCONTROL.0)
-          || Self::is_key_down_raw(VK_RCONTROL.0)
-      }
-      Key::Shift => {
-        Self::is_key_down_raw(VK_LSHIFT.0)
-          || Self::is_key_down_raw(VK_RSHIFT.0)
-      }
-      _ => {
-        if let Ok(key_code) = KeyCode::try_from(key) {
-          Self::is_key_down_raw(key_code.0)
-        } else {
-          false
-        }
-      }
+/// Owns one kernel notification event.
+struct Signal(HANDLE);
+
+impl Signal {
+  /// Creates signaling storage before hook installation.
+  fn new(manual: bool) -> crate::Result<Self> {
+    // SAFETY: Creates an unnamed owned event.
+    Ok(Self(unsafe { CreateEventW(None, manual, false, None)? }))
+  }
+
+  /// Signals without constructing allocating error objects.
+  fn set(&self) -> bool {
+    // SAFETY: This owner retains the handle.
+    unsafe { signal_event(self.0) }.as_bool()
+  }
+
+  /// Resets before checking the publication mailbox.
+  fn reset(&self) -> bool {
+    // SAFETY: This owner retains the handle.
+    unsafe { reset_event(self.0) }.as_bool()
+  }
+
+  /// Waits only outside keyboard delivery.
+  fn wait(&self) -> bool {
+    // SAFETY: This owner retains the handle.
+    unsafe { wait_event(self.0, INFINITE) == 0 }
+  }
+}
+
+impl Drop for Signal {
+  /// Closes the final owned event handle.
+  fn drop(&mut self) {
+    // SAFETY: Threads have released this owner.
+    if let Err(error) = unsafe { CloseHandle(self.0) } {
+      tracing::error!("Input event cleanup failed: {error}");
     }
   }
-
-  /// Gets whether the specified key is currently down using the raw key
-  /// code.
-  fn is_key_down_raw(key: u16) -> bool {
-    unsafe { (GetKeyState(key.into()) & 0x80) == 0x80 }
-  }
 }
 
-/// A system-wide low-level keyboard hook.
-#[derive(Debug)]
-pub struct KeyboardHook {
-  handle: HHOOK,
-  dispatcher: Dispatcher,
+/// Bounds publication and off-thread table retirement.
+#[derive(Default)]
+struct BindingMailbox {
+  pending: Option<Box<CompiledBindings>>,
+  retired: Option<Box<CompiledBindings>>,
 }
 
-impl KeyboardHook {
-  /// Creates an instance of `KeyboardHook`.
-  ///
-  /// The callback is called for every keyboard event and returns `true` if
-  /// the event should be intercepted.
-  ///
-  /// # Panics
-  ///
-  /// Panics when attempting to register multiple hooks on the dispatcher's
-  /// thread.
-  pub fn new<F>(
-    callback: F,
-    dispatcher: &Dispatcher,
-  ) -> crate::Result<Self>
-  where
-    F: Fn(KeyEvent) -> bool + Send + Sync + 'static,
-  {
-    let handle = dispatcher.dispatch_sync(move || {
-      HOOK.with(|state| {
-        assert!(
-          state.take().is_none(),
-          "Only one keyboard hook can be registered on the dispatcher's thread."
-        );
+/// Typed controls; never accepts dispatched closures.
+struct InputControl {
+  mailbox: Mutex<BindingMailbox>,
+  enabled: AtomicBool,
+  stopping: AtomicBool,
+  failure: AtomicU32,
+  installed: AtomicU32,
+  owner: AtomicU32,
+  removed: AtomicU32,
+  callbacks: AtomicU64,
+  suppressed: AtomicU64,
+  overflow: AtomicU64,
+  #[cfg(test)]
+  allocations: AtomicU64,
+  #[cfg(test)]
+  deallocations: AtomicU64,
+  #[cfg(test)]
+  probe: AtomicU32,
+  #[cfg(test)]
+  probes: AtomicU32,
+  #[cfg(test)]
+  invalid_hook: AtomicBool,
+  #[cfg(test)]
+  tls_cleared: AtomicBool,
+  ready: Signal,
+  changed: Signal,
+  stop: Signal,
+  output: Signal,
+}
 
-        state.set(Some(Box::new(callback)));
-      });
-
-      unsafe {
-        SetWindowsHookExW(
-          WH_KEYBOARD_LL,
-          Some(Self::hook_proc),
-          HINSTANCE::default(),
-          0,
-        )
-      }
-    })??;
-
+impl InputControl {
+  /// Allocates controls before starting either thread.
+  fn new() -> crate::Result<Self> {
     Ok(Self {
-      handle,
-      dispatcher: dispatcher.clone(),
+      mailbox: Mutex::default(),
+      enabled: AtomicBool::new(true),
+      stopping: AtomicBool::new(false),
+      failure: AtomicU32::new(0),
+      installed: AtomicU32::new(0),
+      owner: AtomicU32::new(0),
+      removed: AtomicU32::new(0),
+      callbacks: AtomicU64::new(0),
+      suppressed: AtomicU64::new(0),
+      overflow: AtomicU64::new(0),
+      #[cfg(test)]
+      allocations: AtomicU64::new(0),
+      #[cfg(test)]
+      deallocations: AtomicU64::new(0),
+      #[cfg(test)]
+      probe: AtomicU32::new(0),
+      #[cfg(test)]
+      probes: AtomicU32::new(0),
+      #[cfg(test)]
+      invalid_hook: AtomicBool::new(false),
+      #[cfg(test)]
+      tls_cleared: AtomicBool::new(false),
+      ready: Signal::new(true)?,
+      changed: Signal::new(true)?,
+      stop: Signal::new(true)?,
+      output: Signal::new(false)?,
     })
   }
 
-  /// Terminates the keyboard hook by unregistering it.
-  pub fn terminate(&mut self) -> crate::Result<()> {
-    unsafe { UnhookWindowsHookEx(self.handle) }?;
-
-    // Dispatch cleanup to the event loop thread since the callback
-    // is stored in a thread-local on that thread.
-    let _ = self.dispatcher.dispatch_async(|| {
-      HOOK.with(|state| {
-        state.take();
-      });
-    });
-
-    Ok(())
+  /// Records errors without formatting or logging.
+  fn fail(&self, code: u32) {
+    let _previous = self.failure.compare_exchange(
+      0,
+      code.max(1),
+      Ordering::AcqRel,
+      Ordering::Acquire,
+    );
+    self.stopping.store(true, Ordering::Release);
+    self.stop.set();
+    self.output.set();
   }
 
-  /// Hook procedure for keyboard events.
-  ///
-  /// For use with `SetWindowsHookExW`.
-  extern "system" fn hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-  ) -> LRESULT {
-    // If the code is less than zero, the hook procedure must pass the hook
-    // notification directly to other applications.
-    if code != 0 {
-      return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+  /// Requests shutdown without requiring queue capacity.
+  fn stop(&self) {
+    self.stopping.store(true, Ordering::Release);
+    if !self.stop.set() || !self.output.set() {
+      self.fail(FAILED);
     }
+  }
 
-    // Get struct with the keyboard input event.
-    let input = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+  /// Converts errors outside the input thread.
+  fn result(&self) -> crate::Result<()> {
+    match self.failure.load(Ordering::Acquire) {
+      0 => Ok(()),
+      code => Err(
+        std::io::Error::from_raw_os_error(
+          i32::try_from(code).unwrap_or(31),
+        )
+        .into(),
+      ),
+    }
+  }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let key_code = KeyCode(input.vkCode as u16);
-    #[allow(clippy::cast_possible_truncation)]
-    let is_keypress =
-      wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
-
-    let Ok(key) = Key::try_from(key_code) else {
-      return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+  /// Publishes complete tables; reclaims off-thread data.
+  fn publish(&self, table: Box<CompiledBindings>) -> crate::Result<()> {
+    if self.stopping.load(Ordering::Acquire) {
+      return Err(crate::Error::EventLoopStopped);
+    }
+    let (pending, retired) = {
+      let mut mailbox = self.mailbox.lock().map_err(|_| {
+        crate::Error::Thread("Input publication failed.".into())
+      })?;
+      (mailbox.pending.replace(table), mailbox.retired.take())
     };
+    if !self.changed.set() {
+      self.fail(FAILED);
+    }
+    drop((pending, retired));
+    self.result()
+  }
+}
 
-    let key_event = KeyEvent {
-      key,
-      key_code,
-      is_keypress,
-    };
+/// Mutable state accessed only between native callbacks.
+struct InputState {
+  table: Box<CompiledBindings>,
+  producer: Producer<Arc<Keybinding>>,
+  control: Arc<InputControl>,
+}
 
-    let should_intercept = HOOK.with(|state| {
-      if let Some(callback) = state.take() {
-        let result = callback(key_event);
-        state.set(Some(callback));
-        result
-      } else {
-        false
+impl InputState {
+  /// Attempts one whole-table adoption without waiting.
+  fn adopt(&mut self) {
+    match self.control.mailbox.try_lock() {
+      Ok(mut mailbox) => {
+        if mailbox.retired.is_none() {
+          if let Some(table) = mailbox.pending.take() {
+            mailbox.retired =
+              Some(std::mem::replace(&mut self.table, table));
+          }
+        }
       }
-    });
-
-    if should_intercept {
-      return LRESULT(1);
+      Err(TryLockError::WouldBlock) => {}
+      Err(TryLockError::Poisoned(_)) => self.control.fail(FAILED),
     }
+  }
 
+  /// Matches locally and never waits for consumers.
+  fn handle(
+    &mut self,
+    code: u16,
+    keydown: bool,
+    keys: &KeySnapshot,
+  ) -> bool {
+    self.control.callbacks.fetch_add(1, Ordering::Relaxed);
+    if !keydown
+      || !self.control.enabled.load(Ordering::Acquire)
+      || self.control.stopping.load(Ordering::Acquire)
+    {
+      return false;
+    }
+    let Some(binding) = self.table.matching(code, keys) else {
+      return false;
+    };
+    self.control.suppressed.fetch_add(1, Ordering::Relaxed);
+    if self.producer.is_full() {
+      self.control.overflow.fetch_add(1, Ordering::Relaxed);
+    } else if self.producer.push(Arc::clone(binding)).is_err()
+      || !self.control.output.set()
+    {
+      self.control.fail(FAILED);
+    }
+    true
+  }
+}
+
+thread_local! {
+  static INPUT: RefCell<Option<InputState>> = const { RefCell::new(None) };
+}
+
+/// Forwards events without retaining mutable TLS access.
+extern "system" fn keyboard_proc(
+  code: i32,
+  wparam: WPARAM,
+  lparam: LPARAM,
+) -> LRESULT {
+  if code != 0 {
+    // SAFETY: Forwards unchanged native hook parameters.
+    return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+  }
+  // SAFETY: Windows supplies this callback's keyboard payload.
+  let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+  let intercepted = INPUT
+    .try_with(|slot| {
+      let Ok(mut slot) = slot.try_borrow_mut() else {
+        return false;
+      };
+      let Some(input) = slot.as_mut() else {
+        return false;
+      };
+      let Ok(key) = u16::try_from(event.vkCode) else {
+        return false;
+      };
+      let keydown = wparam.0 == WM_KEYDOWN as usize
+        || wparam.0 == WM_SYSKEYDOWN as usize;
+      let keys = if keydown {
+        input.table.sample(key)
+      } else {
+        KeySnapshot::default()
+      };
+      input.handle(key, keydown, &keys)
+    })
+    .unwrap_or(false);
+  if intercepted {
+    LRESULT(1)
+  } else {
+    // SAFETY: No mutable TLS access remains here.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
   }
 }
 
-impl Drop for KeyboardHook {
+/// Pumps only input and typed control signals.
+fn pump_input(control: &InputControl) {
+  let handles = [control.stop.0, control.changed.0];
+  let mut message = MSG::default();
+  while !control.stopping.load(Ordering::Acquire) {
+    // SAFETY: Handles and message storage remain live.
+    let wake = unsafe {
+      MsgWaitForMultipleObjectsEx(
+        Some(&handles),
+        INFINITE,
+        QS_ALLINPUT,
+        MWMO_INPUTAVAILABLE,
+      )
+    }
+    .0;
+    match wake {
+      0 => break,
+      1 => {
+        if !control.changed.reset() {
+          control.fail(FAILED);
+          break;
+        }
+        INPUT.with(|slot| {
+          if let Some(input) = slot.borrow_mut().as_mut() {
+            input.adopt();
+            #[cfg(test)]
+            if let Ok(code) =
+              u16::try_from(control.probe.swap(0, Ordering::AcqRel))
+            {
+              if code != 0 {
+                let mut keys = KeySnapshot::default();
+                keys.record(code, i16::MIN);
+                input.handle(code, true, &keys);
+                control.probes.fetch_add(1, Ordering::Release);
+              }
+            }
+          }
+        });
+      }
+      2 => {}
+      _ => {
+        control.fail(FAILED);
+        break;
+      }
+    }
+    for _ in 0..64 {
+      if control.stopping.load(Ordering::Acquire) {
+        break;
+      }
+      // SAFETY: Pumps without borrowing input state.
+      if !unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE) }
+        .as_bool()
+      {
+        break;
+      }
+      if message.message == WM_QUIT {
+        control.fail(FAILED);
+        break;
+      }
+      // SAFETY: Dispatches the retrieved native message.
+      unsafe { DispatchMessageW(&raw const message) };
+    }
+  }
+}
+
+/// Returns resources for off-thread destruction.
+fn run_input(
+  state: InputState,
+  control: &InputControl,
+) -> Option<InputState> {
+  INPUT.with(|slot| *slot.borrow_mut() = Some(state));
+  let mut message = MSG::default();
+  // SAFETY: Initializes this thread's message queue.
+  unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_NOREMOVE) };
+  // SAFETY: Reads the current hook-owning thread identifier.
+  control
+    .owner
+    .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+  let kind = WH_KEYBOARD_LL.0;
+  #[cfg(test)]
+  let kind = if control.invalid_hook.load(Ordering::Acquire) {
+    i32::MAX
+  } else {
+    kind
+  };
+  #[cfg(test)]
+  crate::input_test_allocator::start();
+  // SAFETY: TLS and message queue are ready.
+  let hook = unsafe {
+    install_hook(kind, Some(keyboard_proc), HINSTANCE::default(), 0)
+  };
+  if hook.0 == 0 {
+    // SAFETY: Reads this thread's installation error.
+    control.fail(unsafe { last_error() });
+  } else {
+    control.installed.fetch_add(1, Ordering::Release);
+  }
+  if !control.ready.set() {
+    control.fail(FAILED);
+  }
+  if hook.0 != 0 {
+    pump_input(control);
+    // SAFETY: Removes this thread's own installed hook.
+    if !unsafe { remove_hook(hook) }.as_bool() {
+      // SAFETY: Reads this thread's removal error.
+      control.fail(unsafe { last_error() });
+    }
+    // SAFETY: Reads the hook-removing thread identifier.
+    control
+      .removed
+      .store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+  }
+  #[cfg(test)]
+  {
+    let (allocated, freed) = crate::input_test_allocator::finish();
+    control
+      .allocations
+      .store(allocated as u64, Ordering::Release);
+    control.deallocations.store(freed as u64, Ordering::Release);
+  }
+  control.stop();
+  let state = INPUT.with(|slot| slot.borrow_mut().take());
+  #[cfg(test)]
+  control.tls_cleared.store(true, Ordering::Release);
+  state
+}
+
+/// Bridges into Tokio away from input delivery.
+fn relay_input(
+  mut consumer: Consumer<Arc<Keybinding>>,
+  sender: &mpsc::Sender<KeybindingEvent>,
+  control: &InputControl,
+) {
+  loop {
+    if control.stopping.load(Ordering::Acquire) {
+      break;
+    }
+    if let Ok(binding) = consumer.pop() {
+      if sender
+        .blocking_send(KeybindingEvent((*binding).clone()))
+        .is_err()
+      {
+        if !control.stopping.load(Ordering::Acquire) {
+          control.fail(FAILED);
+        }
+        break;
+      }
+    } else if !control.output.wait() {
+      control.fail(FAILED);
+      break;
+    }
+  }
+}
+
+/// Owns the Windows keyboard service lifetime.
+pub(crate) struct KeyboardInput {
+  control: Arc<InputControl>,
+  receiver: mpsc::Receiver<KeybindingEvent>,
+  input: Option<JoinHandle<Option<InputState>>>,
+  relay: Option<JoinHandle<()>>,
+}
+
+impl KeyboardInput {
+  /// Starts input without any window dispatcher.
+  pub(crate) fn new(bindings: &[Keybinding]) -> crate::Result<Self> {
+    Self::start(bindings, Arc::new(InputControl::new()?))
+  }
+
+  /// Starts threads with preallocated owned controls.
+  fn start(
+    bindings: &[Keybinding],
+    control: Arc<InputControl>,
+  ) -> crate::Result<Self> {
+    let (producer, consumer) = RingBuffer::new(CAPACITY);
+    let (sender, receiver) = mpsc::channel(1);
+    let state = InputState {
+      table: Box::new(CompiledBindings::new(bindings)),
+      producer,
+      control: Arc::clone(&control),
+    };
+    let mut service = Self {
+      control,
+      receiver,
+      input: None,
+      relay: None,
+    };
+    let relay_control = Arc::clone(&service.control);
+    service.relay = Some(
+      thread::Builder::new()
+        .name("glazewm-key-relay".into())
+        .spawn(move || {
+          relay_input(consumer, &sender, &relay_control);
+        })?,
+    );
+    let input_control = Arc::clone(&service.control);
+    service.input = Some(
+      thread::Builder::new()
+        .name("glazewm-keyboard".into())
+        .spawn(move || run_input(state, &input_control))?,
+    );
+    if !service.control.ready.wait() {
+      service.control.fail(FAILED);
+    }
+    service.control.result()?;
+    Ok(service)
+  }
+
+  /// Publishes bindings without touching the dispatcher.
+  pub(crate) fn update(
+    &self,
+    bindings: &[Keybinding],
+  ) -> crate::Result<()> {
+    self
+      .control
+      .publish(Box::new(CompiledBindings::new(bindings)))
+  }
+
+  /// Takes overflow counts for off-thread reporting.
+  pub(crate) fn take_dropped(&self) -> u64 {
+    self.control.overflow.swap(0, Ordering::Relaxed)
+  }
+
+  /// Changes interception without disabling hook delivery.
+  pub(crate) fn enable(&self, enabled: bool) {
+    self.control.enabled.store(enabled, Ordering::Release);
+  }
+
+  /// Receives commands or reports terminal input closure.
+  pub(crate) async fn next_event(&mut self) -> Option<KeybindingEvent> {
+    if self.control.stopping.load(Ordering::Acquire) {
+      return None;
+    }
+    self.receiver.recv().await
+  }
+
+  /// Stops and joins without draining queued commands.
+  pub(crate) fn terminate(&mut self) -> crate::Result<()> {
+    self.control.stop();
+    self.receiver.close();
+    if let Some(input) = self.input.take() {
+      match input.join() {
+        Ok(state) => drop(state),
+        Err(_) => self.control.fail(FAILED),
+      }
+    }
+    if let Some(relay) = self.relay.take() {
+      if relay.join().is_err() {
+        self.control.fail(FAILED);
+      }
+    }
+    self.control.result()
+  }
+}
+
+impl Drop for KeyboardInput {
+  /// Joins both threads on every exit path.
   fn drop(&mut self) {
-    let _ = self.terminate();
+    if let Err(error) = self.terminate() {
+      tracing::error!("Keyboard shutdown failed: {error}");
+    }
   }
 }

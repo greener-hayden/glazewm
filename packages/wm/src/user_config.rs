@@ -11,6 +11,10 @@ use crate::{
   traits::{CommonGetters, WindowGetters},
 };
 
+#[cfg(test)]
+#[path = "user_config_tests.rs"]
+mod tests;
+
 /// Resource string for the sample config file.
 const SAMPLE_CONFIG: &str =
   include_str!("../../../resources/assets/sample-config.yaml");
@@ -371,6 +375,30 @@ impl UserConfig {
     workspaces.sort_by_key(|workspace| {
       self.workspace_config_index(&workspace.config().name)
     });
+  }
+
+  /// Keeps paused bindings eligible for interception.
+  pub fn listener_bindings(
+    &self,
+    modes: &[wm_common::BindingModeConfig],
+  ) -> Vec<wm_platform::Keybinding> {
+    self
+      .active_keybinding_configs(modes, false)
+      .flat_map(|config| config.bindings)
+      .collect()
+  }
+
+  /// Resolves queued bindings against current configuration.
+  pub fn keybinding_commands(
+    &self,
+    event: &wm_platform::KeybindingEvent,
+    modes: &[wm_common::BindingModeConfig],
+    paused: bool,
+  ) -> Option<Vec<InvokeCommand>> {
+    self
+      .active_keybinding_configs(modes, paused)
+      .find(|config| config.bindings.contains(&event.0))
+      .map(|config| config.commands)
   }
 
   /// Keybinding configs that should be active for the current binding mode

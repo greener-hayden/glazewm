@@ -45,6 +45,27 @@ struct Decorations {
   title_bar: Option<bool>,
 }
 
+/// Resolves the window's requested border and corners.
+fn focus_decorations(
+  window: &WindowContainer,
+  config: &UserConfig,
+) -> (Option<Color>, CornerStyle) {
+  let effects = if window.has_focus(None) {
+    &config.value.window_effects.focused_window
+  } else {
+    &config.value.window_effects.other_windows
+  };
+
+  (
+    effects.border.enabled.then(|| effects.border.color.clone()),
+    if effects.corner_style.enabled {
+      effects.corner_style.style.clone()
+    } else {
+      CornerStyle::Default
+    },
+  )
+}
+
 /// Distinguishes untouched and applied opacity.
 #[derive(PartialEq)]
 enum AppliedOpacity {
@@ -52,11 +73,27 @@ enum AppliedOpacity {
   Value(Option<OpacityValue>),
 }
 
+/// Owns motion independently of source concealment.
+enum MotionOwner {
+  Native,
+  Overlay(MotionPreparation),
+}
+
+impl MotionOwner {
+  /// Returns readiness only for proxy motion.
+  fn preparation(&self) -> Option<&MotionPreparation> {
+    match self {
+      Self::Native => None,
+      Self::Overlay(preparation) => Some(preparation),
+    }
+  }
+}
+
 /// Owns native mutations for one window.
 struct ManagedWindow {
   native: PlacementSession,
   frame: FrameReconciler,
-  pending_motion: Option<MotionPreparation>,
+  motion: Option<MotionOwner>,
   source: Option<SourceLease>,
   retire_after: Option<u64>,
   cancelled: bool,
@@ -78,7 +115,7 @@ struct ManagedWindow {
 impl ManagedWindow {
   /// Whether reconciliation still owes this window work.
   fn settling(&self) -> bool {
-    self.pending_motion.is_some()
+    self.motion.is_some()
       || self.source.is_some()
       || self.retire_after.is_some()
       || self.frame.in_flight()
@@ -134,7 +171,11 @@ impl PlacementCoordinator {
           (!paused).then(|| window.frame.deadline()).flatten(),
           (!paused)
             .then(|| {
-              window.pending_motion.as_ref().map(|motion| motion.deadline)
+              window
+                .motion
+                .as_ref()
+                .and_then(MotionOwner::preparation)
+                .map(|motion| motion.deadline)
             })
             .flatten(),
           window.retry_at,
@@ -325,8 +366,9 @@ pub fn platform_sync(
   // thing that moves a rect: a dropped floating window writes its own
   // placement and asks for no redraw, and reconciling that window against
   // a snapshot from before the drag puts it back where it started.
-  state.layout_snapshot =
-    crate::layout_snapshot::LayoutSnapshot::capture(&state.root_container)?;
+  state.layout_snapshot = crate::layout_snapshot::LayoutSnapshot::capture(
+    &state.root_container,
+  )?;
   let focused =
     state.focused_container().context("No focused container.")?;
   let redraw = if layout_changed {
@@ -532,7 +574,12 @@ fn plan_animations<'a>(
     state.native_sync.batch = state.native_sync.batch.wrapping_add(1);
     let captures = windows
       .iter()
-      .filter(|window| plans.contains_key(&window.id()))
+      .filter(|window| {
+        plans.get(&window.id()).is_some_and(|plan| {
+          !plan.trigger.uses_native()
+            || state.animation_manager.has_overlay(&window.id())
+        })
+      })
       .map(|window| (window.id(), window.native().id()))
       .collect::<Vec<_>>();
     state
@@ -551,8 +598,9 @@ fn release_ready(state: &mut WmState) {
     .values()
     .filter_map(|entry| {
       entry
-        .pending_motion
+        .motion
         .as_ref()
+        .and_then(MotionOwner::preparation)
         .filter(|motion| {
           !motion.ready(
             entry.frame.generation,
@@ -564,11 +612,12 @@ fn release_ready(state: &mut WmState) {
     .collect::<HashSet<_>>();
   for (id, entry) in &mut state.native_sync.windows {
     if entry
-      .pending_motion
+      .motion
       .as_ref()
+      .and_then(MotionOwner::preparation)
       .is_some_and(|motion| !blocked.contains(&motion.batch))
     {
-      entry.pending_motion = None;
+      entry.motion = None;
       state.animation_manager.release_animation(id);
       tracing::debug!(window = %id, "Presentation motion ready.");
     }
@@ -725,7 +774,10 @@ fn begin_handoff(
   id: &Uuid,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
-  entry.pending_motion = None;
+  if matches!(entry.motion, Some(MotionOwner::Native)) {
+    entry.frame.restart();
+  }
+  entry.motion = None;
   entry.cancelled = false;
   state.animation_manager.finish_animation(id)?;
   if let Some(source) = &mut entry.source {
@@ -786,7 +838,7 @@ fn reconcile_window(
     slot.insert(ManagedWindow {
       native,
       frame: FrameReconciler::new(desired),
-      pending_motion: None,
+      motion: None,
       source,
       retire_after: None,
       cancelled: false,
@@ -854,7 +906,23 @@ fn reconcile_managed(
   entry.retry_at = None;
   let mut observed = observe(&entry.native)?;
   if let Some(plan) = plan {
-    if entry.native.supports_presentation()
+    if plan.trigger.uses_native()
+      && visible
+      && entry.source.is_none()
+      && !state.animation_manager.has_overlay(&id)
+      && native_state == NativeState::Normal
+      && observed.state == NativeState::Normal
+      && !dragging
+    {
+      state.animation_manager.prepare_native(
+        id,
+        plan,
+        entry.native.window()?.frame()?,
+        monitor.refresh_rate.unwrap_or(60),
+      );
+      entry.motion = Some(MotionOwner::Native);
+      entry.retire_after = None;
+    } else if entry.native.supports_presentation()
       && entry.conceal.is_some()
       && native_state == NativeState::Normal
       && observed.state == NativeState::Normal
@@ -888,12 +956,13 @@ fn reconcile_managed(
       };
       match prepare() {
         Ok(()) => {
-          entry.pending_motion = Some(MotionPreparation::new(
-            state.native_sync.batch,
-            wm_platform::FrameClock::current_frame()?,
-            now,
-            !opening,
-          ));
+          entry.motion =
+            Some(MotionOwner::Overlay(MotionPreparation::new(
+              state.native_sync.batch,
+              wm_platform::FrameClock::current_frame()?,
+              now,
+              !opening,
+            )));
           entry.retire_after = None;
           if let Some(source) = &mut entry.source {
             source.restoring = false;
@@ -918,12 +987,24 @@ fn reconcile_managed(
       );
     }
   }
-  if dragging
+  let native_motion = matches!(entry.motion, Some(MotionOwner::Native));
+  let visible_target = state
+    .layout_snapshot
+    .rect(id)?
+    .apply_delta(&window.border_delta(), None);
+  if (native_motion
+    && (!visible
+      || observed.state != NativeState::Normal
+      || state.pending_sync.should_skip_animations()
+      || state.animation_manager.native_target(&id)
+        != Some(&visible_target)))
+    || dragging
     || native_state != NativeState::Normal
     || matches!(window.state(), WindowState::Fullscreen(_))
     || entry
-      .pending_motion
+      .motion
       .as_ref()
+      .and_then(MotionOwner::preparation)
       .is_some_and(|motion| now >= motion.deadline)
     || state.animation_manager.is_complete(&id)
     || entry.cancelled
@@ -932,14 +1013,11 @@ fn reconcile_managed(
   }
   // Existing content needs a presented cover. Opening content must stay
   // invisible throughout preparation, including its first native frame.
-  let retaining_source = entry
-    .pending_motion
-    .as_ref()
+  let preparation =
+    entry.motion.as_ref().and_then(MotionOwner::preparation);
+  let retaining_source = preparation
     .is_some_and(|motion| motion.retains_source(compositor_frame));
-  if !retaining_source
-    && entry.pending_motion.is_some()
-    && entry.source.is_none()
-  {
+  if !retaining_source && preparation.is_some() && entry.source.is_none() {
     entry.native.present(true)?;
     entry.source = Some(SourceLease::default());
   }
@@ -958,7 +1036,13 @@ fn reconcile_managed(
       || *hide_method == HideMethod::PlaceInCorner);
   let parked =
     hidden_parking || (suppressing && entry.native.uses_parking());
-  let operational_target = if retaining_source {
+  let native_frame = state.animation_manager.native_frame(&id);
+  let operational_target = if let Some(frame) = native_frame {
+    #[cfg(target_os = "windows")]
+    let frame =
+      frame.apply_delta(&window.native_properties().shadow_borders, None);
+    frame
+  } else if retaining_source {
     observed.rect.clone()
   } else if parked {
     let corner =
@@ -1009,13 +1093,10 @@ fn reconcile_managed(
     entry.native.opacity(alpha)?;
     entry.opacity = AppliedOpacity::Value(alpha);
   }
+  let (border, corner) = focus_decorations(window, config);
   let decorations = Decorations {
-    border: effects.border.enabled.then(|| effects.border.color.clone()),
-    corner: if effects.corner_style.enabled {
-      effects.corner_style.style.clone()
-    } else {
-      CornerStyle::Default
-    },
+    border,
+    corner,
     title_bar: intent.and_then(|intent| intent.title_bar).or_else(|| {
       (config
         .value
@@ -1139,7 +1220,7 @@ fn reconcile_managed(
       }
     });
   }
-  if let Some(motion) = &mut entry.pending_motion {
+  if let Some(MotionOwner::Overlay(motion)) = &mut entry.motion {
     motion.observe(
       entry.frame.generation,
       suppressing && converged && !entry.visibility_pending,
@@ -1241,6 +1322,21 @@ fn reconcile_managed(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Native ownership never requests source concealment.
+  #[test]
+  fn native_excludes_cover_readiness() {
+    assert!(MotionOwner::Native.preparation().is_none());
+    let owner = MotionOwner::Overlay(MotionPreparation::new(
+      1,
+      10,
+      Instant::now(),
+      true,
+    ));
+    let preparation = owner.preparation().expect("Overlay preparation.");
+    assert!(preparation.retains_source(10));
+    assert!(!preparation.retains_source(11));
+  }
 
   #[test]
   fn source_concealment_cloaks_regardless_of_hide_method() {

@@ -6,7 +6,7 @@ use windows::{
     Graphics::{
       Dwm::{
         DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
-        DWMWA_CLOAKED, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
+        DWMWA_CLOAKED, DWMWA_COLOR_DEFAULT, DWMWA_EXTENDED_FRAME_BOUNDS,
         DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
         DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
       },
@@ -662,9 +662,11 @@ impl NativeWindow {
     &self,
     color: Option<&Color>,
   ) -> crate::Result<()> {
+    // No requested color restores the system border, never removes
+    // it. `DWMWA_COLOR_NONE` would strip a border the window owns.
     let bgr = match color {
       Some(color) => color.to_bgr(),
-      None => DWMWA_COLOR_NONE,
+      None => DWMWA_COLOR_DEFAULT,
     };
 
     unsafe {

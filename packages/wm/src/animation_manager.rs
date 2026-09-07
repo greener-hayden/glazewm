@@ -105,6 +105,11 @@ impl AnimationTrigger {
     }
   }
 
+  /// Keeps Windows moves on their native windows.
+  pub fn uses_native(self) -> bool {
+    cfg!(target_os = "windows") && self == Self::WindowMoved
+  }
+
   /// Whether the trigger is one side of a workspace slide.
   #[must_use]
   pub fn is_slide(self) -> bool {
@@ -180,10 +185,18 @@ impl SlideDirection {
   }
 }
 
+/// Selects the owner of animated pixels.
+#[derive(Clone, Debug)]
+enum MotionTarget {
+  Native(u32),
+  Overlay,
+}
+
 /// Prepared geometry and effect, independent of motion and overlay
 /// lifetime.
 #[derive(Clone, Debug)]
 struct AnimationSpec {
+  target: MotionTarget,
   duration: Duration,
   easing: EasingFunction,
 
@@ -221,6 +234,7 @@ impl AnimationSpec {
     let (start_opacity, target_opacity) = opacity.unzip();
 
     Self {
+      target: MotionTarget::Overlay,
       duration: Duration::from_millis(u64::from(config.duration_ms)),
       easing: config.easing.clone(),
       start_rect,
@@ -271,6 +285,7 @@ impl AnimationSpec {
 /// A released effect owns elapsed time and its native completion signal.
 struct RunningMotion {
   started: Instant,
+  sampled: Duration,
   completed: Arc<AtomicBool>,
 }
 
@@ -378,6 +393,51 @@ impl AnimationManager {
     self.running.contains_key(id)
   }
 
+  /// Samples native motion without writing application geometry.
+  pub fn native_frame(&self, id: &Uuid) -> Option<Rect> {
+    let spec = self.animations.get(id)?;
+    if !matches!(spec.target, MotionTarget::Native(_)) {
+      return None;
+    }
+    let elapsed = self
+      .running
+      .get(id)
+      .map_or(Duration::ZERO, |motion| motion.sampled);
+    Some(spec.rect_at(elapsed))
+  }
+
+  /// Returns the native motion's final visible bounds.
+  pub fn native_target(&self, id: &Uuid) -> Option<&Rect> {
+    let spec = self.animations.get(id)?;
+    matches!(spec.target, MotionTarget::Native(_))
+      .then_some(&spec.target_rect)
+  }
+
+  /// Prepares visible motion without creating a cover.
+  pub fn prepare_native(
+    &mut self,
+    id: Uuid,
+    plan: &AnimationPlan,
+    start: Rect,
+    frame_rate: u32,
+  ) {
+    let mut spec = AnimationSpec::new(
+      start,
+      plan.path.target.clone(),
+      None,
+      plan.effect,
+      false,
+    );
+    spec.target = MotionTarget::Native(frame_rate);
+    self.running.remove(&id);
+    self.pending_starts.retain(|pending| *pending != id);
+    self.pending_captures.remove(&id);
+    self.failed_updates.remove(&id);
+    self.animations.insert(id, spec);
+    self.release_animation(&id);
+    self.update_clock();
+  }
+
   /// Whether retained visuals still cover a native source.
   pub fn has_overlay(&self, id: &Uuid) -> bool {
     self.windows.contains_key(id)
@@ -470,6 +530,8 @@ impl AnimationManager {
       return Ok(());
     }
 
+    self.sample_frames(Instant::now());
+
     // A completed animation is included, not filtered out. Completion
     // falls between ticks, so skipping it leaves the overlay up to a
     // frame short of the target while the handover puts the real window
@@ -479,10 +541,16 @@ impl AnimationManager {
       .animations
       .iter()
       .filter_map(|(id, anim)| {
-        let elapsed = self.running.get(id)?.started.elapsed();
+        if matches!(anim.target, MotionTarget::Native(_)) {
+          return None;
+        }
+        let elapsed = self.running.get(id)?.sampled;
         Some((*id, anim.rect_at(elapsed), anim.opacity_at(elapsed)))
       })
       .collect::<Vec<_>>();
+    if rects.is_empty() {
+      return Ok(());
+    }
 
     let mut failed = HashSet::new();
     self
@@ -518,6 +586,13 @@ impl AnimationManager {
     self.failed_updates.extend(failed);
 
     Ok(())
+  }
+
+  /// Advances samples only on animation ticks.
+  fn sample_frames(&mut self, now: Instant) {
+    for motion in self.running.values_mut() {
+      motion.sampled = now.saturating_duration_since(motion.started);
+    }
   }
 
   /// Returns the animation effect config if an animation should be
@@ -857,29 +932,33 @@ impl AnimationManager {
       let completed = Arc::new(AtomicBool::new(false));
       let completion = completed.clone();
       let tick_tx = self.tick_tx.clone();
-      let result = self
-        .windows
-        .get(&window_id)
-        .context("Prepared animation has no overlay.")
-        .and_then(|window| {
-          if AnimationWindow::SELF_ANIMATING {
-            window
-              .window
-              .animate_to(
-                &anim.target_rect,
-                anim.duration,
-                &anim.easing,
-                anim.target_opacity.as_ref(),
-                move || {
-                  completion.store(true, Ordering::Release);
-                  let _ = tick_tx.try_send(FrameSignal::Wake);
-                },
-              )
-              .map_err(Into::into)
-          } else {
-            Ok(())
-          }
-        });
+      let result = if matches!(anim.target, MotionTarget::Native(_)) {
+        Ok(())
+      } else {
+        self
+          .windows
+          .get(&window_id)
+          .context("Prepared animation has no overlay.")
+          .and_then(|window| {
+            if AnimationWindow::SELF_ANIMATING {
+              window
+                .window
+                .animate_to(
+                  &anim.target_rect,
+                  anim.duration,
+                  &anim.easing,
+                  anim.target_opacity.as_ref(),
+                  move || {
+                    completion.store(true, Ordering::Release);
+                    let _ = tick_tx.try_send(FrameSignal::Wake);
+                  },
+                )
+                .map_err(Into::into)
+            } else {
+              Ok(())
+            }
+          })
+      };
       match result {
         Ok(()) => launched.push((window_id, completed)),
         Err(err) => {
@@ -891,11 +970,18 @@ impl AnimationManager {
     // Completion may trail a compositor submission, but must never lead
     // it.
     let started = Instant::now();
-    self.running.extend(
-      launched
-        .into_iter()
-        .map(|(id, completed)| (id, RunningMotion { started, completed })),
-    );
+    self
+      .running
+      .extend(launched.into_iter().map(|(id, completed)| {
+        (
+          id,
+          RunningMotion {
+            started,
+            sampled: Duration::ZERO,
+            completed,
+          },
+        )
+      }));
     self.update_clock();
   }
 
@@ -913,6 +999,12 @@ impl AnimationManager {
       .windows
       .values()
       .map(|overlay| overlay.frame_rate)
+      .chain(self.animations.values().filter_map(
+        |spec| match spec.target {
+          MotionTarget::Native(rate) => Some(rate),
+          MotionTarget::Overlay => None,
+        },
+      ))
       .max()
     else {
       self.clock = None;
@@ -1054,6 +1146,7 @@ mod tests {
       id,
       RunningMotion {
         started,
+        sampled: Duration::ZERO,
         completed: Arc::new(AtomicBool::new(false)),
       },
     );
@@ -1073,6 +1166,7 @@ mod tests {
       id,
       RunningMotion {
         started: Instant::now(),
+        sampled: Duration::ZERO,
         completed: retired_completion.clone(),
       },
     );
@@ -1083,6 +1177,7 @@ mod tests {
       id,
       RunningMotion {
         started: Instant::now(),
+        sampled: Duration::ZERO,
         completed: current_completion.clone(),
       },
     );
@@ -1156,6 +1251,106 @@ mod tests {
     );
     assert_eq!(entering.target, tile);
     assert_eq!(entering.opacity, None);
+  }
+
+  /// Only Windows moves bypass proxy rendering.
+  #[test]
+  fn native_trigger_policy() {
+    assert_eq!(
+      AnimationTrigger::WindowMoved.uses_native(),
+      cfg!(target_os = "windows")
+    );
+    assert!(!AnimationTrigger::WindowOpened.uses_native());
+    for direction in [SlideDirection::Left, SlideDirection::Right] {
+      assert!(
+        !AnimationTrigger::WorkspaceEntering(direction).uses_native()
+      );
+      assert!(!AnimationTrigger::WorkspaceLeaving(direction).uses_native());
+    }
+  }
+
+  /// Creates a move plan without platform resources.
+  fn move_plan(
+    effect: &AnimationEffectConfig,
+    target: Rect,
+  ) -> AnimationPlan<'_> {
+    AnimationPlan {
+      effect,
+      trigger: AnimationTrigger::WindowMoved,
+      path: AnimationPath {
+        start: None,
+        target,
+        opacity: None,
+      },
+    }
+  }
+
+  /// Native moves need clocks, never covers.
+  #[test]
+  fn native_motion_lifecycle() {
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let effect = AnimationEffectConfig::default();
+    let initial = Rect::from_xy(-800, 50, 400, 300);
+    let target = Rect::from_xy(200, 100, 600, 400);
+    let plan = move_plan(&effect, target.clone());
+    manager.prepare_native(id, &plan, initial.clone(), 144);
+    assert_eq!(manager.native_frame(&id), Some(initial.clone()));
+    assert_eq!(manager.native_target(&id), Some(&target));
+    assert!(!manager.is_running(&id));
+    assert!(!manager.has_overlays());
+    assert!(manager.context.is_none());
+    assert_eq!(manager.clock.as_ref().map(|(rate, _)| *rate), Some(144));
+    manager.begin_pending();
+    assert!(manager.is_running(&id));
+    assert!(manager.take_failures().is_empty());
+    let started = manager.running[&id].started;
+    let duration = manager.animations[&id].duration;
+    assert_eq!(manager.native_frame(&id), Some(initial));
+    manager.sample_frames(started + duration / 2);
+    let middle = manager.native_frame(&id).expect("Native frame.");
+    assert_ne!(middle, target);
+    assert_eq!(manager.native_frame(&id), Some(middle));
+    manager.sample_frames(started + duration);
+    assert_eq!(manager.native_frame(&id), Some(target));
+    manager.finish_animation(&id).expect("Motion cleanup.");
+    assert!(manager.native_frame(&id).is_none());
+    assert!(manager.native_target(&id).is_none());
+    assert!(!manager.is_running(&id));
+    assert!(manager.clock.is_none());
+  }
+
+  /// Retargeting starts from observed native geometry.
+  #[test]
+  fn native_retarget_uses_observation() {
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let effect = AnimationEffectConfig::default();
+    let plan = move_plan(&effect, Rect::from_xy(200, 100, 600, 400));
+    manager.prepare_native(id, &plan, Rect::from_xy(0, 0, 400, 300), 60);
+    manager.begin_pending();
+    let observed = Rect::from_xy(37, 14, 420, 310);
+    let replacement =
+      move_plan(&effect, Rect::from_xy(-500, -200, 300, 200));
+    manager.prepare_native(id, &replacement, observed.clone(), 120);
+    assert_eq!(manager.native_frame(&id), Some(observed));
+    assert_eq!(manager.native_target(&id), Some(&replacement.path.target));
+    assert!(!manager.is_running(&id));
+    assert_eq!(manager.pending_starts, vec![id]);
+    manager.finish_animation(&id).expect("Cancellation.");
+    manager.begin_pending();
+    assert!(!manager.is_animating(&id));
+    assert!(manager.clock.is_none());
+  }
+
+  /// Overlay geometry never becomes native placement.
+  #[test]
+  fn overlay_excludes_native_frames() {
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    manager.animations.insert(id, test_spec());
+    assert!(manager.native_frame(&id).is_none());
+    assert!(manager.native_target(&id).is_none());
   }
 
   #[test]

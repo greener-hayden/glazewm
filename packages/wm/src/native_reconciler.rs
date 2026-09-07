@@ -478,6 +478,27 @@ mod tests {
     assert_eq!(sync.deadline(), None);
   }
 
+  /// Drift after convergence spends the same bounded budget.
+  #[test]
+  fn budgets_drift_after_convergence() {
+    let (mut sync, mut observed) = fixture();
+    let now = Instant::now();
+    assert!(sync.next(&observed, now).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+    observed.rect.right += 100;
+    let mut writes = 0;
+    for step in 1..=MAX_ATTEMPTS + 2 {
+      let at = now + RETRY_WAIT * u32::from(step);
+      if let Some(request) = sync.next(&observed, at) {
+        sync.accepted(&request, at);
+        writes += 1;
+      }
+    }
+    assert_eq!(writes, MAX_ATTEMPTS);
+    assert_eq!(sync.phase, ReconcilePhase::Failed);
+    assert_eq!(sync.deadline(), None);
+  }
+
   /// Never positions natively minimized windows.
   #[test]
   fn respects_minimized_state() {

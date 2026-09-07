@@ -425,28 +425,36 @@ fn put_property(
   Ok(())
 }
 
+/// Reads the home rect recorded before parking.
+fn parked_home(
+  window: &NativeWindow,
+  changes: isize,
+) -> crate::Result<Option<Rect>> {
+  if changes & PARKED == 0 || window.is_minimized()? {
+    return Ok(None);
+  }
+  let [left, top, right, bottom] =
+    FRAME.map(|key| i32::try_from(property(window, key)));
+  Ok(Some(Rect::from_ltrb(left?, top?, right?, bottom?)))
+}
+
 /// Restores exclusively tagged WM changes.
+///
+/// Concealment is lifted before placement settles. Placement writes are
+/// asynchronous, so the first attempt almost always reports a pending
+/// frame; returning early with the window still cloaked or transparent
+/// strands it invisible whenever no caller retries. A misplaced window
+/// is recoverable by the user, an unseen one is not.
 fn recover_window(window: &NativeWindow) -> crate::Result<()> {
   if property(window, OWNER) == 0 {
     return Ok(());
   }
   let changes = property(window, CHANGES);
-  if changes & PARKED != 0 && !window.is_minimized()? {
-    let coordinates = FRAME
-      .map(|key| i32::try_from(property(window, key)))
-      .into_iter()
-      .collect::<Result<Vec<_>, _>>()?;
-    let target = Rect::from_ltrb(
-      coordinates[0],
-      coordinates[1],
-      coordinates[2],
-      coordinates[3],
-    );
-    if window.frame_with_shadows()? != target {
-      window.set_frame(&target)?;
-      return Err(crate::Error::Platform(
-        "Window recovery pending.".into(),
-      ));
+  // Start the move first, so concealment lifts over a travelling window.
+  let home = parked_home(window, changes)?;
+  if let Some(target) = &home {
+    if window.frame_with_shadows()? != *target {
+      window.set_frame(target)?;
     }
   }
   if changes & CLOAK != 0 && window.inner.is_cloaked()? {
@@ -465,6 +473,14 @@ fn recover_window(window: &NativeWindow) -> crate::Result<()> {
   }
   if changes & TITLE != 0 {
     window.set_title_bar_visibility(changes & ORIGINAL_TITLE != 0)?;
+  }
+  // Retain the recovery record until the window reaches its home.
+  if let Some(target) = &home {
+    if window.frame_with_shadows()? != *target {
+      return Err(crate::Error::Platform(
+        "Window recovery pending.".into(),
+      ));
+    }
   }
   for key in FRAME.into_iter().chain([CHANGES, OWNER]) {
     // SAFETY: Removes only our named properties.

@@ -20,6 +20,36 @@ use crate::{
   traits::TilingSizeGetters,
 };
 
+#[cfg(test)]
+mod tests {
+  /// Mock displays clone and drop without resources.
+  #[test]
+  fn mock_display_lifetime() {
+    let cloned = {
+      let display = wm_platform::Display::mock();
+      let cloned = display.clone();
+      assert_eq!(display.id(), cloned.id());
+      cloned
+    };
+    assert_eq!(cloned.id().0, 0);
+    #[cfg(target_os = "macos")]
+    {
+      assert!(matches!(
+        cloned.name(),
+        Err(wm_platform::Error::DisplayNotFound)
+      ));
+      assert!(matches!(
+        cloned.working_area(),
+        Err(wm_platform::Error::DisplayNotFound)
+      ));
+      assert!(matches!(
+        cloned.scale_factor(),
+        Err(wm_platform::Error::DisplayNotFound)
+      ));
+    }
+  }
+}
+
 pub const MOCK_MONITOR_WIDTH: i32 = 1680;
 pub const MOCK_MONITOR_HEIGHT: i32 = 1050;
 pub const MOCK_TASKBAR_HEIGHT: i32 = 50;

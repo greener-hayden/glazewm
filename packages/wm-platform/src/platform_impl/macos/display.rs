@@ -19,7 +19,10 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct Display {
   cg_display_id: CGDirectDisplayID,
+  #[cfg(not(feature = "test_utils"))]
   ns_screen: Arc<ThreadBound<Retained<NSScreen>>>,
+  #[cfg(feature = "test_utils")]
+  ns_screen: Option<Arc<ThreadBound<Retained<NSScreen>>>>,
 }
 
 impl Display {
@@ -39,10 +42,41 @@ impl Display {
       })?
       .ok_or(crate::Error::DisplayNotFound)?;
 
+    let ns_screen = Arc::new(ns_screen);
+    #[cfg(feature = "test_utils")]
+    let ns_screen = Some(ns_screen);
     Ok(Self {
       cg_display_id,
-      ns_screen: Arc::new(ns_screen),
+      ns_screen,
     })
+  }
+
+  /// Creates screenless displays for geometry tests.
+  #[cfg(feature = "test_utils")]
+  pub(crate) fn mock() -> Self {
+    Self {
+      cg_display_id: 0,
+      ns_screen: None,
+    }
+  }
+
+  /// Rejects native access on screenless test displays.
+  #[cfg_attr(
+    not(feature = "test_utils"),
+    allow(clippy::unnecessary_wraps)
+  )]
+  fn screen(&self) -> crate::Result<&ThreadBound<Retained<NSScreen>>> {
+    #[cfg(not(feature = "test_utils"))]
+    {
+      Ok(&self.ns_screen)
+    }
+    #[cfg(feature = "test_utils")]
+    {
+      self
+        .ns_screen
+        .as_deref()
+        .ok_or(crate::Error::DisplayNotFound)
+    }
   }
 
   /// Implements [`Display::id`].
@@ -52,7 +86,7 @@ impl Display {
 
   /// Implements [`Display::name`].
   pub(crate) fn name(&self) -> crate::Result<String> {
-    self.ns_screen.with(|screen| {
+    self.screen()?.with(|screen| {
       let name = screen.localizedName();
       Ok(name.to_string())
     })?
@@ -74,6 +108,7 @@ impl Display {
 
   /// Implements [`Display::working_area`].
   pub(crate) fn working_area(&self) -> crate::Result<Rect> {
+    let screen = self.screen()?;
     let primary_display_bounds = {
       let bounds = CGDisplayBounds(CGMainDisplayID());
 
@@ -86,7 +121,7 @@ impl Display {
       )
     };
 
-    self.ns_screen.with(|screen| {
+    screen.with(|screen| {
       // Convert `NSScreen::visibleFrame` into the same coordinate space as
       // `CGDisplayBounds`.
       Ok(
@@ -100,7 +135,7 @@ impl Display {
   pub(crate) fn scale_factor(&self) -> crate::Result<f32> {
     #[allow(clippy::cast_possible_truncation)]
     self
-      .ns_screen
+      .screen()?
       .with(|screen| screen.backingScaleFactor() as f32)
   }
 
@@ -153,7 +188,7 @@ impl Display {
 
   /// Implements [`DisplayExtMacOs::ns_screen`].
   pub(crate) fn ns_screen(&self) -> &ThreadBound<Retained<NSScreen>> {
-    &self.ns_screen
+    self.screen().expect("Native screen unavailable.")
   }
 }
 

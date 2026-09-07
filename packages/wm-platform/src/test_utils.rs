@@ -69,17 +69,14 @@ impl NativeWindow {
 }
 
 impl Display {
-  /// Creates a mock `Display` for use in tests.
-  ///
-  /// Calling any methods on the mock is undefined behavior and may panic.
+  /// Creates a display without native resources.
   #[must_use]
   pub fn mock() -> Self {
     Self {
       #[cfg(target_os = "windows")]
       inner: platform_impl::Display::new(0),
       #[cfg(target_os = "macos")]
-      #[allow(invalid_value)]
-      inner: unsafe { std::mem::zeroed() },
+      inner: platform_impl::Display::mock(),
     }
   }
 }

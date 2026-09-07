@@ -137,8 +137,10 @@ impl WindowListener {
         && crate::opening_windows::enabled()
         && !CONCEALING.with(Cell::get)
       {
-        // Shell COM calls can dispatch nested WinEvents. Forward those
-        // events without recursively borrowing the shell connection.
+        // Concealment itself now runs on its own thread, so the shell is
+        // no longer called from here. The guard stays because a nested
+        // WinEvent arriving mid-claim would still reserve the same window
+        // twice, and the second claim would take ownership from the first.
         CONCEALING.with(|busy| busy.set(true));
         let window = NativeWindow::new(handle.0);
         // Only ordinary top-level application windows are candidates.

@@ -24,6 +24,8 @@ mod placement_session;
 mod platform_event;
 mod platform_impl;
 mod single_instance;
+#[cfg(feature = "test_utils")]
+pub mod test_utils;
 mod thread_bound;
 mod thumbnail_layout;
 pub use thumbnail_layout::thumbnail_rects;

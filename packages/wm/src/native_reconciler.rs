@@ -20,6 +20,9 @@ pub struct DesiredFrame {
   pub monitor: Rect,
   pub dpi: u32,
   pub state: NativeState,
+  /// Pixels the platform may pull a parked target back toward its
+  /// display. `None` when the target is not parked.
+  pub parking_clamp: Option<i32>,
 }
 
 /// Contains observations, not accepted requests.
@@ -277,8 +280,13 @@ impl FrameReconciler {
         }
       }
       (NativeState::Normal, NativeState::Normal) => {
-        (!frames_match(&self.desired.rect, &observed.rect)
-          || self.desired.dpi != observed.dpi)
+        let placed = match self.desired.parking_clamp {
+          Some(clamp) => {
+            parked_frames_match(&self.desired.rect, &observed.rect, clamp)
+          }
+          None => frames_match(&self.desired.rect, &observed.rect),
+        };
+        (!placed || self.desired.dpi != observed.dpi)
           .then(|| NativeMutation::Frame(self.desired.rect.clone()))
       }
     }
@@ -339,6 +347,22 @@ pub fn frames_match(desired: &Rect, observed: &Rect) -> bool {
   .all(|difference| difference <= 1)
 }
 
+/// Compares a parked frame, letting the platform pull its top edge back
+/// toward the display by up to `clamp` pixels.
+///
+/// Horizontal position and size still match within 1px.
+pub fn parked_frames_match(
+  desired: &Rect,
+  observed: &Rect,
+  clamp: i32,
+) -> bool {
+  let lift = desired.top - observed.top;
+  desired.left.abs_diff(observed.left) <= 1
+    && desired.width().abs_diff(observed.width()) <= 1
+    && desired.height().abs_diff(observed.height()) <= 1
+    && (-1..=clamp).contains(&lift)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -352,6 +376,7 @@ mod tests {
         monitor: Rect::from_xy(0, 0, 1920, 1080),
         dpi: 96,
         state: NativeState::Normal,
+        parking_clamp: None,
       }),
       ObservedFrame {
         rect,
@@ -550,5 +575,47 @@ mod tests {
     assert_eq!(sync.constraint(&observed, Some((700, 300)), at), None);
     observed.dpi = 144;
     assert_eq!(sync.constraint(&observed, Some((500, 300)), at), None);
+  }
+
+  /// Creates a target parked below a 1080px display, with its clamp.
+  fn parked_fixture(clamp: i32) -> (FrameReconciler, ObservedFrame) {
+    let (mut sync, mut observed) = fixture();
+    sync.desired.rect = Rect::from_xy(-399, 1079, 400, 300);
+    sync.desired.parking_clamp = Some(clamp);
+    observed.rect = sync.desired.rect.clone();
+    (sync, observed)
+  }
+
+  /// Accepts a parked window the platform held below its title bar.
+  #[test]
+  fn converges_on_clamped_parking() {
+    let (mut sync, mut observed) = parked_fixture(55);
+    observed.rect = observed.rect.translate_to_coordinates(-399, 1027);
+    assert!(sync.next(&observed, Instant::now()).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+  }
+
+  /// Still corrects a parked window lifted beyond the clamp.
+  #[test]
+  fn rejects_parking_beyond_clamp() {
+    let (mut sync, mut observed) = parked_fixture(55);
+    observed.rect = observed.rect.translate_to_coordinates(-399, 1020);
+    assert!(sync.next(&observed, Instant::now()).is_some());
+  }
+
+  /// The clamp is vertical only; horizontal drift is still corrected.
+  #[test]
+  fn rejects_parked_horizontal_drift() {
+    let (mut sync, mut observed) = parked_fixture(55);
+    observed.rect = observed.rect.translate_to_coordinates(-390, 1079);
+    assert!(sync.next(&observed, Instant::now()).is_some());
+  }
+
+  /// Without a clamp, parking matches as exactly as any other frame.
+  #[test]
+  fn exact_parking_without_clamp() {
+    let (mut sync, mut observed) = parked_fixture(0);
+    observed.rect = observed.rect.translate_to_coordinates(-399, 1060);
+    assert!(sync.next(&observed, Instant::now()).is_some());
   }
 }

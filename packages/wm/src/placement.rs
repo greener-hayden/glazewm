@@ -670,12 +670,14 @@ fn desired_frame(
   target: &Rect,
   monitor: &NativeMonitorProperties,
   state: NativeState,
+  parked: bool,
 ) -> anyhow::Result<DesiredFrame> {
   Ok(DesiredFrame {
     rect: target.clone(),
     monitor: monitor.bounds.clone(),
     dpi: native.expected_dpi(monitor.dpi)?,
     state,
+    parking_clamp: parked.then_some(PlacementSession::PARKING_CLAMP),
   })
 }
 
@@ -824,7 +826,8 @@ fn reconcile_window(
     );
     let native = PlacementSession::new(window.native().clone(), token)?;
     let desired =
-      match desired_frame(&native, &target, &monitor, native_state) {
+      match desired_frame(&native, &target, &monitor, native_state, false)
+      {
         Ok(desired) => desired,
         Err(err) => {
           let _ = native.release();
@@ -1037,26 +1040,27 @@ fn reconcile_managed(
   let parked =
     hidden_parking || (suppressing && entry.native.uses_parking());
   let native_frame = state.animation_manager.native_frame(&id);
-  let operational_target = if let Some(frame) = native_frame {
+  let (operational_target, parking) = if let Some(frame) = native_frame {
     #[cfg(target_os = "windows")]
     let frame =
       frame.apply_delta(&window.native_properties().shadow_borders, None);
-    frame
+    (frame, false)
   } else if retaining_source {
-    observed.rect.clone()
+    (observed.rect.clone(), false)
   } else if parked {
     let corner =
       parking_rect(&observed.rect, &monitor.working_area, hide_corner);
     entry.native.remember_restore(target)?;
-    corner
+    (corner, true)
   } else {
-    target.clone()
+    (target.clone(), false)
   };
   let desired = desired_frame(
     &entry.native,
     &operational_target,
     &monitor,
     native_state,
+    parking,
   )?;
   if entry.frame.desired.dpi != desired.dpi {
     window
@@ -1236,9 +1240,10 @@ fn reconcile_managed(
     && !dragging
     && entry.frame.phase == ReconcilePhase::Failed
     && entry.native.uses_parking()
-    && crate::native_reconciler::frames_match(
-      &observed.rect,
+    && crate::native_reconciler::parked_frames_match(
       &parking_rect(&observed.rect, &monitor.working_area, hide_corner),
+      &observed.rect,
+      PlacementSession::PARKING_CLAMP,
     )
   {
     anyhow::bail!("Source restoration remains parked.");

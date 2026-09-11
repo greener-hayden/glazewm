@@ -236,6 +236,18 @@ impl PlacementSession {
     }
   }
 
+  /// Pixels the platform may pull a parked window's top edge back toward
+  /// its display.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: `0`; parked frames are placed exactly.
+  /// - macOS: the tallest title bar (up to 52px). The window server keeps
+  ///   a title bar inside the working area, so a window parked below it
+  ///   stops short by that bar's height.
+  pub const PARKING_CLAMP: i32 =
+    if cfg!(target_os = "macos") { 55 } else { 0 };
+
   /// Reports whether source suppression requires temporary placement.
   #[must_use]
   pub fn uses_parking(&self) -> bool {

@@ -777,36 +777,41 @@ impl AnimationWindow {
   }
 
   /// Implements [`AnimationWindow::destroy`].
+  ///
+  /// Every step runs even when an earlier one fails. A source destroyed
+  /// mid-animation has already taken its thumbnail with it, so
+  /// unregistering fails, and stopping there leaked the overlay window
+  /// for good. Handles are cleared before the dispatch: a dispatch that
+  /// times out still runs, so nothing is left to retry.
   pub(crate) fn destroy(&mut self) -> crate::Result<()> {
-    let companions = self
-      .companions
-      .get_mut()
-      .unwrap_or_else(PoisonError::into_inner);
-    if !companions.registered.is_empty() {
-      let mut registered = std::mem::take(&mut companions.registered);
-      self.dispatcher.dispatch_sync(move || {
-        for companion in &mut registered {
-          companion.unregister();
-        }
-      })?;
+    let mut registered = std::mem::take(
+      &mut self
+        .companions
+        .get_mut()
+        .unwrap_or_else(PoisonError::into_inner)
+        .registered,
+    );
+    let thumbnail = std::mem::take(&mut self.thumbnail);
+    let handle = std::mem::take(&mut self.handle);
+    if registered.is_empty() && thumbnail == 0 && handle == 0 {
+      return Ok(());
     }
-    if self.thumbnail != 0 {
-      let thumbnail = self.thumbnail;
-      self.dispatcher.dispatch_sync(move || {
+    self.dispatcher.dispatch_sync(move || {
+      for companion in &mut registered {
+        companion.unregister();
+      }
+      if thumbnail != 0 {
         // SAFETY: Unregisters our still-owned thumbnail.
-        unsafe { DwmUnregisterThumbnail(thumbnail) }
-      })??;
-      self.thumbnail = 0;
-    }
-    if self.handle != 0 {
-      let handle = HWND(self.handle);
-      self.dispatcher.dispatch_sync(move || {
+        if let Err(err) = unsafe { DwmUnregisterThumbnail(thumbnail) } {
+          tracing::debug!("Overlay thumbnail release failed: {err}");
+        }
+      }
+      if handle != 0 {
         // SAFETY: Destroys our still-owned window.
-        unsafe { DestroyWindow(handle) }
-      })??;
-      self.handle = 0;
-    }
-    Ok(())
+        unsafe { DestroyWindow(HWND(handle)) }?;
+      }
+      Ok(())
+    })?
   }
 
   /// Reads the source's invisible frame insets, in source coordinates.
@@ -1142,29 +1147,32 @@ impl CompanionOverlay {
   }
 
   /// Implements [`CompanionOverlay::destroy`].
+  ///
+  /// Releases everything in one dispatch, as `AnimationWindow::destroy`
+  /// does.
   pub(crate) fn destroy(&mut self) -> crate::Result<()> {
-    let companions = &mut self
-      .state
-      .get_mut()
-      .unwrap_or_else(PoisonError::into_inner)
-      .companions;
-    if !companions.registered.is_empty() {
-      let mut registered = std::mem::take(&mut companions.registered);
-      self.dispatcher.dispatch_sync(move || {
-        for companion in &mut registered {
-          companion.unregister();
-        }
-      })?;
+    let mut registered = std::mem::take(
+      &mut self
+        .state
+        .get_mut()
+        .unwrap_or_else(PoisonError::into_inner)
+        .companions
+        .registered,
+    );
+    let handle = std::mem::take(&mut self.handle);
+    if registered.is_empty() && handle == 0 {
+      return Ok(());
     }
-    if self.handle != 0 {
-      let handle = HWND(self.handle);
-      self.dispatcher.dispatch_sync(move || {
+    self.dispatcher.dispatch_sync(move || {
+      for companion in &mut registered {
+        companion.unregister();
+      }
+      if handle != 0 {
         // SAFETY: Destroys our still-owned window.
-        unsafe { DestroyWindow(handle) }
-      })??;
-      self.handle = 0;
-    }
-    Ok(())
+        unsafe { DestroyWindow(HWND(handle)) }?;
+      }
+      Ok(())
+    })?
   }
 }
 

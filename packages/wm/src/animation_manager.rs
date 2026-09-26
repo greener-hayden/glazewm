@@ -1020,16 +1020,19 @@ impl AnimationManager {
   /// Retires visuals only after successful handoff.
   ///
   /// Also retires the window's companion overlay, which a released
-  /// window no longer needs.
+  /// window no longer needs. The overlay is forgotten before its native
+  /// teardown, so a failed teardown is reported once rather than leaving
+  /// an overlay the frame clock redraws, and fails to, every frame.
   pub fn retire_overlay(&mut self, id: &Uuid) -> anyhow::Result<()> {
-    self.retire_decoration(id)?;
-    if let Some(overlay) = self.windows.get_mut(id) {
-      overlay.window.destroy()?;
-    }
-    self.windows.remove(id);
+    let decoration = self.retire_decoration(id);
+    let overlay = self.windows.remove(id);
     self.clear_motion(id);
     self.pending_captures.remove(id);
     self.failed_updates.remove(id);
+    decoration?;
+    if let Some(mut overlay) = overlay {
+      overlay.window.destroy()?;
+    }
     Ok(())
   }
 

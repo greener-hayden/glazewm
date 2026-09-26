@@ -127,9 +127,9 @@ pub fn move_window_to_workspace(
       state.pending_sync.queue_focus_change();
     }
 
-    match window {
+    match &window {
       WindowContainer::NonTilingWindow(_) => {
-        state.pending_sync.queue_container_to_redraw(window);
+        state.pending_sync.queue_container_to_redraw(window.clone());
       }
       WindowContainer::TilingWindow(_) => {
         state
@@ -137,6 +137,11 @@ pub fn move_window_to_workspace(
           .queue_containers_to_redraw(current_workspace.tiling_children())
           .queue_containers_to_redraw(target_workspace.tiling_children());
       }
+    }
+
+    if current_workspace.is_displayed() && !target_workspace.is_displayed()
+    {
+      state.pending_sync.queue_sent_window(window);
     }
 
     state

@@ -36,7 +36,12 @@ pub fn handle_window_moved_or_resized(
   let found_window = state.window_from_native(native_window);
 
   if let Some(window) = found_window {
-    state.native_sync.observe(window.id());
+    // Every frame tick reconciles a window whose presentation the clock
+    // drives. Native motion echoes each of its own writes, and queueing a
+    // commit for each echo doubled the commits per frame.
+    if !state.animation_manager.drives_frames(&window.id()) {
+      state.native_sync.observe(window.id());
+    }
     let old_frame_position = window.native_properties().frame;
     let frame_position = try_warn!(window.native().frame());
 

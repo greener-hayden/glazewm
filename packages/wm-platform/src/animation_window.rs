@@ -18,6 +18,17 @@ impl AnimationContext {
     Ok(Self { inner })
   }
 
+  /// Whether [`AnimationContext::capture_frame`] does real work.
+  ///
+  /// When `false`, a capture returns at once and callers gain nothing
+  /// from running captures in parallel.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: `true`; each capture is a screenshot.
+  /// - Windows: `false`; each capture is a token.
+  pub const CAPTURE_BLOCKS: bool = cfg!(target_os = "macos");
+
   /// Captures a frame of `window` for use in an [`AnimationWindow`].
   ///
   /// The capture is taken from the window's own surface, so the overlay
@@ -122,6 +133,29 @@ impl AnimationWindow {
     Ok(Self { inner })
   }
 
+  /// Whether the window's bounds already enclose `rect`.
+  ///
+  /// A resize moves the window, while its content is placed relative to
+  /// it, and the two changes do not land in the same compositor frame.
+  /// Callers skip a resize that is not needed so content never draws for
+  /// a frame against the wrong origin.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: always `false`, so callers keep resizing as before.
+  #[must_use]
+  pub fn covers(&self, rect: &Rect) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.covers(rect)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = rect;
+      false
+    }
+  }
+
   /// Resizes the window.
   ///
   /// Called when an animation's target rect changes mid-flight.
@@ -133,6 +167,12 @@ impl AnimationWindow {
   ///
   /// Does not commit; should be called within
   /// `AnimationContext::transaction` for the change to take effect.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: also moves the source's companions by the same transform,
+  ///   in the same compositor frame, and searches for companions while
+  ///   none are found. A failing companion never fails the update.
   pub fn update(
     &self,
     inner_rect: &Rect,
@@ -222,8 +262,144 @@ impl AnimationWindow {
     }
   }
 
+  /// Whether every companion the overlay draws shows itself again.
+  ///
+  /// A companion is a window of another process that decorates the
+  /// source, such as a border ring. At the reveal the overlay is held
+  /// until this is `true`, so the decoration is never missing for a
+  /// frame. Also `true` when there are no companions.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: always `true`; the platform has no companions.
+  /// - Windows: `true` once every companion reports `DWMWA_CLOAKED` as 0
+  ///   or is gone.
+  #[must_use]
+  pub fn companions_revealed(&self) -> bool {
+    self.inner.companions_revealed()
+  }
+
   /// Destroys the window and releases GPU resources.
   pub fn destroy(&mut self) -> crate::Result<()> {
     self.inner.destroy()
+  }
+}
+
+/// Draws a window's companions above it while the WM moves the real
+/// window.
+///
+/// A companion is a window of another process that decorates the source,
+/// such as a border ring. The source's own pixels are real during native
+/// motion, so this draws only its companions, as thumbnails in a
+/// transparent window directly above the source in the z-order. Each
+/// companion's rect and the source's rect are recorded when the overlay
+/// is created. Every update anchors each recorded companion edge to the
+/// nearer edge of the frame the WM has just requested, so a band keeps
+/// its thickness and stretches with the window.
+///
+/// Callers issue [`CompanionOverlay::update`] straight after each native
+/// move request for the source, so the decoration follows the requests
+/// instead of trailing the move events.
+///
+/// # Platform-specific
+///
+/// - macOS: never created; the platform has no companions.
+pub struct CompanionOverlay {
+  #[cfg(target_os = "windows")]
+  inner: platform_impl::CompanionOverlay,
+}
+
+impl CompanionOverlay {
+  /// Creates an overlay for the companions of `window`, drawn where they
+  /// stand, within `outer_rect`.
+  ///
+  /// Returns `None` when the window has no companions, so a window
+  /// without them costs only the shared companion search.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: always `None`.
+  /// - Windows: also `None` for a topmost window, whose band the overlay
+  ///   may not join.
+  pub fn new(
+    window: &NativeWindow,
+    outer_rect: &Rect,
+    dispatcher: &Dispatcher,
+  ) -> crate::Result<Option<Self>> {
+    #[cfg(target_os = "windows")]
+    {
+      Ok(
+        platform_impl::CompanionOverlay::new(
+          window, outer_rect, dispatcher,
+        )?
+        .map(|inner| Self { inner }),
+      )
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = (window, outer_rect, dispatcher);
+      Ok(None)
+    }
+  }
+
+  /// Grows the overlay to enclose `outer_rect` if it does not already,
+  /// and restacks it directly above its source.
+  ///
+  /// Called when the source's motion is retargeted. The recorded
+  /// companion rects are kept, so the decoration does not jump.
+  pub fn retarget(&mut self, outer_rect: &Rect) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.retarget(outer_rect)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = outer_rect;
+      Ok(())
+    }
+  }
+
+  /// Draws every companion anchored to `frame`, the source's window rect
+  /// as just requested.
+  ///
+  /// Companions that are gone or fail are dropped; neither fails the
+  /// update.
+  pub fn update(&self, frame: &Rect) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.update(frame)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = frame;
+      Ok(())
+    }
+  }
+
+  /// Whether every companion the overlay draws shows itself again.
+  ///
+  /// `true` once every companion reports `DWMWA_CLOAKED` as 0 or is gone.
+  #[must_use]
+  pub fn companions_revealed(&self) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.companions_revealed()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      true
+    }
+  }
+
+  /// Destroys the overlay and releases its thumbnails.
+  pub fn destroy(&mut self) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.destroy()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      Ok(())
+    }
   }
 }

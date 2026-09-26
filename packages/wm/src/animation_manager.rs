@@ -10,12 +10,16 @@ use std::{
 use anyhow::Context;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use wm_common::{AnimationEffectConfig, AnimationsConfig, WindowState};
+use wm_common::{
+  AnimationEffectConfig, AnimationsConfig, WindowMoveAnimationConfig,
+  WindowState,
+};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
-  AnimationCapture, AnimationContext, AnimationWindow, Dispatcher,
-  EasingFunction, FrameClock, FrameSignal, OpacityValue, Rect, WindowId,
+  AnimationCapture, AnimationContext, AnimationWindow, CompanionOverlay,
+  Dispatcher, EasingFunction, FrameClock, FrameSignal, NativeWindow,
+  OpacityValue, Rect, Spring, SpringState, WindowId,
 };
 
 use crate::{
@@ -31,11 +35,33 @@ use crate::{
 /// distortion.
 const OPEN_START_SCALE: f32 = 0.94;
 
+/// Distinct steps of an 8-bit alpha channel.
+///
+/// A spring measures opacity in these steps, so its 0.5 px settle
+/// tolerance becomes half an alpha step, below what a display shows.
+const ALPHA_STEPS: f64 = 255.0;
+
+/// How far an overlay extends past its path so companion thumbnails that
+/// reach outside the window's frame are not clipped.
+///
+/// A border ring reaches a few pixels out at 100% and about three times
+/// that at 200% with a thick stroke. The overlay has no redirection
+/// bitmap, so the transparent margin costs nothing to compose.
+#[cfg(target_os = "windows")]
+const COMPANION_MARGIN_PX: i32 = 32;
+
+/// Velocity of each rect edge, in px per second, ordered left, top,
+/// right, bottom.
+type EdgeVelocity = [f64; 4];
+
 /// Platform-neutral policy describing why a window changes presentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnimationTrigger {
   WindowOpened,
   WindowMoved,
+  /// A visible window sent to a hidden workspace. It fades out where it
+  /// stands and is hidden once the fade ends, as a leaving slide is.
+  WindowSent,
   /// A window arriving with the workspace being switched to. It starts
   /// one screen away, on the side it is travelling from.
   WorkspaceEntering(SlideDirection),
@@ -51,7 +77,7 @@ impl AnimationTrigger {
     skip: bool,
     slide: Option<SlideDirection>,
     visible: bool,
-    opening: bool,
+    change: WindowChange,
   ) -> Option<Self> {
     if skip {
       None
@@ -62,8 +88,8 @@ impl AnimationTrigger {
         Self::WorkspaceLeaving(direction)
       })
     } else if !visible {
-      None
-    } else if opening {
+      (change == WindowChange::Sent).then_some(Self::WindowSent)
+    } else if change == WindowChange::Opened {
       Some(Self::WindowOpened)
     } else {
       Some(Self::WindowMoved)
@@ -102,6 +128,13 @@ impl AnimationTrigger {
         target: target.clone(),
         opacity: None,
       },
+      // `target` is where the window stands, not its new tile, which is
+      // on a workspace nobody can see.
+      Self::WindowSent => AnimationPath {
+        start: Some(target.clone()),
+        target: target.clone(),
+        opacity: Some((OpacityValue(1.0), OpacityValue(0.0))),
+      },
     }
   }
 
@@ -115,6 +148,17 @@ impl AnimationTrigger {
   pub fn is_slide(self) -> bool {
     matches!(self, Self::WorkspaceEntering(_) | Self::WorkspaceLeaving(_))
   }
+}
+
+/// What happened to a window this commit, apart from its geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowChange {
+  /// Newly managed and shown for the first time.
+  Opened,
+  /// Was visible, and now belongs to a hidden workspace.
+  Sent,
+  /// Neither; only its placement may have changed.
+  Placed,
 }
 
 /// The geometry of one window's animation.
@@ -133,6 +177,20 @@ pub struct AnimationPlan<'a> {
   pub effect: &'a AnimationEffectConfig,
   pub trigger: AnimationTrigger,
   pub path: AnimationPath,
+}
+
+/// How a prepared overlay motion begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionStart {
+  /// Holds its start frame until the coordinator releases its batch.
+  Held,
+  /// Starts at once, continuing the motion it replaces.
+  ///
+  /// Only for a cover already presented over a concealed source. Such a
+  /// retarget has no readiness to wait for, and holding it froze a
+  /// running slide for a whole commit: a quick double workspace switch
+  /// stopped for about 30ms before reversing.
+  Immediate,
 }
 
 /// Which way the workspaces travel during a switch.
@@ -185,6 +243,26 @@ impl SlideDirection {
   }
 }
 
+/// Whether moving from `from` to `to` travels far enough to animate.
+///
+/// The distance is the sum of the edge and size differences, in pixels.
+fn exceeds_threshold(
+  from: &Rect,
+  to: &Rect,
+  config: &WindowMoveAnimationConfig,
+) -> bool {
+  let distance = (from.x() - to.x()).abs()
+    + (from.y() - to.y()).abs()
+    + (from.width() - to.width()).abs()
+    + (from.height() - to.height()).abs();
+
+  // TODO: Validate config to only allow pixel values.
+  #[allow(clippy::cast_possible_truncation)]
+  let threshold_px = config.trigger_threshold.amount as i32;
+
+  distance > threshold_px
+}
+
 /// Selects the owner of animated pixels.
 #[derive(Clone, Debug)]
 enum MotionTarget {
@@ -192,13 +270,72 @@ enum MotionTarget {
   Overlay,
 }
 
+/// Returns the edges of `rect`, ordered as in `EdgeVelocity`.
+fn edges(rect: &Rect) -> [i32; 4] {
+  [rect.left, rect.top, rect.right, rect.bottom]
+}
+
+/// Per-edge springs for `easing: spring`, each measured from its target.
+#[derive(Clone, Copy, Debug)]
+struct SpringMotion {
+  spring: Spring,
+  /// Starting state of each edge, ordered as in `EdgeVelocity`.
+  edges: [SpringState; 4],
+  /// Starting opacity state, in alpha steps. Always starts at rest.
+  opacity: SpringState,
+}
+
+impl SpringMotion {
+  /// Creates the springs between two rects and opacities, with each edge
+  /// starting at `velocity`.
+  fn new(
+    spring: Spring,
+    start_rect: &Rect,
+    target_rect: &Rect,
+    opacity: Option<(OpacityValue, OpacityValue)>,
+    velocity: EdgeVelocity,
+  ) -> Self {
+    let (start, target) = (edges(start_rect), edges(target_rect));
+    let edges = std::array::from_fn(|index| SpringState {
+      displacement: f64::from(start[index] - target[index]),
+      velocity: velocity[index],
+    });
+    let opacity = SpringState {
+      displacement: opacity.map_or(0.0, |(start, target)| {
+        f64::from(start.0 - target.0) * ALPHA_STEPS
+      }),
+      velocity: 0.0,
+    };
+
+    Self {
+      spring,
+      edges,
+      opacity,
+    }
+  }
+
+  /// Time until every edge and the opacity have settled.
+  fn settle_time(&self) -> Duration {
+    self
+      .edges
+      .iter()
+      .chain(std::iter::once(&self.opacity))
+      .map(|state| self.spring.settle_time(*state))
+      .max()
+      .unwrap_or(Duration::ZERO)
+  }
+}
+
 /// Prepared geometry and effect, independent of motion and overlay
 /// lifetime.
 #[derive(Clone, Debug)]
 struct AnimationSpec {
   target: MotionTarget,
+  /// Length of the motion. For a spring, its settle time.
   duration: Duration,
   easing: EasingFunction,
+  /// Springs for `easing: spring`, or `None` for a curve easing.
+  spring: Option<SpringMotion>,
 
   /// Start and target positions for the animation.
   start_rect: Rect,
@@ -215,6 +352,12 @@ struct AnimationSpec {
   /// incoming one before vanishing.
   is_slide: bool,
 
+  /// Whether the real window stays where the cover stands until motion
+  /// ends. A window fading out to a hidden workspace would otherwise move
+  /// to its new tile under the cover, and a live thumbnail would stretch
+  /// it to the old frame.
+  holds_source: bool,
+
   /// Start and target opacity for the animation, or `None` if no opacity
   /// animation is active.
   start_opacity: Option<OpacityValue>,
@@ -224,22 +367,41 @@ struct AnimationSpec {
 impl AnimationSpec {
   /// Creates a new animation between two rects, and optionally between
   /// two opacities.
+  ///
+  /// A spring starts each edge at `velocity`, so a retarget carries the
+  /// motion on. A curve easing ignores it.
   fn new(
     start_rect: Rect,
     target_rect: Rect,
     opacity: Option<(OpacityValue, OpacityValue)>,
     config: &AnimationEffectConfig,
     is_slide: bool,
+    velocity: EdgeVelocity,
   ) -> Self {
+    let spring = config.spring().map(|spring| {
+      SpringMotion::new(
+        spring,
+        &start_rect,
+        &target_rect,
+        opacity,
+        velocity,
+      )
+    });
+    let duration = spring.as_ref().map_or_else(
+      || Duration::from_millis(u64::from(config.duration_ms)),
+      SpringMotion::settle_time,
+    );
     let (start_opacity, target_opacity) = opacity.unzip();
 
     Self {
       target: MotionTarget::Overlay,
-      duration: Duration::from_millis(u64::from(config.duration_ms)),
+      duration,
       easing: config.easing.clone(),
+      spring,
       start_rect,
       target_rect,
       is_slide,
+      holds_source: false,
       start_opacity,
       target_opacity,
     }
@@ -259,16 +421,55 @@ impl AnimationSpec {
   }
 
   /// Whether the animation has completed.
+  ///
+  /// A spring's duration is its settle time, so it completes once every
+  /// edge is within 0.5 px of its target and nearly at rest.
   fn is_complete(&self, elapsed: Duration) -> bool {
     elapsed >= self.duration
   }
 
+  /// Returns the smallest rect enclosing every frame of the motion.
+  ///
+  /// A curve easing stays between its start and target. A spring does
+  /// not: it overshoots with bounce, and a retarget that carries velocity
+  /// away from the new target keeps travelling before it turns. An
+  /// overlay sized to the endpoints alone clipped the window for as long
+  /// as it was outside them, so the spring's path is sampled.
+  fn path_bounds(&self) -> Rect {
+    /// Samples across the settle time; one per frame at 144 Hz for a
+    /// 400 ms motion, and a spring's excursion is smooth between them.
+    const SAMPLES: u32 = 64;
+
+    let mut bounds = self.start_rect.union(&self.target_rect);
+    if self.spring.is_some() {
+      for step in 1..SAMPLES {
+        bounds =
+          bounds.union(&self.rect_at(self.duration * step / SAMPLES));
+      }
+    }
+    bounds
+  }
+
   /// Returns the interpolated rect at the current animation progress.
   fn rect_at(&self, elapsed: Duration) -> Rect {
-    let eased_progress = self.easing.apply(self.progress(elapsed));
-    self
-      .start_rect
-      .interpolate(&self.target_rect, eased_progress)
+    let Some(motion) = self.spring.filter(|_| !self.is_complete(elapsed))
+    else {
+      let eased_progress = self.easing.apply(self.progress(elapsed));
+      return self
+        .start_rect
+        .interpolate(&self.target_rect, eased_progress);
+    };
+
+    let time = elapsed.as_secs_f64();
+    let target = edges(&self.target_rect);
+    // LINT: Edges stay within a few screens of their targets.
+    #[allow(clippy::cast_possible_truncation)]
+    let edge = |index: usize| {
+      let state = motion.spring.state_at(motion.edges[index], time);
+      target[index] + state.displacement.round() as i32
+    };
+
+    Rect::from_ltrb(edge(0), edge(1), edge(2), edge(3))
   }
 
   /// Returns the interpolated opacity at the current animation progress,
@@ -277,8 +478,54 @@ impl AnimationSpec {
     let (start, end) =
       (self.start_opacity.as_ref()?, self.target_opacity.as_ref()?);
 
-    let eased_progress = self.easing.apply(self.progress(elapsed));
-    Some(start.interpolate(end, eased_progress))
+    let Some(motion) = self.spring.filter(|_| !self.is_complete(elapsed))
+    else {
+      let eased_progress = self.easing.apply(self.progress(elapsed));
+      return Some(start.interpolate(end, eased_progress));
+    };
+
+    let state = motion
+      .spring
+      .state_at(motion.opacity, elapsed.as_secs_f64());
+    // LINT: Opacity is a fraction, well within `f32`.
+    #[allow(clippy::cast_possible_truncation)]
+    let offset = (state.displacement / ALPHA_STEPS) as f32;
+
+    // A bouncing fade would otherwise pass fully clear or fully opaque.
+    Some(OpacityValue((end.0 + offset).clamp(0.0, 1.0)))
+  }
+
+  /// Returns the velocity of each edge at `elapsed`, in px per second.
+  ///
+  /// Zero once the motion has completed.
+  fn velocity_at(&self, elapsed: Duration) -> EdgeVelocity {
+    if self.is_complete(elapsed) {
+      return [0.0; 4];
+    }
+
+    if let Some(motion) = self.spring {
+      let time = elapsed.as_secs_f64();
+      return motion
+        .edges
+        .map(|edge| motion.spring.state_at(edge, time).velocity);
+    }
+
+    // A curve's velocity is its slope, sampled across a short span of
+    // progress, times the distance each edge travels.
+    let span = 0.001;
+    let progress = self.progress(elapsed);
+    let (before, after) =
+      ((progress - span).max(0.0), (progress + span).min(1.0));
+    let slope = f64::from(
+      (self.easing.apply(after) - self.easing.apply(before))
+        / (after - before),
+    ) / self.duration.as_secs_f64();
+
+    let (start, target) =
+      (edges(&self.start_rect), edges(&self.target_rect));
+    std::array::from_fn(|index| {
+      f64::from(target[index] - start[index]) * slope
+    })
   }
 }
 
@@ -297,6 +544,13 @@ struct Overlay {
   frame: Rect,
 }
 
+/// Draws a window's companions during its native motion and holds them
+/// through their reveal. See `CompanionOverlay`.
+struct Decoration {
+  overlay: CompanionOverlay,
+  frame_rate: u32,
+}
+
 /// Manages animations for all windows.
 pub struct AnimationManager {
   /// Prepared effects remain until native handoff relinquishes motion.
@@ -313,6 +567,11 @@ pub struct AnimationManager {
 
   /// Per-window overlay windows keyed by window ID.
   windows: HashMap<Uuid, Overlay>,
+
+  /// Companion-only overlays of windows in native motion, keyed by window
+  /// ID. Kept apart from `windows`: the real window stays visible and
+  /// owns its motion, so none of the cover rules apply.
+  decorations: HashMap<Uuid, Decoration>,
 
   /// Pre-captured frames, keyed by window ID, waiting for their
   /// animations to start.
@@ -337,6 +596,9 @@ pub struct AnimationManager {
   /// a 200ms slide and barely moved. Released together instead.
   pending_starts: Vec<Uuid>,
 
+  /// When `tick_update` last submitted overlay frames.
+  last_submitted: Option<Instant>,
+
   /// Whether "Displays have separate Spaces" setting is enabled.
   #[cfg(target_os = "macos")]
   displays_have_separate_spaces: bool,
@@ -359,10 +621,12 @@ impl AnimationManager {
       tick_tx,
       tick_rx,
       windows: HashMap::new(),
+      decorations: HashMap::new(),
       pending_captures: HashMap::new(),
       context: None,
       clock: None,
       pending_starts: Vec::new(),
+      last_submitted: None,
       #[cfg(target_os = "macos")]
       displays_have_separate_spaces: dispatcher
         .displays_have_separate_spaces(),
@@ -375,6 +639,10 @@ impl AnimationManager {
   }
 
   /// Whether one released animation has reached its target.
+  ///
+  /// Tick-driven motion completes at the last sampled tick, not by wall
+  /// clock. A commit between ticks would otherwise hand off before the
+  /// final frame was drawn, and the cover would freeze a remainder short.
   pub fn is_complete(&self, id: &Uuid) -> bool {
     self.running.get(id).is_some_and(|motion| {
       if AnimationWindow::SELF_ANIMATING {
@@ -383,9 +651,71 @@ impl AnimationManager {
         self
           .animations
           .get(id)
-          .is_some_and(|spec| spec.is_complete(motion.started.elapsed()))
+          .is_some_and(|spec| spec.is_complete(motion.sampled))
       }
     })
+  }
+
+  /// Whether a workspace slide, running or complete, owns the window.
+  pub fn owns_slide(&self, id: &Uuid) -> bool {
+    self.animations.get(id).is_some_and(|spec| spec.is_slide)
+  }
+
+  /// Returns the move effect for a window whose completed slide ended
+  /// away from its current tile.
+  pub fn deferred_move_effect<'a>(
+    &self,
+    id: &Uuid,
+    tile: &Rect,
+    config: &'a UserConfig,
+  ) -> Option<&'a AnimationEffectConfig> {
+    let move_config = config.value.animations.window_move.as_ref()?;
+    let spec = self.animations.get(id)?;
+    exceeds_threshold(&spec.target_rect, tile, move_config)
+      .then_some(&move_config.effect)
+  }
+
+  /// Whether the frame clock runs for this window's presentation, so
+  /// every tick already commits it.
+  pub fn drives_frames(&self, id: &Uuid) -> bool {
+    self.windows.contains_key(id)
+      || self.decorations.contains_key(id)
+      || self
+        .animations
+        .get(id)
+        .is_some_and(|spec| matches!(spec.target, MotionTarget::Native(_)))
+  }
+
+  /// Returns where a cover holds its real window, if it does.
+  pub fn held_frame(&self, id: &Uuid) -> Option<Rect> {
+    self
+      .animations
+      .get(id)
+      .filter(|spec| spec.holds_source)
+      .map(|spec| spec.target_rect.clone())
+  }
+
+  /// Returns where a window's cover ends: its running motion's target, or
+  /// where a finished cover stands.
+  pub fn cover_target(&self, id: &Uuid) -> Option<Rect> {
+    let overlay = self.windows.get(id)?;
+    Some(
+      self
+        .animations
+        .get(id)
+        .filter(|spec| matches!(spec.target, MotionTarget::Overlay))
+        .map_or_else(
+          || overlay.frame.clone(),
+          |spec| spec.target_rect.clone(),
+        ),
+    )
+  }
+
+  /// Whether any overlay or motion still depends on the frame clock.
+  pub fn has_presentations(&self) -> bool {
+    !self.windows.is_empty()
+      || !self.animations.is_empty()
+      || !self.decorations.is_empty()
   }
 
   /// Whether this presentation owns released motion.
@@ -413,7 +743,94 @@ impl AnimationManager {
       .then_some(&spec.target_rect)
   }
 
+  /// Returns the per-edge velocity of a window's current motion, so a
+  /// replacement carries it on.
+  ///
+  /// Zero without motion. A prepared motion that is not yet released
+  /// reports its starting velocity, which it would have set off with.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: the compositor runs released motion, so elapsed time is read
+  ///   from the wall clock rather than the last sampled tick.
+  fn carried_velocity(&self, id: &Uuid) -> EdgeVelocity {
+    let Some(spec) = self.animations.get(id) else {
+      return [0.0; 4];
+    };
+    let elapsed = self.running.get(id).map_or(Duration::ZERO, |motion| {
+      if AnimationWindow::SELF_ANIMATING {
+        motion.started.elapsed()
+      } else {
+        motion.sampled
+      }
+    });
+
+    spec.velocity_at(elapsed)
+  }
+
+  /// Returns when a window's current motion was last drawn, so a
+  /// replacement started from that frame continues its clock.
+  ///
+  /// Now without motion, or when the last draw is older than
+  /// `MAX_CONTINUATION`.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: the compositor draws continuously, so this is always now.
+  fn last_drawn(&self, id: &Uuid) -> Instant {
+    /// A draw older than this means the frame clock stalled. Continuing
+    /// from it would start the replacement far along its path.
+    const MAX_CONTINUATION: Duration = Duration::from_millis(100);
+
+    let now = Instant::now();
+    match self.running.get(id) {
+      Some(motion) if !AnimationWindow::SELF_ANIMATING => {
+        let drawn = motion.started + motion.sampled;
+        if now.saturating_duration_since(drawn) > MAX_CONTINUATION {
+          now
+        } else {
+          drawn.min(now)
+        }
+      }
+      _ => now,
+    }
+  }
+
+  /// Returns where a window's cover is presented, if it has one, and the
+  /// velocity its motion carries.
+  ///
+  /// Only a cover that is still presented has motion to carry on, so the
+  /// velocity is zero without one.
+  fn cover_motion(
+    &self,
+    id: &Uuid,
+  ) -> anyhow::Result<(Option<Rect>, EdgeVelocity)> {
+    let Some(overlay) = self.windows.get(id) else {
+      return Ok((None, [0.0; 4]));
+    };
+    let frame = overlay
+      .window
+      .current_frame()?
+      .unwrap_or_else(|| overlay.frame.clone());
+    Ok((Some(frame), self.carried_velocity(id)))
+  }
+
+  /// Whether a window's cover is on screen.
+  ///
+  /// A cover whose motion is held for release may not be composed yet, so
+  /// it does not count.
+  fn is_presented(&self, id: &Uuid) -> bool {
+    self.windows.contains_key(id)
+      && (self.running.contains_key(id)
+        || !self.animations.contains_key(id))
+  }
+
   /// Prepares visible motion without creating a cover.
+  ///
+  /// The window holds its start frame until the coordinator releases its
+  /// batch, so it starts together with any overlays prepared beside it.
+  /// A retarget starts from `start`, the observed frame, with the
+  /// velocity of the motion it replaces.
   pub fn prepare_native(
     &mut self,
     id: Uuid,
@@ -427,6 +844,7 @@ impl AnimationManager {
       None,
       plan.effect,
       false,
+      self.carried_velocity(&id),
     );
     spec.target = MotionTarget::Native(frame_rate);
     self.running.remove(&id);
@@ -434,7 +852,6 @@ impl AnimationManager {
     self.pending_captures.remove(&id);
     self.failed_updates.remove(&id);
     self.animations.insert(id, spec);
-    self.release_animation(&id);
     self.update_clock();
   }
 
@@ -443,9 +860,121 @@ impl AnimationManager {
     self.windows.contains_key(id)
   }
 
-  /// Whether compositor readiness is still required by retained covers.
-  pub fn has_overlays(&self) -> bool {
-    !self.windows.is_empty()
+  /// Starts or continues drawing a window's companions for its native
+  /// motion.
+  ///
+  /// Called after `prepare_native`, with the same `start`. The overlay
+  /// covers the motion's path grown by the companion margin. A retarget
+  /// keeps the existing overlay and the companion rects it recorded when
+  /// it was created, so the decoration does not jump; the overlay only
+  /// grows.
+  ///
+  /// Returns whether the window is decorated. A window without companions
+  /// costs one shared companion search and gets no overlay. Failures are
+  /// logged and leave the window undecorated; they never affect its
+  /// motion.
+  pub fn decorate_native(
+    &mut self,
+    id: Uuid,
+    window: &NativeWindow,
+    start: &Rect,
+    frame_rate: u32,
+    dispatcher: &Dispatcher,
+  ) -> bool {
+    let Some(target) = self.native_target(&id) else {
+      return false;
+    };
+    // The spring's path, not only its endpoints: an overshoot or a
+    // carried velocity would otherwise draw the ring outside the overlay.
+    let bounds = self.animations.get(&id).map_or_else(
+      || start.union(target),
+      |spec| spec.path_bounds().union(start),
+    );
+    #[cfg(target_os = "windows")]
+    let bounds = bounds.inset(-COMPANION_MARGIN_PX);
+    if let Some(decoration) = self.decorations.get_mut(&id) {
+      decoration.frame_rate = frame_rate;
+      let Err(err) = decoration.overlay.retarget(&bounds) else {
+        self.update_clock();
+        return true;
+      };
+      tracing::warn!(window = %id, "Companion overlay retarget failed: {err}");
+      if let Err(err) = self.retire_decoration(&id) {
+        tracing::warn!("Companion overlay cleanup failed: {err}");
+      }
+      return false;
+    }
+    match CompanionOverlay::new(window, &bounds, dispatcher) {
+      Ok(Some(overlay)) => {
+        self.decorations.insert(
+          id,
+          Decoration {
+            overlay,
+            frame_rate,
+          },
+        );
+        self.update_clock();
+        tracing::debug!(window = %id, "Companion overlay prepared.");
+        true
+      }
+      Ok(None) => false,
+      Err(err) => {
+        tracing::warn!(window = %id, "Companion overlay failed: {err}");
+        false
+      }
+    }
+  }
+
+  /// Draws a decorated window's companions against `frame`, the window
+  /// rect just requested for it.
+  ///
+  /// Called straight after the request, so both reach the compositor
+  /// together. Does nothing for an undecorated window. A failed update
+  /// retires the decoration; the window's own motion continues.
+  pub fn draw_decoration(&mut self, id: &Uuid, frame: &Rect) {
+    let Some(decoration) = self.decorations.get(id) else {
+      return;
+    };
+    if let Err(err) = decoration.overlay.update(frame) {
+      tracing::warn!(window = %id, "Companion overlay update failed: {err}");
+      if let Err(err) = self.retire_decoration(id) {
+        tracing::warn!("Companion overlay cleanup failed: {err}");
+      }
+    }
+  }
+
+  /// Whether a companion overlay draws this window's companions.
+  pub fn has_decoration(&self, id: &Uuid) -> bool {
+    self.decorations.contains_key(id)
+  }
+
+  /// Whether every companion drawn by a window's companion overlay shows
+  /// itself again. `true` without one.
+  pub fn decoration_revealed(&self, id: &Uuid) -> bool {
+    self
+      .decorations
+      .get(id)
+      .is_none_or(|decoration| decoration.overlay.companions_revealed())
+  }
+
+  /// Destroys a window's companion overlay, if it has one.
+  pub fn retire_decoration(&mut self, id: &Uuid) -> anyhow::Result<()> {
+    let Some(mut decoration) = self.decorations.remove(id) else {
+      return Ok(());
+    };
+    self.update_clock();
+    tracing::debug!(window = %id, "Companion overlay retired.");
+    decoration.overlay.destroy()?;
+    Ok(())
+  }
+
+  /// Whether every companion drawn by a window's overlay shows itself
+  /// again. `true` without an overlay or companions.
+  pub fn companions_revealed(&self, id: &Uuid) -> bool {
+    self
+      .windows
+      .get(id)
+      .is_none_or(|overlay| overlay.window.companions_revealed())
   }
 
   /// Takes failed launches or updates for native recovery.
@@ -460,7 +989,17 @@ impl AnimationManager {
     rect: &Rect,
   ) -> anyhow::Result<()> {
     if let Some(overlay) = self.windows.get_mut(id) {
-      overlay.window.resize(rect)?;
+      // Companions are drawn through the reveal hold, so the overlay keeps
+      // the margin they reach into. Its path usually encloses the landing
+      // frame already; resizing anyway moves its origin a compositor frame
+      // before the thumbnail follows, and the window blinks at the reveal.
+      #[cfg(target_os = "windows")]
+      let bounds = rect.inset(-COMPANION_MARGIN_PX);
+      #[cfg(not(target_os = "windows"))]
+      let bounds = rect.clone();
+      if !overlay.window.covers(&bounds) {
+        overlay.window.resize(&bounds)?;
+      }
       overlay.window.stop_at(rect, Some(&OpacityValue(1.0)))?;
       overlay.frame = rect.clone();
     }
@@ -479,7 +1018,11 @@ impl AnimationManager {
   }
 
   /// Retires visuals only after successful handoff.
+  ///
+  /// Also retires the window's companion overlay, which a released
+  /// window no longer needs.
   pub fn retire_overlay(&mut self, id: &Uuid) -> anyhow::Result<()> {
+    self.retire_decoration(id)?;
     if let Some(overlay) = self.windows.get_mut(id) {
       overlay.window.destroy()?;
     }
@@ -576,6 +1119,7 @@ impl AnimationManager {
         dispatcher,
       )
       .context("Animation update failed.")?;
+    self.last_submitted = Some(Instant::now());
     for (id, rect, _) in rects {
       if !failed.contains(&id) {
         if let Some(overlay) = self.windows.get_mut(&id) {
@@ -586,6 +1130,33 @@ impl AnimationManager {
     self.failed_updates.extend(failed);
 
     Ok(())
+  }
+
+  /// Submits a frame for running overlay motion if a frame period has
+  /// passed since the last one.
+  ///
+  /// Called by the coordinator between windows of a long commit. Native
+  /// calls for a few windows can outlast several frames, and without a
+  /// tick in between every running cover stood still until the commit
+  /// ended. Safe between windows: nothing here is mid-mutation, and the
+  /// update only reads motion and writes overlay frames. Failed overlays
+  /// are queued for the frame clock's own tick, as `tick_update` always
+  /// does.
+  pub fn tick_if_due(
+    &mut self,
+    dispatcher: &Dispatcher,
+  ) -> anyhow::Result<()> {
+    let Some((frame_rate, _)) = &self.clock else {
+      return Ok(());
+    };
+    let period = Duration::from_secs(1) / (*frame_rate).max(1);
+    if self
+      .last_submitted
+      .is_some_and(|submitted| submitted.elapsed() < period)
+    {
+      return Ok(());
+    }
+    self.tick_update(dispatcher)
   }
 
   /// Advances samples only on animation ticks.
@@ -609,7 +1180,9 @@ impl AnimationManager {
     //  - The window is minimized.
     //  - The window is fullscreen. Games and video players live here, and
     //    an animation would capture, layer, cloak, overlay and move them.
-    //    They get the hard cut a desktop normally gives them.
+    //    They get the hard cut a desktop normally gives them. Workspace
+    //    slides exclude them too. The coordinator cuts the way out of
+    //    fullscreen, which this check cannot see.
     //  - The window is maximized (macOS only - can't override the OS's
     //    animation).
     //  - The window is stranded in the corner.
@@ -663,6 +1236,13 @@ impl AnimationManager {
         }
       }
       (
+        AnimationTrigger::WindowSent,
+        AnimationsConfig {
+          window_close: Some(close_config),
+          ..
+        },
+      ) => Some(close_config),
+      (
         AnimationTrigger::WorkspaceEntering(_)
         | AnimationTrigger::WorkspaceLeaving(_),
         AnimationsConfig {
@@ -677,11 +1257,8 @@ impl AnimationManager {
           ..
         },
       ) => {
-        // A slide owns its windows for its whole duration. A redraw
-        // landing mid-slide targets the windows' tiles, which differ from
-        // the slide targets (a leaving window's target is off screen), so
-        // the distance check alone would restart the slide mid-flight.
-        // The slide finishes, and the redraw re-runs after it anyway.
+        // A slide owns its windows for its whole duration; the
+        // coordinator holds a move asked for meanwhile until it ends.
         if self
           .animations
           .get(&window.id())
@@ -698,20 +1275,8 @@ impl AnimationManager {
           .get(&window.id())
           .map_or(&frame, |anim| &anim.target_rect);
 
-        let distance = (prev_rect.x() - target_rect.x()).abs()
-          + (prev_rect.y() - target_rect.y()).abs()
-          + (prev_rect.width() - target_rect.width()).abs()
-          + (prev_rect.height() - target_rect.height()).abs();
-
-        // TODO: Validate config to only allow pixel values.
-        #[allow(clippy::cast_possible_truncation)]
-        let threshold_px = move_config.trigger_threshold.amount as i32;
-
-        if distance > threshold_px {
-          Some(&move_config.effect)
-        } else {
-          None
-        }
+        exceeds_threshold(prev_rect, target_rect, move_config)
+          .then_some(&move_config.effect)
       }
       _ => None,
     }
@@ -752,21 +1317,29 @@ impl AnimationManager {
     };
 
     let capture_t0 = Instant::now();
-    let results = std::thread::scope(|scope| {
-      // Spawn every capture before joining any, or they run one at a
-      // time.
-      let handles = windows
-        .iter()
-        .map(|(id, window_id)| {
-          (id, scope.spawn(move || context.capture_frame(*window_id)))
-        })
-        .collect::<Vec<_>>();
+    // A capture that returns at once gains nothing from a thread.
+    let results = if AnimationContext::CAPTURE_BLOCKS {
+      std::thread::scope(|scope| {
+        // Spawn every capture before joining any, or they run one at a
+        // time.
+        let handles = windows
+          .iter()
+          .map(|(id, window_id)| {
+            (id, scope.spawn(move || context.capture_frame(*window_id)))
+          })
+          .collect::<Vec<_>>();
 
-      handles
-        .into_iter()
-        .map(|(id, handle)| (id, handle.join()))
+        handles
+          .into_iter()
+          .map(|(id, handle)| (id, handle.join()))
+          .collect::<Vec<_>>()
+      })
+    } else {
+      windows
+        .iter()
+        .map(|(id, window_id)| (id, Ok(context.capture_frame(*window_id))))
         .collect::<Vec<_>>()
-    });
+    };
 
     tracing::debug!(
       "Captured {} window frames in {:?}.",
@@ -791,43 +1364,49 @@ impl AnimationManager {
     Ok(())
   }
 
-  /// Prepares a held overlay and effect, preserving any retained capture.
+  /// Prepares an overlay and effect, preserving any retained capture.
   ///
   /// The plan's path decides where the animation begins. Without a start
-  /// of its own it begins where the window is, or where its running
-  /// animation has got to.
+  /// of its own it begins where the window is. A window whose cover is
+  /// still up begins where the cover is presented, with the velocity of
+  /// the motion it replaces, so a spring carries on rather than
+  /// restarting from rest.
+  ///
+  /// Pass `MotionStart::Immediate` only for a concealed source. Returns
+  /// how the motion actually starts: a cover that is not yet presented is
+  /// always held, and the coordinator must release it. An immediate
+  /// motion is running on return and needs no release.
   pub fn prepare_animation(
     &mut self,
     window: &WindowContainer,
     plan: &AnimationPlan,
     monitor_properties: &NativeMonitorProperties,
     dispatcher: &Dispatcher,
-  ) -> anyhow::Result<()> {
+    start: MotionStart,
+  ) -> anyhow::Result<MotionStart> {
     // The monitor's refresh rate, for platforms that pace the clock by
     // sleeping rather than by the compositor.
     let frame_rate = monitor_properties.refresh_rate.unwrap_or(60);
-
-    let presented_rect = self
-      .windows
-      .get(&window.id())
-      .map(|overlay| {
-        overlay
-          .window
-          .current_frame()
-          .map(|frame| frame.unwrap_or_else(|| overlay.frame.clone()))
-      })
-      .transpose()?;
+    let start = if self.is_presented(&window.id()) {
+      start
+    } else {
+      MotionStart::Held
+    };
+    let continued_from = self.last_drawn(&window.id());
+    let (presented_rect, velocity) = self.cover_motion(&window.id())?;
     let start_rect = presented_rect
       .or_else(|| plan.path.start.clone())
       .unwrap_or_else(|| window.native_properties().frame.clone());
 
-    let animation = AnimationSpec::new(
+    let mut animation = AnimationSpec::new(
       start_rect,
       plan.path.target.clone(),
       plan.path.opacity,
       plan.effect,
       plan.trigger.is_slide(),
+      velocity,
     );
+    animation.holds_source = plan.trigger == AnimationTrigger::WindowSent;
 
     // On macOS, windows cannot span across multiple displays when
     // "Displays have separate Spaces" is enabled. Attempting to position a
@@ -842,7 +1421,14 @@ impl AnimationManager {
     // on. A switch belongs to one display; only a window genuinely moving
     // between them should be drawn across both.
     let outer_rect = {
-      let outer_rect = animation.start_rect.union(&animation.target_rect);
+      let outer_rect = animation.path_bounds();
+      // Companions such as border rings extend past the window's frame,
+      // and the overlay clips their thumbnails to its own bounds.
+      // Without the margin a ring loses its outer half, or all of a
+      // band drawn wholly outside the frame, for the whole
+      // animation.
+      #[cfg(target_os = "windows")]
+      let outer_rect = outer_rect.inset(-COMPANION_MARGIN_PX);
 
       #[cfg(target_os = "macos")]
       if self.displays_have_separate_spaces || plan.trigger.is_slide() {
@@ -872,18 +1458,29 @@ impl AnimationManager {
     };
 
     // Resize existing overlay to the new bounding box when the target
-    // changes mid-flight, preserving the screenshot and z-order.
+    // changes mid-flight, preserving the screenshot and z-order. A slide's
+    // overlay already spans its monitor, so a reversal usually fits; the
+    // resize is skipped then, sparing a round trip per window while no
+    // frame is ticking, and the origin move that lands a frame before the
+    // thumbnail follows it.
     if let Some(anim_window) = self.windows.get_mut(&window.id()) {
-      anim_window.window.resize(&outer_rect)?;
+      if !anim_window.window.covers(&outer_rect) {
+        anim_window.window.resize(&outer_rect)?;
+      }
       anim_window.frame_rate = frame_rate;
 
-      // A replacement is prepared, not running: freeze the sampled
-      // presentation before waiting for the next native readiness signal.
-      anim_window.window.stop_at(
-        &animation.start_rect,
-        animation.start_opacity.as_ref(),
-      )?;
-      anim_window.frame = animation.start_rect.clone();
+      // A held replacement freezes the sampled presentation until its
+      // batch is released. An immediate one on a tick-driven backend
+      // already shows its start frame, and its next tick draws the new
+      // motion. A compositor-driven one must first stop the running
+      // animation, so the next begins where it is.
+      if start == MotionStart::Held || AnimationWindow::SELF_ANIMATING {
+        anim_window.window.stop_at(
+          &animation.start_rect,
+          animation.start_opacity.as_ref(),
+        )?;
+        anim_window.frame = animation.start_rect.clone();
+      }
     } else {
       let capture = match capture {
         Some(capture) => capture,
@@ -914,8 +1511,85 @@ impl AnimationManager {
     self.pending_starts.retain(|id| *id != window.id());
     self.failed_updates.remove(&window.id());
     self.animations.insert(window.id(), animation);
+    if start == MotionStart::Immediate {
+      self.start_now(window.id(), continued_from);
+    }
     self.update_clock();
-    Ok(())
+    Ok(start)
+  }
+
+  /// Starts a prepared motion at once, without waiting for its batch.
+  ///
+  /// `started` is when the motion it replaces was last drawn, which is
+  /// where the replacement begins. The next tick then draws it as far
+  /// along as the time since, rather than from rest. A failed launch is
+  /// reported as a failed release is.
+  fn start_now(&mut self, id: Uuid, started: Instant) {
+    self.pending_starts.retain(|pending| *pending != id);
+    let completed = Arc::new(AtomicBool::new(false));
+    match self.launch(&id, &completed) {
+      Ok(()) => self.run(id, started, completed),
+      Err(err) => {
+        tracing::warn!("Animation launch failed: {err}");
+        self.failed_updates.insert(id);
+      }
+    }
+  }
+
+  /// Hands a prepared motion to whatever draws it.
+  ///
+  /// Nothing to do for native motion or on a tick-driven backend, where
+  /// the frame clock draws every frame. Fails for an overlay motion
+  /// without an overlay.
+  fn launch(
+    &self,
+    id: &Uuid,
+    completed: &Arc<AtomicBool>,
+  ) -> anyhow::Result<()> {
+    let anim = self.animations.get(id).context("No prepared motion.")?;
+    if matches!(anim.target, MotionTarget::Native(_)) {
+      return Ok(());
+    }
+    let overlay = self
+      .windows
+      .get(id)
+      .context("Prepared animation has no overlay.")?;
+    if !AnimationWindow::SELF_ANIMATING {
+      return Ok(());
+    }
+    let completion = completed.clone();
+    let tick_tx = self.tick_tx.clone();
+    overlay
+      .window
+      .animate_to(
+        &anim.target_rect,
+        anim.duration,
+        &anim.easing,
+        anim.target_opacity.as_ref(),
+        move || {
+          completion.store(true, Ordering::Release);
+          let _ = tick_tx.try_send(FrameSignal::Wake);
+        },
+      )
+      .map_err(Into::into)
+  }
+
+  /// Gives a launched motion its clock, with its first frame at
+  /// `started`.
+  fn run(
+    &mut self,
+    id: Uuid,
+    started: Instant,
+    completed: Arc<AtomicBool>,
+  ) {
+    self.running.insert(
+      id,
+      RunningMotion {
+        started,
+        sampled: Duration::ZERO,
+        completed,
+      },
+    );
   }
 
   /// Releases ready effects together, preserving later launches on
@@ -923,43 +1597,13 @@ impl AnimationManager {
   pub fn begin_pending(&mut self) {
     let mut launched = Vec::new();
     for window_id in std::mem::take(&mut self.pending_starts) {
-      let Some(anim) = self.animations.get(&window_id) else {
-        continue;
-      };
-      if self.running.contains_key(&window_id) {
+      if !self.animations.contains_key(&window_id)
+        || self.running.contains_key(&window_id)
+      {
         continue;
       }
       let completed = Arc::new(AtomicBool::new(false));
-      let completion = completed.clone();
-      let tick_tx = self.tick_tx.clone();
-      let result = if matches!(anim.target, MotionTarget::Native(_)) {
-        Ok(())
-      } else {
-        self
-          .windows
-          .get(&window_id)
-          .context("Prepared animation has no overlay.")
-          .and_then(|window| {
-            if AnimationWindow::SELF_ANIMATING {
-              window
-                .window
-                .animate_to(
-                  &anim.target_rect,
-                  anim.duration,
-                  &anim.easing,
-                  anim.target_opacity.as_ref(),
-                  move || {
-                    completion.store(true, Ordering::Release);
-                    let _ = tick_tx.try_send(FrameSignal::Wake);
-                  },
-                )
-                .map_err(Into::into)
-            } else {
-              Ok(())
-            }
-          })
-      };
-      match result {
+      match self.launch(&window_id, &completed) {
         Ok(()) => launched.push((window_id, completed)),
         Err(err) => {
           tracing::warn!("Animation launch failed: {err}");
@@ -970,22 +1614,16 @@ impl AnimationManager {
     // Completion may trail a compositor submission, but must never lead
     // it.
     let started = Instant::now();
-    self
-      .running
-      .extend(launched.into_iter().map(|(id, completed)| {
-        (
-          id,
-          RunningMotion {
-            started,
-            sampled: Duration::ZERO,
-            completed,
-          },
-        )
-      }));
+    for (id, completed) in launched {
+      self.run(id, started, completed);
+    }
     self.update_clock();
   }
 
   /// Keeps compositor signals alive while any overlay awaits handoff.
+  ///
+  /// A companion overlay counts too: its reveal hold waits on compositor
+  /// frames after the motion itself has ended.
   ///
   /// The clock's fallback rate is the highest refresh rate among the
   /// animated windows' monitors. A running clock is only replaced when
@@ -999,6 +1637,12 @@ impl AnimationManager {
       .windows
       .values()
       .map(|overlay| overlay.frame_rate)
+      .chain(
+        self
+          .decorations
+          .values()
+          .map(|decoration| decoration.frame_rate),
+      )
       .chain(self.animations.values().filter_map(
         |spec| match spec.target {
           MotionTarget::Native(rate) => Some(rate),
@@ -1048,16 +1692,22 @@ mod tests {
   #[test]
   fn trigger_selection_is_shared_and_ordered() {
     use AnimationTrigger::{
-      WindowMoved, WindowOpened, WorkspaceEntering, WorkspaceLeaving,
+      WindowMoved, WindowOpened, WindowSent, WorkspaceEntering,
+      WorkspaceLeaving,
     };
+    let changes = [
+      WindowChange::Opened,
+      WindowChange::Sent,
+      WindowChange::Placed,
+    ];
     for direction in [SlideDirection::Left, SlideDirection::Right] {
-      for opening in [false, true] {
+      for change in changes {
         assert_eq!(
-          AnimationTrigger::select(false, Some(direction), true, opening),
+          AnimationTrigger::select(false, Some(direction), true, change),
           Some(WorkspaceEntering(direction))
         );
         assert_eq!(
-          AnimationTrigger::select(false, Some(direction), false, opening),
+          AnimationTrigger::select(false, Some(direction), false, change),
           Some(WorkspaceLeaving(direction))
         );
         for visible in [false, true] {
@@ -1065,27 +1715,35 @@ mod tests {
             true,
             Some(direction),
             visible,
-            opening
+            change
           )
           .is_none());
         }
       }
     }
     assert_eq!(
-      AnimationTrigger::select(false, None, true, true),
+      AnimationTrigger::select(false, None, true, WindowChange::Opened),
       Some(WindowOpened)
     );
     assert_eq!(
-      AnimationTrigger::select(false, None, true, false),
+      AnimationTrigger::select(false, None, true, WindowChange::Placed),
       Some(WindowMoved)
     );
-    for opening in [false, true] {
+    assert_eq!(
+      AnimationTrigger::select(false, None, false, WindowChange::Sent),
+      Some(WindowSent)
+    );
+    for change in [WindowChange::Opened, WindowChange::Placed] {
       assert!(
-        AnimationTrigger::select(false, None, false, opening).is_none()
+        AnimationTrigger::select(false, None, false, change).is_none()
       );
-      assert!(
-        AnimationTrigger::select(true, None, true, opening).is_none()
-      );
+    }
+    for change in changes {
+      for visible in [false, true] {
+        assert!(
+          AnimationTrigger::select(true, None, visible, change).is_none()
+        );
+      }
     }
   }
 
@@ -1100,10 +1758,12 @@ mod tests {
       tick_tx,
       tick_rx,
       windows: HashMap::new(),
+      decorations: HashMap::new(),
       pending_captures: HashMap::new(),
       context: None,
       clock: None,
       pending_starts: Vec::new(),
+      last_submitted: None,
       #[cfg(target_os = "macos")]
       displays_have_separate_spaces: false,
     }
@@ -1116,7 +1776,312 @@ mod tests {
       None,
       &AnimationEffectConfig::default(),
       false,
+      [0.0; 4],
     )
+  }
+
+  /// Creates a spring effect with a perceptual duration and bounce.
+  fn spring_effect(
+    duration_ms: u32,
+    bounce: f32,
+  ) -> AnimationEffectConfig {
+    AnimationEffectConfig {
+      duration_ms,
+      easing: EasingFunction::Spring,
+      bounce,
+      ..AnimationEffectConfig::default()
+    }
+  }
+
+  /// A spring runs until it settles and then lands exactly.
+  #[test]
+  fn spring_completes_once_settled() {
+    let effect = spring_effect(250, 0.1);
+    let spec = AnimationSpec::new(
+      Rect::from_xy(0, 0, 400, 300),
+      Rect::from_xy(1200, 200, 600, 400),
+      None,
+      &effect,
+      false,
+      [0.0; 4],
+    );
+
+    assert!(spec.duration > Duration::from_millis(250));
+    assert!(!spec.is_complete(Duration::from_millis(250)));
+    assert!(spec.is_complete(spec.duration));
+    assert_eq!(spec.rect_at(Duration::ZERO), spec.start_rect);
+    assert_eq!(spec.rect_at(spec.duration), spec.target_rect);
+
+    // Just before settling, every edge is already within half a pixel.
+    let almost =
+      spec.rect_at(spec.duration.saturating_sub(Duration::from_millis(1)));
+    for (edge, target) in
+      edges(&almost).into_iter().zip(edges(&spec.target_rect))
+    {
+      assert!((edge - target).abs() <= 1, "{almost:?}");
+    }
+
+    // A bouncing spring passes its target before settling.
+    let overshoot = (1..100)
+      .map(|step| spec.rect_at(spec.duration * step / 100).left)
+      .max()
+      .unwrap_or_default();
+    assert!(overshoot > spec.target_rect.left);
+  }
+
+  /// A fade without travel still lasts until its opacity settles.
+  #[test]
+  fn spring_fade_settles_its_opacity() {
+    let effect = spring_effect(300, 0.15);
+    let frame = Rect::from_xy(100, 100, 800, 600);
+    let spec = AnimationSpec::new(
+      frame.clone(),
+      frame,
+      Some((OpacityValue(1.0), OpacityValue(0.0))),
+      &effect,
+      false,
+      [0.0; 4],
+    );
+
+    assert!(spec.duration > Duration::from_millis(300));
+    let opacity = |elapsed| spec.opacity_at(elapsed).map(|value| value.0);
+    assert_eq!(opacity(Duration::ZERO), Some(1.0));
+    assert_eq!(opacity(spec.duration), Some(0.0));
+    for step in 0..=100 {
+      let value = opacity(spec.duration * step / 100).unwrap_or(-1.0);
+      assert!((0.0..=1.0).contains(&value));
+    }
+  }
+
+  /// A curve's velocity is its slope over the travel.
+  #[test]
+  fn curve_velocity_follows_its_slope() {
+    let effect = AnimationEffectConfig {
+      duration_ms: 200,
+      easing: EasingFunction::Linear,
+      ..AnimationEffectConfig::default()
+    };
+    let spec = AnimationSpec::new(
+      Rect::from_xy(0, 0, 100, 100),
+      Rect::from_xy(400, 0, 100, 100),
+      None,
+      &effect,
+      false,
+      [0.0; 4],
+    );
+
+    let velocity = spec.velocity_at(Duration::from_millis(100));
+    assert!((velocity[0] - 2000.0).abs() < 1.0, "{velocity:?}");
+    assert!(velocity[1].abs() < f64::EPSILON);
+    assert_eq!(spec.velocity_at(spec.duration), [0.0; 4]);
+  }
+
+  /// A retarget mid-flight carries each edge's velocity into the new
+  /// spring, so the window neither stops nor jerks.
+  #[test]
+  fn spring_retarget_keeps_velocity() {
+    if AnimationWindow::SELF_ANIMATING {
+      return;
+    }
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let effect = spring_effect(250, 0.1);
+    let plan = move_plan(&effect, Rect::from_xy(1600, 200, 800, 600));
+    manager.prepare_native(id, &plan, Rect::from_xy(0, 0, 800, 600), 60);
+    manager.release_animation(&id);
+    manager.begin_pending();
+
+    let started = manager.running[&id].started;
+    manager.sample_frames(started + Duration::from_millis(60));
+    let before = manager.carried_velocity(&id);
+    let observed = manager.native_frame(&id).expect("Native frame.");
+    assert!(before[0] > 1000.0, "{before:?}");
+
+    let retarget = move_plan(&effect, Rect::from_xy(2400, 400, 1000, 700));
+    manager.prepare_native(id, &retarget, observed.clone(), 60);
+    let spec = &manager.animations[&id];
+
+    assert_eq!(spec.rect_at(Duration::ZERO), observed);
+    let after = spec.velocity_at(Duration::ZERO);
+    for (old, new) in before.iter().zip(after) {
+      assert!((old - new).abs() < 1e-9, "{before:?} vs {after:?}");
+    }
+  }
+
+  /// Starts a leaving slide's overlay motion without platform resources,
+  /// and samples it `elapsed` after it started.
+  fn sampled_slide(
+    manager: &mut AnimationManager,
+    id: Uuid,
+    effect: &AnimationEffectConfig,
+    elapsed: Duration,
+  ) -> Instant {
+    let spec = AnimationSpec::new(
+      Rect::from_xy(0, 0, 800, 600),
+      Rect::from_xy(-3440, 0, 800, 600),
+      None,
+      effect,
+      true,
+      [0.0; 4],
+    );
+    manager.animations.insert(id, spec);
+    let started = Instant::now()
+      .checked_sub(Duration::from_millis(50))
+      .expect("Clock predates the test.");
+    manager.run(id, started, Arc::new(AtomicBool::new(false)));
+    manager.sample_frames(started + elapsed);
+    started
+  }
+
+  /// A covered retarget continues from the last drawn frame, with its
+  /// velocity, on the replaced motion's clock. It runs without a release,
+  /// and the next frame moves as far as the carried velocity takes it
+  /// rather than standing still.
+  #[test]
+  fn covered_retarget_continues_without_release() {
+    if AnimationWindow::SELF_ANIMATING {
+      return;
+    }
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let effect = spring_effect(200, 0.0);
+    let elapsed = Duration::from_millis(30);
+    let started = sampled_slide(&mut manager, id, &effect, elapsed);
+    let drawn = manager.animations[&id].rect_at(elapsed);
+    let before = manager.carried_velocity(&id);
+    assert!(before[0] < -1000.0, "{before:?}");
+
+    // What `prepare_animation` does for `MotionStart::Immediate`.
+    let continued_from = manager.last_drawn(&id);
+    assert_eq!(continued_from, started + elapsed);
+    let reverse = AnimationSpec::new(
+      drawn.clone(),
+      Rect::from_xy(0, 0, 800, 600),
+      None,
+      &effect,
+      true,
+      before,
+    );
+    manager.running.remove(&id);
+    manager.animations.insert(id, reverse);
+    manager.run(id, continued_from, Arc::new(AtomicBool::new(false)));
+
+    // Running at once; a release and a batch start leave it alone.
+    assert!(manager.is_running(&id));
+    manager.release_animation(&id);
+    assert_eq!(manager.pending_starts, Vec::<Uuid>::new());
+    manager.begin_pending();
+    assert_eq!(manager.running[&id].started, continued_from);
+
+    // One 144Hz frame later it has carried on at the old velocity.
+    let frame = Duration::from_micros(6944);
+    manager.sample_frames(continued_from + frame);
+    let spec = &manager.animations[&id];
+    assert_eq!(spec.rect_at(Duration::ZERO), drawn);
+    let after = spec.velocity_at(Duration::ZERO);
+    for (old, new) in before.iter().zip(after) {
+      assert!((old - new).abs() < 1e-9, "{before:?} vs {after:?}");
+    }
+    let sampled = manager.running[&id].sampled;
+    let moved = f64::from(spec.rect_at(sampled).left - drawn.left);
+    let expected = before[0] * frame.as_secs_f64();
+    assert!(moved < expected / 2.0, "{moved} vs {expected}");
+  }
+
+  /// A continuation never reaches back past a stalled clock, and a window
+  /// without motion continues from now.
+  #[test]
+  fn continuation_starts_no_earlier_than_a_recent_draw() {
+    if AnimationWindow::SELF_ANIMATING {
+      return;
+    }
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let before = Instant::now();
+    assert!(manager.last_drawn(&id) >= before);
+
+    let effect = spring_effect(200, 0.0);
+    let started =
+      sampled_slide(&mut manager, id, &effect, Duration::from_millis(10));
+    assert_eq!(
+      manager.last_drawn(&id),
+      started + Duration::from_millis(10)
+    );
+
+    manager.running.get_mut(&id).expect("Running.").started =
+      Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("Clock predates the test.");
+    let stalled = Instant::now();
+    assert!(manager.last_drawn(&id) >= stalled);
+  }
+
+  /// An immediate start without a cover to draw it is reported like a
+  /// failed release, and never runs.
+  #[test]
+  fn immediate_start_without_overlay_fails_like_a_release() {
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    manager.animations.insert(id, test_spec());
+    manager.start_now(id, Instant::now());
+    assert!(!manager.is_running(&id));
+    assert_eq!(manager.take_failures(), HashSet::from([id]));
+    assert_eq!(manager.pending_starts, Vec::<Uuid>::new());
+  }
+
+  /// A retarget that carries velocity away from its new target travels
+  /// past its start, and the overlay's bounds must include that stretch.
+  #[test]
+  fn spring_path_bounds_include_carried_overshoot() {
+    if AnimationWindow::SELF_ANIMATING {
+      return;
+    }
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let effect = spring_effect(180, 0.0);
+    let plan = move_plan(&effect, Rect::from_xy(-3000, 0, 800, 600));
+    manager.prepare_native(id, &plan, Rect::from_xy(0, 0, 800, 600), 60);
+    manager.release_animation(&id);
+    manager.begin_pending();
+    let started = manager.running[&id].started;
+    manager.sample_frames(started + Duration::from_millis(30));
+    let observed = manager.native_frame(&id).expect("Native frame.");
+
+    // Reverse while moving left at speed.
+    let reverse = move_plan(&effect, Rect::from_xy(0, 0, 800, 600));
+    manager.prepare_native(id, &reverse, observed.clone(), 60);
+    let spec = &manager.animations[&id];
+    let bounds = spec.path_bounds();
+    let leftmost = (0..=64)
+      .map(|step| spec.rect_at(spec.duration * step / 64).left)
+      .min()
+      .expect("Samples.");
+
+    assert!(leftmost < observed.left, "{leftmost} vs {observed:?}");
+    assert!(bounds.left <= leftmost, "{bounds:?} vs {leftmost}");
+    assert!(bounds.contains_rect(&observed));
+    assert!(bounds.contains_rect(&Rect::from_xy(0, 0, 800, 600)));
+  }
+
+  /// A settled spring carries no velocity into a retarget.
+  #[test]
+  fn finished_motion_carries_no_velocity() {
+    if AnimationWindow::SELF_ANIMATING {
+      return;
+    }
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let effect = spring_effect(250, 0.0);
+    let plan = move_plan(&effect, Rect::from_xy(900, 0, 800, 600));
+    manager.prepare_native(id, &plan, Rect::from_xy(0, 0, 800, 600), 60);
+    manager.release_animation(&id);
+    manager.begin_pending();
+
+    let started = manager.running[&id].started;
+    let duration = manager.animations[&id].duration;
+    manager.sample_frames(started + duration);
+    assert_eq!(manager.carried_velocity(&id), [0.0; 4]);
+    assert!(manager.is_complete(&id));
   }
 
   #[test]
@@ -1298,9 +2263,13 @@ mod tests {
     assert_eq!(manager.native_frame(&id), Some(initial.clone()));
     assert_eq!(manager.native_target(&id), Some(&target));
     assert!(!manager.is_running(&id));
-    assert!(!manager.has_overlays());
+    assert!(manager.windows.is_empty());
     assert!(manager.context.is_none());
     assert_eq!(manager.clock.as_ref().map(|(rate, _)| *rate), Some(144));
+    // Preparation alone never starts motion; its batch releases it.
+    manager.begin_pending();
+    assert!(!manager.is_running(&id));
+    manager.release_animation(&id);
     manager.begin_pending();
     assert!(manager.is_running(&id));
     assert!(manager.take_failures().is_empty());
@@ -1328,6 +2297,7 @@ mod tests {
     let effect = AnimationEffectConfig::default();
     let plan = move_plan(&effect, Rect::from_xy(200, 100, 600, 400));
     manager.prepare_native(id, &plan, Rect::from_xy(0, 0, 400, 300), 60);
+    manager.release_animation(&id);
     manager.begin_pending();
     let observed = Rect::from_xy(37, 14, 420, 310);
     let replacement =
@@ -1336,11 +2306,57 @@ mod tests {
     assert_eq!(manager.native_frame(&id), Some(observed));
     assert_eq!(manager.native_target(&id), Some(&replacement.path.target));
     assert!(!manager.is_running(&id));
+    assert_eq!(manager.pending_starts, Vec::<Uuid>::new());
+    manager.release_animation(&id);
     assert_eq!(manager.pending_starts, vec![id]);
     manager.finish_animation(&id).expect("Cancellation.");
     manager.begin_pending();
     assert!(!manager.is_animating(&id));
     assert!(manager.clock.is_none());
+  }
+
+  /// Tick-driven motion completes only once a tick has sampled its end.
+  #[test]
+  fn completion_follows_the_sampled_tick() {
+    if AnimationWindow::SELF_ANIMATING {
+      return;
+    }
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    let spec = test_spec();
+    let duration = spec.duration;
+    manager.animations.insert(id, spec);
+    let started = Instant::now()
+      .checked_sub(duration * 2)
+      .expect("Clock predates the test.");
+    manager.running.insert(
+      id,
+      RunningMotion {
+        started,
+        sampled: Duration::ZERO,
+        completed: Arc::new(AtomicBool::new(false)),
+      },
+    );
+    assert!(!manager.is_complete(&id));
+    manager.sample_frames(started + duration);
+    assert!(manager.is_complete(&id));
+  }
+
+  /// A slide owns its window until it is handed off.
+  #[test]
+  fn slide_ownership_follows_the_spec() {
+    let mut manager = manager_without_overlays();
+    let id = Uuid::new_v4();
+    manager.animations.insert(id, test_spec());
+    assert!(!manager.owns_slide(&id));
+    let mut slide = test_spec();
+    slide.is_slide = true;
+    manager.animations.insert(id, slide);
+    assert!(manager.owns_slide(&id));
+    assert!(manager.has_presentations());
+    manager.finish_animation(&id).expect("Handoff.");
+    assert!(!manager.owns_slide(&id));
+    assert!(!manager.has_presentations());
   }
 
   /// Overlay geometry never becomes native placement.
@@ -1351,6 +2367,21 @@ mod tests {
     manager.animations.insert(id, test_spec());
     assert!(manager.native_frame(&id).is_none());
     assert!(manager.native_target(&id).is_none());
+  }
+
+  /// A sent window fades in place and never slides or moves natively.
+  #[test]
+  fn sent_window_fades_where_it_stands() {
+    let frame = Rect::from_xy(100, 100, 1000, 500);
+    let monitor = Rect::from_xy(0, 0, 3440, 1440);
+
+    let path = AnimationTrigger::WindowSent.path(&frame, &monitor);
+
+    assert_eq!(path.start, Some(frame.clone()));
+    assert_eq!(path.target, frame);
+    assert_eq!(path.opacity, Some((OpacityValue(1.0), OpacityValue(0.0))));
+    assert!(!AnimationTrigger::WindowSent.is_slide());
+    assert!(!AnimationTrigger::WindowSent.uses_native());
   }
 
   #[test]

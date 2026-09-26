@@ -46,6 +46,10 @@ pub fn handle_display_settings_changed(
     return Ok(());
   }
   state.native_sync.invalidate();
+  // The desktop changed under the layout; the user moved nothing. Like
+  // startup, the relayout cuts. Windows can also cross displays with a
+  // new scale here, which native motion does not yet handle.
+  state.pending_sync.set_skip_animations(true);
 
   let mut pending_monitors = state.monitors();
   let mut unmatched_displays = Vec::new();

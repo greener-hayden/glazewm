@@ -382,6 +382,43 @@ impl PlacementSession {
     }
   }
 
+  /// Publishes whether the WM draws the window's companions itself
+  /// during native motion.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: sets a window property that border renderers read.
+  /// - macOS: no-op; the platform has no companions.
+  pub fn mark_decorated(&self, decorated: bool) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.mark_decorated(decorated)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = decorated;
+      self.validate()
+    }
+  }
+
+  /// Publishes whether the window holds the WM's focus.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: sets a window property that border renderers read.
+  /// - macOS: no-op; the renderer reads focus from the front window.
+  pub fn mark_focused(&self, focused: bool) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.mark_focused(focused)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = focused;
+      self.validate()
+    }
+  }
+
   /// Observes native cloaking, including cloaks we did not apply.
   pub fn is_cloaked(&self) -> crate::Result<bool> {
     #[cfg(target_os = "windows")]

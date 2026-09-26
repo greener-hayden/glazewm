@@ -252,8 +252,8 @@ fn conceal_session(session: &NativeSession) -> crate::Result<()> {
 /// Queues a reservation's recovery. Never performs it inline.
 ///
 /// Callers include a `Drop` impl and a shell timer callback, both of which
-/// can run on the event thread, and recovery reaches the shell the same way
-/// concealment does.
+/// can run on the event thread, and recovery reaches the shell the same
+/// way concealment does.
 fn restore(pending: &Pending) {
   submit(Job::Restore(pending.session.clone()));
 }

@@ -21,6 +21,10 @@ pub struct PendingSync {
   /// Newly managed windows that should have an opening animation.
   open_animation_windows: Vec<WindowContainer>,
 
+  /// Visible windows sent to a hidden workspace, which fade out where
+  /// they are before they are hidden.
+  sent_windows: Vec<WindowContainer>,
+
   /// Whether native focus should be reassigned to the WM's focused
   /// container.
   needs_focus_update: bool,
@@ -35,21 +39,18 @@ pub struct PendingSync {
   /// user config).
   needs_cursor_jump: bool,
 
-  /// Whether to skip animations for the current sync.
+  /// Whether to skip animations on every monitor for the current sync.
   skip_animations: bool,
 
-  /// Set when this sync is a workspace switch, to the direction the
-  /// content travels. Windows being shown enter from the opposite side;
-  /// windows being hidden leave toward it.
-  workspace_slide: Option<SlideDirection>,
-
-  /// Monitor whose displayed workspace is changing.
+  /// Workspace switches in this sync, keyed by the switching monitor.
   ///
-  /// A switch belongs to one monitor, but the slide is a property of the
-  /// whole sync, so without this every window queued for redraw picks up
-  /// a slide trigger — including windows on other monitors, which fly off
-  /// screen and are dragged back for a switch that never involved them.
-  workspace_slide_monitor: Option<Uuid>,
+  /// The value is the direction the content travels, or `None` for a
+  /// switch that cuts. Windows being shown enter from the opposite side;
+  /// windows being hidden leave toward it. A switch belongs to one
+  /// monitor, so a cut or slide on one display never decides the motion
+  /// of windows on another, and two switches in one sync each keep their
+  /// own.
+  workspace_transitions: HashMap<Uuid, Option<SlideDirection>>,
 }
 
 impl PendingSync {
@@ -57,6 +58,7 @@ impl PendingSync {
     !self.containers_to_redraw.is_empty()
       || !self.workspaces_to_reorder.is_empty()
       || !self.open_animation_windows.is_empty()
+      || !self.sent_windows.is_empty()
       || self.needs_focus_update
       || self.needs_focused_effect_update
       || self.needs_all_effects_update
@@ -67,13 +69,13 @@ impl PendingSync {
     self.containers_to_redraw.clear();
     self.workspaces_to_reorder.clear();
     self.open_animation_windows.clear();
+    self.sent_windows.clear();
     self.needs_focus_update = false;
     self.needs_focused_effect_update = false;
     self.needs_all_effects_update = false;
     self.needs_cursor_jump = false;
     self.skip_animations = false;
-    self.workspace_slide = None;
-    self.workspace_slide_monitor = None;
+    self.workspace_transitions.clear();
     self
   }
 
@@ -129,6 +131,15 @@ impl PendingSync {
     self
   }
 
+  /// Queues a visible window leaving for a hidden workspace.
+  pub fn queue_sent_window(
+    &mut self,
+    window: WindowContainer,
+  ) -> &mut Self {
+    self.sent_windows.push(window);
+    self
+  }
+
   pub fn queue_focus_change(&mut self) -> &mut Self {
     self.needs_focus_update = true;
     self
@@ -154,30 +165,41 @@ impl PendingSync {
     self
   }
 
-  pub fn should_skip_animations(&self) -> bool {
+  /// Whether windows on `monitor_id` cut rather than animate this sync.
+  ///
+  /// True when animations are skipped everywhere, or when the monitor
+  /// switches workspace without a slide.
+  pub fn should_skip_animations_for(&self, monitor_id: Uuid) -> bool {
     self.skip_animations
+      || self
+        .workspace_transitions
+        .get(&monitor_id)
+        .is_some_and(Option::is_none)
   }
 
   /// Marks this sync as a workspace switch on `monitor_id`, travelling
-  /// in `direction`.
-  pub fn set_workspace_slide(
+  /// in `direction`, or cutting when `direction` is `None`.
+  ///
+  /// A later switch on the same monitor replaces an earlier one.
+  pub fn set_workspace_transition(
     &mut self,
+    monitor_id: Uuid,
     direction: Option<SlideDirection>,
-    monitor_id: Option<Uuid>,
   ) -> &mut Self {
-    self.workspace_slide = direction;
-    self.workspace_slide_monitor = monitor_id;
+    self.workspace_transitions.insert(monitor_id, direction);
     self
   }
 
-  /// The direction this switch travels for a window on `monitor_id`, or
-  /// `None` if that monitor is not the one switching.
+  /// The direction a switch travels for a window on `monitor_id`, or
+  /// `None` if that monitor is not sliding.
   pub fn workspace_slide_for(
     &self,
     monitor_id: Uuid,
   ) -> Option<SlideDirection> {
-    (self.workspace_slide_monitor == Some(monitor_id))
-      .then_some(self.workspace_slide)
+    self
+      .workspace_transitions
+      .get(&monitor_id)
+      .copied()
       .flatten()
   }
 
@@ -207,5 +229,9 @@ impl PendingSync {
 
   pub fn open_animation_windows(&self) -> &Vec<WindowContainer> {
     &self.open_animation_windows
+  }
+
+  pub fn sent_windows(&self) -> &Vec<WindowContainer> {
+    &self.sent_windows
   }
 }

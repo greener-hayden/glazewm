@@ -61,6 +61,24 @@ gaps:
 # (see `window_rules` below) are never touched by any animation at all:
 # no capture, no overlay, no style changes. Recommended for games with
 # anti-cheat.
+#
+# `easing` is one of 'linear', 'ease_in', 'ease_out', 'ease_in_out',
+# 'ease_in_cubic', 'ease_out_cubic', 'ease_in_out_cubic' or 'spring'.
+#
+# 'spring' moves like a physical spring, as on macOS and iOS. A window
+# that is retargeted mid-flight keeps its speed instead of restarting.
+# - `duration_ms` is the perceptual duration: about when the motion
+#   looks finished. The spring then settles to within half a pixel,
+#   which takes somewhat longer.
+# - `bounce` sets the springiness, from -1.0 to 1.0 (default 0.0).
+#   0.0 glides in without overshoot, positive values overshoot and
+#   wobble (0.15 is subtle, 0.3 is playful), and negative values ease
+#   in more slowly. Values beyond +/-0.9 are treated as +/-0.9.
+# Example:
+#   window_move:
+#     duration_ms: 250
+#     easing: 'spring'
+#     bounce: 0.1
 animations:
   # window_move:
   #   duration_ms: 180
@@ -69,6 +87,11 @@ animations:
   # window_open:
   #   duration_ms: 180
   #   easing: 'ease_out'
+  # Fades out a window sent to a hidden workspace before it is hidden.
+  # Closing a window is never animated.
+  # window_close:
+  #   duration_ms: 140
+  #   easing: 'ease_in'
   # Slides the outgoing workspace off screen and the incoming one on, in
   # the direction of travel. Unlike `window_move`, this treats the switch
   # as one motion: every window on both workspaces travels a full monitor

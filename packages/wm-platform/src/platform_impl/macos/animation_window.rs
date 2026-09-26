@@ -26,6 +26,12 @@ use crate::{
 /// Core Animation expresses easing as a timing curve rather than a
 /// per-frame function, so each variant maps to the curve that matches
 /// `EasingFunction::apply` most closely.
+///
+/// `Spring` is an approximation: the curve is the closest cubic to a
+/// critically damped spring over its settle time, within about 2% of the
+/// travel. It ignores bounce and does not carry velocity into a retarget,
+/// because the implicit layer animations used here take one timing
+/// function for every property and have no spring form.
 const fn control_points(easing: &EasingFunction) -> (f32, f32, f32, f32) {
   match easing {
     EasingFunction::Linear => (0.0, 0.0, 1.0, 1.0),
@@ -35,6 +41,7 @@ const fn control_points(easing: &EasingFunction) -> (f32, f32, f32, f32) {
     EasingFunction::EaseInCubic => (0.55, 0.055, 0.675, 0.19),
     EasingFunction::EaseOutCubic => (0.215, 0.61, 0.355, 1.0),
     EasingFunction::EaseInOutCubic => (0.645, 0.045, 0.355, 1.0),
+    EasingFunction::Spring => (0.29, 0.48, 0.03, 1.0),
   }
 }
 
@@ -326,6 +333,14 @@ impl AnimationWindow {
         )
       })
     })
+  }
+
+  /// Implements [`AnimationWindow::companions_revealed`].
+  ///
+  /// Always `true`; macOS has no companions.
+  #[allow(clippy::unused_self)]
+  pub(crate) fn companions_revealed(&self) -> bool {
+    true
   }
 
   /// Implements [`AnimationWindow::destroy`].

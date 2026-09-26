@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use wm_platform::{
   Color, CornerStyle, EasingFunction, Key, Keybinding, LengthValue,
-  OpacityValue, RectDelta,
+  OpacityValue, RectDelta, Spring,
 };
 
 use crate::app_command::InvokeCommand;
@@ -395,6 +397,12 @@ pub struct WorkspaceConfig {
 pub struct AnimationsConfig {
   pub window_move: Option<WindowMoveAnimationConfig>,
   pub window_open: Option<AnimationEffectConfig>,
+  /// Fades out a visible window sent to a hidden workspace, where it
+  /// stands, before it is hidden.
+  ///
+  /// Closing a window stays a cut: its surface is gone at once, and a
+  /// fade would need a captured frame to show.
+  pub window_close: Option<AnimationEffectConfig>,
   /// Slides the outgoing workspace off screen and the incoming one on,
   /// in the direction of travel.
   ///
@@ -411,6 +419,7 @@ impl AnimationsConfig {
   pub const fn is_enabled(&self) -> bool {
     self.window_move.is_some()
       || self.window_open.is_some()
+      || self.window_close.is_some()
       || self.workspace_switch.is_some()
   }
 }
@@ -438,8 +447,28 @@ impl Default for WindowMoveAnimationConfig {
 #[serde(default, rename_all(serialize = "camelCase"))]
 pub struct AnimationEffectConfig {
   pub effect_type: AnimationEffect,
+  /// Length of a curve easing. For `easing: spring`, the perceptual
+  /// duration; the motion runs until the spring settles.
   pub duration_ms: u32,
   pub easing: EasingFunction,
+  /// Springiness of `easing: spring`, from `-1.0` to `1.0`.
+  ///
+  /// `0.0` is critically damped, positive values overshoot, and negative
+  /// values are over-damped. Magnitudes above `SPRING_BOUNCE_LIMIT` are
+  /// clamped to it. Ignored by curve easings.
+  pub bounce: f32,
+}
+
+impl AnimationEffectConfig {
+  /// Returns the spring for `easing: spring`, or `None` for a curve
+  /// easing.
+  #[must_use]
+  pub fn spring(&self) -> Option<Spring> {
+    self.easing.spring(
+      Duration::from_millis(u64::from(self.duration_ms)),
+      self.bounce,
+    )
+  }
 }
 
 impl Default for AnimationEffectConfig {
@@ -448,6 +477,7 @@ impl Default for AnimationEffectConfig {
       effect_type: AnimationEffect::default(),
       duration_ms: 200,
       easing: EasingFunction::default(),
+      bounce: 0.0,
     }
   }
 }
@@ -543,5 +573,88 @@ where
   #[cfg(not(target_os = "macos"))]
   {
     Ok(method)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use anyhow::Context;
+  use wm_platform::SPRING_BOUNCE_LIMIT;
+
+  use super::*;
+
+  /// Parses an `animations` block.
+  fn parse(yaml: &str) -> anyhow::Result<AnimationsConfig> {
+    Ok(serde_yaml::from_str(yaml)?)
+  }
+
+  #[test]
+  fn curve_configs_parse_unchanged() -> anyhow::Result<()> {
+    let config = parse(
+      &[
+        "window_move:",
+        "  duration_ms: 180",
+        "  easing: 'ease_in_out'",
+        "  trigger_threshold: '10px'",
+        "workspace_switch:",
+        "  duration_ms: 200",
+        "  easing: 'ease_out_cubic'",
+      ]
+      .join("\n"),
+    )?;
+
+    let window_move = config.window_move.context("No window move.")?;
+    assert_eq!(window_move.effect.duration_ms, 180);
+    assert_eq!(window_move.effect.easing, EasingFunction::EaseInOut);
+    assert!(window_move.effect.bounce.abs() < f32::EPSILON);
+    assert!(window_move.effect.spring().is_none());
+
+    let switch = config.workspace_switch.context("No switch.")?;
+    assert_eq!(switch.easing, EasingFunction::EaseOutCubic);
+    assert!(switch.spring().is_none());
+    Ok(())
+  }
+
+  #[test]
+  fn spring_config_parses_with_bounce() -> anyhow::Result<()> {
+    let config = parse(
+      &[
+        "window_move:",
+        "  duration_ms: 250",
+        "  easing: 'spring'",
+        "  bounce: 0.1",
+        "window_open:",
+        "  duration_ms: 350",
+        "  easing: 'spring'",
+        "workspace_switch:",
+        "  duration_ms: 300",
+        "  easing: 'spring'",
+        "  bounce: -2",
+      ]
+      .join("\n"),
+    )?;
+
+    let window_move = config.window_move.context("No window move.")?;
+    assert_eq!(window_move.effect.easing, EasingFunction::Spring);
+    assert_eq!(
+      window_move.effect.spring(),
+      Some(Spring::new(Duration::from_millis(250), 0.1)),
+    );
+
+    // Bounce defaults to a critically damped spring.
+    let open = config.window_open.context("No window open.")?;
+    assert!(open.bounce.abs() < f32::EPSILON);
+    let spring = open.spring().context("No spring.")?;
+    assert!((spring.damping_ratio() - 1.0).abs() < 1e-9);
+
+    let switch = config.workspace_switch.context("No switch.")?;
+    assert_eq!(
+      switch.spring(),
+      Some(Spring::new(
+        Duration::from_millis(300),
+        -SPRING_BOUNCE_LIMIT,
+      )),
+    );
+    Ok(())
   }
 }

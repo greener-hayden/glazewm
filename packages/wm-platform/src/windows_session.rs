@@ -7,14 +7,16 @@ use windows::{
       Gdi::{MonitorFromRect, MONITOR_DEFAULTTONEAREST},
     },
     UI::{
+      Accessibility::NotifyWinEvent,
       HiDpi::{
         GetAwarenessFromDpiAwarenessContext, GetDpiForWindow,
         GetWindowDpiAwarenessContext, DPI_AWARENESS_PER_MONITOR_AWARE,
       },
       WindowsAndMessaging::{
         EnumWindows, GetClassLongPtrW, GetPropW, GetWindowThreadProcessId,
-        RemovePropW, SendMessageTimeoutW, SetPropW, CS_CLASSDC, CS_OWNDC,
-        GCL_STYLE, MINMAXINFO, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+        RemovePropW, SendMessageTimeoutW, SetPropW, CHILDID_SELF,
+        CS_CLASSDC, CS_OWNDC, EVENT_OBJECT_STATECHANGE, GCL_STYLE,
+        MINMAXINFO, OBJID_WINDOW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
         WM_GETMINMAXINFO, WS_DLGFRAME, WS_EX_LAYERED,
         WS_EX_NOREDIRECTIONBITMAP,
       },
@@ -30,8 +32,59 @@ const OWNER: PCWSTR = w!("GlazeWM.greener.owner.v1");
 /// Recovery flags, also a contract for other processes.
 ///
 /// Border renderers read `PRESENTED` to hide a ring while an overlay
-/// stands in for the window. The property name and bit values are stable.
+/// stands in for the window, `DECORATED` to hide it while the WM draws
+/// the ring itself during native motion, and `FOCUSED` to colour a ring
+/// for the WM's focus before the OS foreground follows it. Every change
+/// to `PRESENTED`, `DECORATED` or `FOCUSED` is followed by
+/// `EVENT_OBJECT_STATECHANGE` on the window (`OBJID_WINDOW`,
+/// `CHILDID_SELF`), so readers can react without polling. The property
+/// name and bit values are stable.
 const CHANGES: PCWSTR = w!("GlazeWM.greener.changes.v1");
+/// Companion registration, a contract for other processes.
+///
+/// A companion is a top-level window of another process that decorates a
+/// managed window, such as one band of a border ring. It opts in by
+/// setting this property on itself, with the managed window's `HWND` as
+/// the value. The WM only reads the property; the companion owns it.
+///
+/// The WM draws companions itself in two cases, each flagged in
+/// `CHANGES`. The companion should hide itself, by cloaking itself or at
+/// alpha 0, while either flag is set; its thumbnail keeps rendering
+/// either way.
+///
+/// - Overlay motion (`PRESENTED`): an overlay stands in for the window and
+///   draws each companion as a DWM thumbnail above the window's own
+///   thumbnail. Each update maps the companion's live window rect through
+///   the transform that maps the window's frame to its animated rect: the
+///   same translation and scale, clipped to the overlay, at the same
+///   opacity. Both thumbnails move in one compositor batch.
+/// - Native motion (`DECORATED`): the WM moves the real window, and a
+///   transparent overlay directly above it in the z-order draws only the
+///   companions. When the motion starts the WM records each companion's
+///   window rect and the window's rect. Each frame the WM requests for the
+///   window, it redraws every companion from that record with each edge
+///   anchored to the nearer parallel window edge, keeping its offset. A
+///   band therefore keeps its thickness and stretches with the window. The
+///   thumbnails are updated right after the window's own move request, so
+///   the decoration follows the WM's requests rather than trailing the
+///   move events. A companion that changes shape relative to the window
+///   during the motion is drawn with its recorded shape.
+///
+/// - Companions are found by enumerating top-level windows when the
+///   overlay is prepared. During overlay motion, until one is found, the
+///   search repeats at most every 16ms, and one found late fades in over
+///   80ms. Native motion searches only when it starts; a window without
+///   companions gets no overlay and no flag.
+/// - A companion that is destroyed, or whose property no longer names the
+///   window, is dropped. A failing companion never fails or stalls the
+///   window's own motion.
+/// - At the reveal, the flag is cleared and the overlay is held until
+///   every companion reports `DWMWA_CLOAKED` as 0 or is gone, for at most
+///   50ms after the flag cleared. A companion that uncloaks itself when
+///   the flag clears is therefore never missing for a frame.
+///
+/// The property name and value format are stable.
+pub(crate) const COMPANION: PCWSTR = w!("GlazeWM.greener.companion.v1");
 const FRAME: [PCWSTR; 4] = [
   w!("GlazeWM.greener.left.v1"),
   w!("GlazeWM.greener.top.v1"),
@@ -45,6 +98,11 @@ const PARKED: isize = 8;
 const TITLE: isize = 16;
 const ORIGINAL_TITLE: isize = 32;
 const PRESENTED: isize = 64;
+const FOCUSED: isize = 128;
+/// Set while the WM draws the window's companions itself during native
+/// motion; the window's own pixels are real. Companions treat it like
+/// `PRESENTED`: stay drawn, self-cloaked, and uncloak when it clears.
+const DECORATED: isize = 256;
 
 /// Describes safe opacity mutations.
 #[derive(Debug, PartialEq)]
@@ -306,15 +364,48 @@ impl NativeSession {
   /// Nothing native changes; the flag tells other processes that the
   /// pixels at this window's frame are not what the user sees.
   pub fn present(&self, presenting: bool) -> crate::Result<()> {
+    self.set_flag(PRESENTED, presenting)
+  }
+
+  /// Marks the window as the WM's focus.
+  ///
+  /// The OS foreground follows only once the window is revealed, so a
+  /// window arriving with a workspace is shown before it is foreground.
+  /// The flag lets other processes know its focus from the start.
+  pub fn mark_focused(&self, focused: bool) -> crate::Result<()> {
+    self.set_flag(FOCUSED, focused)
+  }
+
+  /// Marks the window as decorated by the WM during native motion.
+  ///
+  /// Nothing native changes; the flag tells companions that the WM draws
+  /// them above the moving window, so they should hide themselves until
+  /// it clears. See `COMPANION`.
+  pub fn mark_decorated(&self, decorated: bool) -> crate::Result<()> {
+    self.set_flag(DECORATED, decorated)
+  }
+
+  /// Sets or clears one published bit of the shared `CHANGES` property.
+  ///
+  /// Only for `PRESENTED`, `DECORATED` and `FOCUSED`: an actual change
+  /// raises `EVENT_OBJECT_STATECHANGE` so readers need not poll.
+  /// Recovery bits are private and change without notice.
+  fn set_flag(&self, flag: isize, set: bool) -> crate::Result<()> {
     self.validate()?;
     let changes = property(&self.window, CHANGES);
-    let updated = if presenting {
-      changes | PRESENTED
-    } else {
-      changes & !PRESENTED
-    };
+    let updated = if set { changes | flag } else { changes & !flag };
     if updated != changes {
       put_property(&self.window, CHANGES, updated)?;
+      let child = i32::try_from(CHILDID_SELF)?;
+      // SAFETY: Raises an event for a live window; no memory is passed.
+      unsafe {
+        NotifyWinEvent(
+          EVENT_OBJECT_STATECHANGE,
+          self.window.hwnd(),
+          OBJID_WINDOW.0,
+          child,
+        );
+      }
     }
     Ok(())
   }

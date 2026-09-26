@@ -110,8 +110,7 @@ pub fn focus_workspace(
       // unconditionally.
       state
         .pending_sync
-        .set_skip_animations(slide.is_none())
-        .set_workspace_slide(slide, Some(monitor.id()))
+        .set_workspace_transition(monitor.id(), slide)
         .queue_container_to_redraw(displayed_workspace)
         .queue_container_to_redraw(target_workspace.clone());
 

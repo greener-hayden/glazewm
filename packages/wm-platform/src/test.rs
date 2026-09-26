@@ -4,6 +4,9 @@
 extern crate libtest_mimic_collect;
 
 mod animation_window;
+// LINT: See `lib.rs`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod companion;
 mod dispatcher;
 mod display;
 mod display_listener;

@@ -3374,6 +3374,7 @@ dependencies = [
  "clap",
  "regex",
  "serde",
+ "serde_yaml",
  "tracing",
  "uuid",
  "wm-platform",

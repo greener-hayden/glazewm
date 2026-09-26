@@ -10,6 +10,7 @@ mod opacity_value;
 mod point;
 mod rect;
 mod rect_delta;
+mod spring;
 
 pub use color::*;
 pub use corner_style::*;
@@ -23,3 +24,4 @@ pub use opacity_value::*;
 pub use point::*;
 pub use rect::*;
 pub use rect_delta::*;
+pub use spring::*;

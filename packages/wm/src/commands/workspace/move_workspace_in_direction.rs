@@ -48,9 +48,14 @@ pub fn move_workspace_in_direction(
       );
     }
 
+    // Both monitors change what they display, and no single motion
+    // describes that: some windows would cross displays while the sheets
+    // revealed behind them cut. The whole transition cuts instead.
     state
       .pending_sync
       .queue_cursor_jump()
+      .set_workspace_transition(origin_monitor.id(), None)
+      .set_workspace_transition(target_monitor.id(), None)
       .queue_container_to_redraw(workspace.clone())
       .queue_container_to_redraw(displayed_workspace);
 

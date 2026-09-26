@@ -3,6 +3,10 @@
 #![feature(iterator_try_collect)]
 
 mod animation_window;
+// LINT: Only Windows draws companions; the math compiles everywhere so
+// it stays testable.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod companion;
 mod dispatcher;
 mod display;
 mod display_listener;

@@ -5,6 +5,37 @@ use wm_platform::Rect;
 const RETRY_WAIT: Duration = Duration::from_millis(250);
 const MAX_ATTEMPTS: u8 = 3;
 
+/// Longest wait for an application to apply a frame write before the
+/// next one is issued anyway.
+///
+/// Windows frame writes are queued on the application's own thread. An
+/// application slower than the frame clock (File Explorer takes over a
+/// frame per resize) otherwise falls behind by a write every frame: it
+/// replays the backlog long after the motion has ended, and a close
+/// posted meanwhile waits behind it. Only a hung application reaches
+/// this bound.
+const APPLY_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// A frame write the application has not been observed to apply.
+#[derive(Clone, Debug)]
+struct UnappliedWrite {
+  rect: Rect,
+  /// The observation the write was issued against.
+  before: Option<ObservedFrame>,
+  at: Instant,
+}
+
+impl UnappliedWrite {
+  /// Whether `observed` shows the application has acted on the write.
+  ///
+  /// An application may clamp or adjust the rect, so any change from the
+  /// frame the write was issued against also counts.
+  fn applied(&self, observed: &ObservedFrame) -> bool {
+    frames_match(&self.rect, &observed.rect)
+      || self.before.as_ref() != Some(observed)
+  }
+}
+
 /// Describes native show-state intent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeState {
@@ -68,13 +99,26 @@ pub struct FrameReconciler {
   accepted_at: Option<Instant>,
   previous: Option<ObservedFrame>,
   stable_since: Option<Instant>,
+  /// The last frame write, until the application is seen to apply it.
+  ///
+  /// Survives `restart`: a retarget does not recall a write already
+  /// queued on the application.
+  unapplied: Option<UnappliedWrite>,
 }
 
 impl FrameReconciler {
   /// Schedules only outstanding request recovery, never periodic polling.
+  ///
+  /// A pending write held behind an unapplied one waits for the
+  /// application's move event, with `APPLY_TIMEOUT` as the fallback.
   pub fn deadline(&self) -> Option<Instant> {
     match self.phase {
-      ReconcilePhase::Pending => Some(Instant::now()),
+      ReconcilePhase::Pending => Some(
+        self
+          .unapplied
+          .as_ref()
+          .map_or_else(Instant::now, |write| write.at + APPLY_TIMEOUT),
+      ),
       ReconcilePhase::Accepted => {
         self.accepted_at.map(|at| at + RETRY_WAIT)
       }
@@ -91,6 +135,7 @@ impl FrameReconciler {
       accepted_at: None,
       previous: None,
       stable_since: None,
+      unapplied: None,
     }
   }
 
@@ -179,6 +224,13 @@ impl FrameReconciler {
     self.phase = ReconcilePhase::Accepted;
     self.accepted_at = Some(now);
     self.attempts = self.attempts.saturating_add(1);
+    if let NativeMutation::Frame(rect) = &request.mutation {
+      self.unapplied = Some(UnappliedWrite {
+        rect: rect.clone(),
+        before: self.previous.clone(),
+        at: now,
+      });
+    }
   }
 
   /// Terminates failed requests without declaring convergence.
@@ -199,6 +251,13 @@ impl FrameReconciler {
       self.phase = ReconcilePhase::Pending;
       self.accepted_at = None;
       self.attempts = 0;
+    }
+    if self
+      .unapplied
+      .as_ref()
+      .is_some_and(|write| write.applied(observed))
+    {
+      self.unapplied = None;
     }
     if self.previous.as_ref() != Some(observed) {
       self.previous = Some(observed.clone());
@@ -233,6 +292,16 @@ impl FrameReconciler {
     if self
       .accepted_at
       .is_some_and(|at| now.saturating_duration_since(at) < RETRY_WAIT)
+    {
+      return None;
+    }
+    // Keep at most one frame write queued on the application. The next
+    // write carries the latest target, so skipped frames cost smoothness
+    // on a slow application, never time.
+    if matches!(mutation, Some(NativeMutation::Frame(_)))
+      && self.unapplied.as_ref().is_some_and(|write| {
+        now.saturating_duration_since(write.at) < APPLY_TIMEOUT
+      })
     {
       return None;
     }
@@ -417,6 +486,99 @@ mod tests {
     sync.accepted(&request, Instant::now());
     assert!(!sync.accepts(&request));
     assert_eq!(sync.phase, ReconcilePhase::Pending);
+  }
+
+  /// Moves `sync` to a target 10px further right each call, as native
+  /// motion does every frame.
+  fn advance(sync: &mut FrameReconciler) {
+    let mut target = sync.desired.clone();
+    target.rect = target
+      .rect
+      .translate_to_coordinates(target.rect.left + 10, target.rect.top);
+    sync.retarget(target);
+  }
+
+  /// Holds motion writes while the application has not applied the last
+  /// one, then writes the latest target.
+  #[test]
+  fn holds_frame_writes_until_applied() {
+    let (mut sync, observed) = fixture();
+    let now = Instant::now();
+    advance(&mut sync);
+    let first = sync.next(&observed, now).expect("First write.");
+    sync.accepted(&first, now);
+    sync.observe(&observed, now);
+
+    let frame = Duration::from_millis(7);
+    advance(&mut sync);
+    advance(&mut sync);
+    assert!(sync.next(&observed, now + frame).is_none());
+    assert_eq!(sync.deadline(), Some(now + APPLY_TIMEOUT));
+
+    let NativeMutation::Frame(written) = first.mutation else {
+      panic!("Expected a frame write.");
+    };
+    let applied = ObservedFrame {
+      rect: written,
+      ..observed
+    };
+    let request = sync
+      .next(&applied, now + frame * 2)
+      .expect("Applied write releases the latest target.");
+    assert_eq!(
+      request.mutation,
+      NativeMutation::Frame(sync.desired.rect.clone())
+    );
+  }
+
+  /// Writes again once an application has left a write unapplied for
+  /// `APPLY_TIMEOUT`.
+  #[test]
+  fn bounds_unapplied_frame_writes() {
+    let (mut sync, observed) = fixture();
+    let now = Instant::now();
+    advance(&mut sync);
+    let request = sync.next(&observed, now).expect("First write.");
+    sync.accepted(&request, now);
+    advance(&mut sync);
+    let early =
+      now + APPLY_TIMEOUT.saturating_sub(Duration::from_millis(1));
+    assert!(sync.next(&observed, early).is_none());
+    assert!(sync.next(&observed, now + APPLY_TIMEOUT).is_some());
+  }
+
+  /// An application that clamps a write has still applied it.
+  #[test]
+  fn clamped_frame_write_counts_as_applied() {
+    let (mut sync, observed) = fixture();
+    let now = Instant::now();
+    advance(&mut sync);
+    let request = sync.next(&observed, now).expect("First write.");
+    sync.accepted(&request, now);
+    advance(&mut sync);
+    let clamped = ObservedFrame {
+      rect: observed.rect.translate_to_coordinates(
+        observed.rect.left + 3,
+        observed.rect.top,
+      ),
+      ..observed
+    };
+    assert!(sync.next(&clamped, now).is_some());
+  }
+
+  /// State requests are not held behind an unapplied frame write.
+  #[test]
+  fn state_requests_skip_unapplied_frame_writes() {
+    let (mut sync, mut observed) = fixture();
+    let now = Instant::now();
+    advance(&mut sync);
+    let request = sync.next(&observed, now).expect("First write.");
+    sync.accepted(&request, now);
+    sync.desired.state = NativeState::Minimized;
+    sync.restart();
+    observed.state = NativeState::Normal;
+    let request = sync.next(&observed, now).expect("Minimize request.");
+    assert_eq!(request.mutation, NativeMutation::Minimize);
   }
 
   /// Never executes stale accepted operations.

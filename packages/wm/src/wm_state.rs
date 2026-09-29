@@ -90,6 +90,10 @@ pub struct WmState {
   /// `ignore` command.
   pub ignored_windows: Vec<NativeWindow>,
 
+  /// Shown windows whose manageability could not be checked, because the
+  /// application did not answer. Their next window event checks again.
+  pub unresolved_windows: Vec<NativeWindow>,
+
   /// Whether the WM is paused.
   pub is_paused: bool,
 
@@ -131,6 +135,7 @@ impl WmState {
       pending_follow: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
+      unresolved_windows: Vec::new(),
       is_paused: false,
       is_focus_synced: false,
       has_initialized: false,
@@ -801,6 +806,7 @@ impl WmState {
 
     // Prune ignored windows that are no longer valid.
     self.ignored_windows.retain(NativeWindow::is_valid);
+    self.unresolved_windows.retain(NativeWindow::is_valid);
 
     Ok(())
   }

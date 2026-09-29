@@ -23,8 +23,8 @@ use crate::{
     monitor::focus_monitor,
     window::{
       ignore_window, move_window_in_direction, move_window_to_workspace,
-      resize_window, set_window_position, set_window_size,
-      update_window_state, WindowPositionTarget,
+      resize_window, retry_unresolved_window, set_window_position,
+      set_window_size, update_window_state, WindowPositionTarget,
     },
     workspace::{
       focus_workspace, move_workspace_in_direction,
@@ -138,6 +138,7 @@ impl WindowManager {
       }
       PlatformEvent::Window(window_event) => match window_event {
         WindowEvent::Focused { window, .. } => {
+          retry_unresolved_window(&window, state, config)?;
           handle_window_focused(&window, state, config)
         }
         WindowEvent::Shown { window, .. } => {
@@ -151,13 +152,16 @@ impl WindowManager {
           is_interactive_start,
           is_interactive_end,
           ..
-        } => handle_window_moved_or_resized(
-          &window,
-          is_interactive_start,
-          is_interactive_end,
-          state,
-          config,
-        ),
+        } => {
+          retry_unresolved_window(&window, state, config)?;
+          handle_window_moved_or_resized(
+            &window,
+            is_interactive_start,
+            is_interactive_end,
+            state,
+            config,
+          )
+        }
         WindowEvent::Minimized { window, .. } => {
           handle_window_minimized(&window, state, config)
         }
@@ -165,6 +169,7 @@ impl WindowManager {
           handle_window_minimize_ended(&window, state, config)
         }
         WindowEvent::TitleChanged { window, .. } => {
+          retry_unresolved_window(&window, state, config)?;
           handle_window_title_changed(&window, state, config)
         }
         WindowEvent::Destroyed { window_id, .. } => {

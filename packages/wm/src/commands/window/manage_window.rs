@@ -1,5 +1,5 @@
 use anyhow::Context;
-use tracing::info;
+use tracing::{info, warn};
 use wm_common::{try_warn, WindowRuleEvent, WindowState, WmEvent};
 use wm_platform::{NativeWindow, RectDelta};
 
@@ -26,9 +26,28 @@ pub fn manage_window(
   state: &mut WmState,
   config: &mut UserConfig,
 ) -> anyhow::Result<()> {
-  let Some(native_properties) =
-    check_is_manageable(&native_window).unwrap_or(None)
-  else {
+  // A failed check is not a verdict: the application may be busy, and a
+  // window dropped here would never be offered again.
+  let native_properties = match check_is_manageable(&native_window) {
+    Ok(properties) => {
+      state
+        .unresolved_windows
+        .retain(|window| *window != native_window);
+      properties
+    }
+    Err(err) => {
+      if !state.unresolved_windows.contains(&native_window) {
+        warn!(
+          "Window {} could not be checked: {err}. Checking again on its \
+           next event.",
+          native_window.id().0
+        );
+        state.unresolved_windows.push(native_window);
+      }
+      return Ok(());
+    }
+  };
+  let Some(native_properties) = native_properties else {
     return Ok(());
   };
 
@@ -84,6 +103,23 @@ pub fn manage_window(
     );
 
     state.pending_sync.queue_open_animation_window(window);
+  }
+
+  Ok(())
+}
+
+/// Checks a window again whose manageability check failed earlier.
+///
+/// Called for each window event; free while no window is unresolved.
+pub fn retry_unresolved_window(
+  native_window: &NativeWindow,
+  state: &mut WmState,
+  config: &mut UserConfig,
+) -> anyhow::Result<()> {
+  if state.unresolved_windows.contains(native_window)
+    && state.window_from_native(native_window).is_none()
+  {
+    manage_window(native_window.clone(), None, state, config)?;
   }
 
   Ok(())

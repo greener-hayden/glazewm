@@ -773,6 +773,25 @@ mod tests {
     assert!(sync.next(&observed, Instant::now()).is_some());
   }
 
+  /// Accepts a title bar taller than any fixed allowance, clamped by the
+  /// window's own height (Spotify's toolbar holds it 63px up).
+  #[test]
+  fn converges_on_tall_title_bar() {
+    let (mut sync, mut observed) = parked_fixture(300);
+    observed.rect = observed.rect.translate_to_coordinates(-399, 1016);
+    assert!(sync.next(&observed, Instant::now()).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+  }
+
+  /// A window left at its tile's height never reached the parking row,
+  /// even with a height-sized clamp.
+  #[test]
+  fn rejects_unapplied_vertical_parking() {
+    let (mut sync, mut observed) = parked_fixture(300);
+    observed.rect = observed.rect.translate_to_coordinates(-399, 44);
+    assert!(sync.next(&observed, Instant::now()).is_some());
+  }
+
   /// Without a clamp, parking matches as exactly as any other frame.
   #[test]
   fn exact_parking_without_clamp() {

@@ -1104,7 +1104,8 @@ fn desired_frame(
     monitor: monitor.bounds.clone(),
     dpi: native.expected_dpi(monitor.dpi)?,
     state,
-    parking_clamp: parked.then_some(PlacementSession::PARKING_CLAMP),
+    parking_clamp: parked
+      .then(|| PlacementSession::parking_clamp(target.height())),
   })
 }
 
@@ -1834,7 +1835,7 @@ fn reconcile_managed(
     && crate::native_reconciler::parked_frames_match(
       &parking_rect(&observed.rect, &monitor.working_area, hide_corner),
       &observed.rect,
-      PlacementSession::PARKING_CLAMP,
+      PlacementSession::parking_clamp(observed.rect.height()),
     )
   {
     anyhow::bail!("Source restoration remains parked.");

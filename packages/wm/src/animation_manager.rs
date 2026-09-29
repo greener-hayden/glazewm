@@ -1876,7 +1876,11 @@ mod tests {
     let velocity = spec.velocity_at(Duration::from_millis(100));
     assert!((velocity[0] - 2000.0).abs() < 1.0, "{velocity:?}");
     assert!(velocity[1].abs() < f64::EPSILON);
-    assert_eq!(spec.velocity_at(spec.duration), [0.0; 4]);
+    let settled_velocity = spec.velocity_at(spec.duration);
+    assert!(
+      settled_velocity.iter().all(|value| *value == 0.0),
+      "{settled_velocity:?}",
+    );
   }
 
   /// A retarget mid-flight carries each edge's velocity into the new
@@ -2083,7 +2087,11 @@ mod tests {
     let started = manager.running[&id].started;
     let duration = manager.animations[&id].duration;
     manager.sample_frames(started + duration);
-    assert_eq!(manager.carried_velocity(&id), [0.0; 4]);
+    let carried_velocity = manager.carried_velocity(&id);
+    assert!(
+      carried_velocity.iter().all(|value| *value == 0.0),
+      "{carried_velocity:?}",
+    );
     assert!(manager.is_complete(&id));
   }
 

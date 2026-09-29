@@ -715,7 +715,7 @@ mod tests {
       Spring::new(SPRING_MIN_DURATION, 0.0),
     );
     assert_eq!(
-      Spring::new(Duration::from_secs(3600), 0.0),
+      Spring::new(Duration::from_hours(1), 0.0),
       Spring::new(SPRING_MAX_DURATION, 0.0),
     );
 

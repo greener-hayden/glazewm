@@ -31,6 +31,18 @@ const AX_WINDOW_NOTIFICATIONS: &[&str] = &[
   "AXWindowMiniaturized",
 ];
 
+/// Whether an error means the application did not answer in time.
+///
+/// The request still reaches the application; only the reply is
+/// abandoned. The application may be busy (e.g. launching) and answer
+/// the same request moments later, so a stall is not a refusal.
+pub(crate) fn is_stall(err: &crate::Error) -> bool {
+  matches!(
+    err,
+    crate::Error::Accessibility(_, code) if *code == AXError::CannotComplete.0
+  )
+}
+
 /// Context passed to the application event callback.
 #[derive(Debug)]
 struct ApplicationEventContext {
@@ -67,7 +79,8 @@ impl ApplicationObserver {
   /// windows.
   ///
   /// Window enumeration failure is tolerated so future windows are still
-  /// observed.
+  /// observed, unless the application stalled (see [`is_stall`]). A
+  /// failed call leaves nothing registered with the run loop.
   pub fn new(
     app: &Application,
     events_tx: mpsc::UnboundedSender<WindowEvent>,
@@ -95,6 +108,9 @@ impl ApplicationObserver {
       })?)
     };
 
+    let runloop =
+      CFRunLoop::current().ok_or(crate::Error::EventLoopStopped)?;
+
     // Seed after notification registration to avoid startup races.
     let app_windows = Arc::new(Mutex::new(Vec::new()));
     let context = Box::into_raw(Box::new(ApplicationEventContext {
@@ -104,20 +120,35 @@ impl ApplicationObserver {
       observer: observer.clone(),
     }));
 
-    let runloop =
-      CFRunLoop::current().ok_or(crate::Error::EventLoopStopped)?;
-
     let observer_source = unsafe { observer.run_loop_source() };
     runloop.add_source(Some(&observer_source), unsafe {
       kCFRunLoopDefaultMode
     });
 
-    // Register for all window notifications.
-    // TODO: Remove from runloop if registration fails.
+    // Own the source and context before anything can fail, so an early
+    // return drops them. A registration that timed out may still be
+    // applied by the application later; left running, it would deliver
+    // events to an observer that nothing tracks or removes.
+    let app_observer = Self {
+      pid: app.pid,
+      app_windows: app_windows.clone(),
+      events_tx,
+      _observer: observer.clone(),
+      observer_source,
+      context_ptr: context,
+      dispatcher: app.dispatcher.clone(),
+    };
+
     Self::register_app_notifications(app, &observer, context)?;
 
-    // Re-scan after app-level notifications are registered.
-    let windows = app.windows().unwrap_or_default();
+    // Re-scan after app-level notifications are registered. A stalled
+    // application is retried as a whole, since `AXWindowCreated` never
+    // fires for the windows it already has.
+    let windows = match app.windows() {
+      Ok(windows) => windows,
+      Err(err) if is_stall(&err) => return Err(err),
+      Err(_) => Vec::new(),
+    };
 
     // `Shown` is idempotent and adopts windows missed during startup.
     for window in &windows {
@@ -131,7 +162,7 @@ impl ApplicationObserver {
         );
       }
 
-      if let Err(err) = events_tx.send(WindowEvent::Shown {
+      if let Err(err) = app_observer.events_tx.send(WindowEvent::Shown {
         window: window.clone(),
         notification: crate::WindowEventNotification(None),
       }) {
@@ -145,15 +176,7 @@ impl ApplicationObserver {
 
     *app_windows.lock().unwrap() = windows;
 
-    Ok(Self {
-      pid: app.pid,
-      app_windows,
-      events_tx,
-      _observer: observer,
-      observer_source,
-      context_ptr: context,
-      dispatcher: app.dispatcher.clone(),
-    })
+    Ok(app_observer)
   }
 
   fn register_app_notifications(
@@ -171,10 +194,10 @@ impl ApplicationObserver {
         );
 
         if result != AXError::Success {
-          return Err(crate::Error::Platform(format!(
-            "Failed to add notification {} for PID {}: {:?}",
-            notification, app.pid, result
-          )));
+          return Err(crate::Error::Accessibility(
+            (*notification).to_string(),
+            result.0,
+          ));
         }
       }
     }

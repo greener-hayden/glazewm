@@ -116,6 +116,14 @@ pub(crate) enum NotificationEvent {
   WorkspaceWillSleep,
   WorkspaceDidWake,
   ApplicationDidChangeScreenParameters,
+  /// Sent by the window listener, not by macOS, once an application
+  /// answers accessibility requests and can be observed.
+  ///
+  /// `attempt` counts observation attempts, starting at 1.
+  ApplicationReady {
+    app: Retained<NSRunningApplication>,
+    attempt: u8,
+  },
 }
 
 /// Instance variables for `NotificationObserver`.
@@ -219,6 +227,14 @@ impl NotificationObserver {
         );
       }
     }
+  }
+
+  /// Returns a sender into this observer's event channel.
+  ///
+  /// Lets the receiving side queue its own events behind the ones macOS
+  /// has already posted.
+  pub fn events_tx(&self) -> mpsc::UnboundedSender<NotificationEvent> {
+    self.ivars().events_tx.clone()
   }
 
   fn emit_event(&self, event: NotificationEvent) {

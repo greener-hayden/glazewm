@@ -15,10 +15,10 @@ use std::{env, path::PathBuf, process, time::Duration};
 
 use anyhow::{Context, Error};
 use tokio::{process::Command, signal};
-use tracing::Level;
 use tracing_subscriber::{
-  fmt::{self, writer::MakeWriterExt},
-  layer::SubscriberExt,
+  filter::LevelFilter,
+  fmt,
+  layer::{Layer, SubscriberExt},
 };
 use wm_common::{AppCommand, InvokeCommand, Verbosity, WmEvent};
 #[cfg(target_os = "macos")]
@@ -407,16 +407,23 @@ fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
   let error_writer =
     tracing_appender::rolling::never(error_log_dir, "errors.log");
 
+  // Filter per layer rather than per writer. A writer filter formats
+  // every event before discarding it, so each disabled `debug!` still
+  // paid for its `Debug` output, including LaunchServices round trips
+  // for `NSRunningApplication`. Layer filters also lower the global max
+  // level, which disables those callsites outright.
   let subscriber = tracing_subscriber::registry()
     .with(
       // Output to stdout with specified verbosity level.
       fmt::Layer::new()
-        .with_writer(std::io::stdout.with_max_level(verbosity.level())),
+        .with_writer(std::io::stdout)
+        .with_filter(LevelFilter::from_level(verbosity.level())),
     )
     .with(
       // Output to error log file.
       fmt::Layer::new()
-        .with_writer(error_writer.with_max_level(Level::ERROR)),
+        .with_writer(error_writer)
+        .with_filter(LevelFilter::ERROR),
     );
 
   tracing::subscriber::set_global_default(subscriber)?;

@@ -9,7 +9,10 @@ use objc2_core_foundation::{
   CFBoolean, CFRetained, CFString, CGPoint, CGSize,
 };
 #[allow(deprecated)]
-use objc2_core_graphics::{CGDisplayIsAsleep, CGError};
+use objc2_core_graphics::{
+  CGDisplayIsAsleep, CGError, CGWindowListCopyWindowInfo,
+  CGWindowListOption,
+};
 
 use crate::{
   platform_impl::{
@@ -196,9 +199,29 @@ impl NativeWindow {
           // Perf: `CGDisplayIsAsleep` ~1-5µs, login window check ~1-2ms.
           CGDisplayIsAsleep(0) || has_login_window
         }
-        _ => true,
+        Ok(_) => true,
+        // No answer (e.g. -25204) says nothing about the window: the app
+        // may be busy, or gone along with its windows. The window server
+        // knows either way, without the app.
+        //
+        // Perf: `AXRole` ~25us p50 from a responsive app; the window
+        // server lookup ~100us p50, so it only runs when AX cannot answer.
+        Err(_) => self.exists_on_window_server(),
       })
       .unwrap_or(false)
+  }
+
+  /// Whether the window server still has this window.
+  ///
+  /// Answers without the owning application, so it holds while the
+  /// application is busy or after it has exited. Trails the application's
+  /// own destroy notification by a moment.
+  fn exists_on_window_server(&self) -> bool {
+    CGWindowListCopyWindowInfo(
+      CGWindowListOption::OptionIncludingWindow,
+      self.id.0,
+    )
+    .is_some_and(|windows| windows.count() > 0)
   }
 
   /// Implements [`NativeWindow::is_visible`].

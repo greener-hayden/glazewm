@@ -1,5 +1,5 @@
 use std::{
-  cell::RefCell,
+  cell::{Cell, RefCell},
   collections::HashMap,
   sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,13 +11,14 @@ use std::{
 use windows::{
   core::w,
   Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-    System::Threading::GetCurrentThreadId,
+    Foundation::{
+      ERROR_INVALID_WINDOW_HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+    },
     UI::WindowsAndMessaging::{
       CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-      GetMessageW, PostMessageW, PostThreadMessageW, RegisterClassW,
+      GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
       RegisterWindowMessageW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-      CW_USEDEFAULT, MSG, WINDOW_EX_STYLE, WM_QUIT, WNDCLASSW, WNDPROC,
+      CW_USEDEFAULT, MSG, WINDOW_EX_STYLE, WNDCLASSW, WNDPROC,
       WS_OVERLAPPEDWINDOW,
     },
   },
@@ -36,6 +37,14 @@ thread_local! {
   /// [`EventLoop::window_proc`].
   static WM_DISPATCH_CALLBACK: u32 = unsafe { RegisterWindowMessageW(w!("GlazeWM:Dispatch")) };
 
+  /// Custom message ID that stops the event loop.
+  ///
+  /// Posted to the message window rather than the thread, so a loop that
+  /// never runs cannot leave a stale `WM_QUIT` in its thread's queue:
+  /// destroying the window discards messages addressed to it. A stale
+  /// `WM_QUIT` would end the next message loop on that thread at once.
+  static WM_STOP_EVENT_LOOP: u32 = unsafe { RegisterWindowMessageW(w!("GlazeWM:Stop")) };
+
   /// Registered callbacks that pre-process messages in the event loop's
   /// window procedure.
   ///
@@ -49,7 +58,6 @@ thread_local! {
 pub(crate) struct EventLoopSource {
   pub(crate) message_window_handle: isize,
   pub(crate) thread_id: ThreadId,
-  os_thread_id: u32,
   next_callback_id: Arc<AtomicUsize>,
 }
 
@@ -113,15 +121,29 @@ impl EventLoopSource {
     Ok(())
   }
 
+  /// Asks the event loop to stop.
+  ///
+  /// Succeeds without posting when the loop has already exited, since its
+  /// message window is then destroyed.
   pub(crate) fn send_stop(&self) -> crate::Result<()> {
-    unsafe {
-      PostThreadMessageW(self.os_thread_id, WM_QUIT, WPARAM(0), LPARAM(0))
-    }
-    .map_err(|_| {
-      crate::Error::WindowMessage(
-        "Failed to post quit message".to_string(),
+    match unsafe {
+      PostMessageW(
+        HWND(self.message_window_handle),
+        WM_STOP_EVENT_LOOP.with(|v| *v),
+        WPARAM(0),
+        LPARAM(0),
       )
-    })
+    } {
+      Ok(()) => Ok(()),
+      Err(err)
+        if err.code() == ERROR_INVALID_WINDOW_HANDLE.to_hresult() =>
+      {
+        Ok(())
+      }
+      Err(_) => Err(crate::Error::WindowMessage(
+        "Failed to post quit message".to_string(),
+      )),
+    }
   }
 
   pub(crate) fn register_wndproc_callback(
@@ -155,6 +177,8 @@ impl EventLoopSource {
 /// Platform-specific implementation of [`EventLoop`].
 pub(crate) struct EventLoop {
   source: EventLoopSource,
+  /// Whether the message window has been destroyed.
+  window_destroyed: Cell<bool>,
 }
 
 impl EventLoop {
@@ -167,14 +191,19 @@ impl EventLoop {
     let source = EventLoopSource {
       message_window_handle: window_handle,
       thread_id: thread::current().id(),
-      os_thread_id: unsafe { GetCurrentThreadId() },
       next_callback_id: Arc::new(AtomicUsize::new(0)),
     };
 
     let stopped = Arc::new(AtomicBool::new(false));
     let dispatcher = Dispatcher::new(Some(source.clone()), stopped);
 
-    Ok((Self { source }, dispatcher))
+    Ok((
+      Self {
+        source,
+        window_destroyed: Cell::new(false),
+      },
+      dispatcher,
+    ))
   }
 
   /// Implements [`EventLoop::run`].
@@ -195,15 +224,19 @@ impl EventLoop {
     }
 
     tracing::info!("Event loop thread exiting.");
-    unsafe { DestroyWindow(HWND(self.source.message_window_handle)) }?;
-
-    Ok(())
+    self.destroy_window()
   }
 
-  /// Shuts down the event loop gracefully.
-  pub(crate) fn shutdown(&mut self) -> crate::Result<()> {
-    tracing::info!("Shutting down event loop.");
-    self.source.send_stop()?;
+  /// Destroys the message window, once.
+  ///
+  /// Must run on the thread that created the window. Messages still
+  /// queued for the window, including a stop request, are discarded.
+  fn destroy_window(&self) -> crate::Result<()> {
+    if self.window_destroyed.replace(true) {
+      return Ok(());
+    }
+
+    unsafe { DestroyWindow(HWND(self.source.message_window_handle)) }?;
 
     Ok(())
   }
@@ -256,6 +289,11 @@ impl EventLoop {
     wparam: WPARAM,
     lparam: LPARAM,
   ) -> LRESULT {
+    if msg == WM_STOP_EVENT_LOOP.with(|v| *v) {
+      PostQuitMessage(0);
+      return LRESULT(0);
+    }
+
     // Handle dispatch callbacks first.
     if msg == WM_DISPATCH_CALLBACK.with(|v| *v) {
       // Convert the `WPARAM` fn pointer back to a double-boxed function.
@@ -287,8 +325,11 @@ impl EventLoop {
 
 impl Drop for EventLoop {
   fn drop(&mut self) {
-    if let Err(err) = self.shutdown() {
-      tracing::warn!("Failed to shut down event loop: {err}");
+    // A loop that ran has already destroyed its window. One that never ran
+    // is dropped on its own thread (`EventLoop` is `!Send`), so the window
+    // can be destroyed here, which also discards any pending stop request.
+    if let Err(err) = self.destroy_window() {
+      tracing::warn!("Failed to destroy event loop window: {err}");
     }
   }
 }

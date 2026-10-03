@@ -55,12 +55,17 @@ impl WindowId {
   }
 }
 
+/// Where a window sits in the native stacking order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowZOrder {
+  /// Out of the always-on-top band. A window leaving that band lands in
+  /// front of every other normal window.
   Normal,
   AfterWindow(WindowId),
   Top,
   TopMost,
+  /// Behind every other window, and out of the always-on-top band.
+  Bottom,
 }
 
 /// macOS-specific extension trait for [`NativeWindow`].
@@ -299,6 +304,21 @@ pub trait NativeWindowWindowsExt {
   /// This method is only available on Windows.
   fn set_z_order(&self, zorder: &WindowZOrder) -> crate::Result<()>;
 
+  /// Whether the window's native stacking already satisfies `z_order`.
+  ///
+  /// `in_front` lists the windows that a `WindowZOrder::Bottom` window
+  /// must sit behind. `WindowZOrder::Top` and `WindowZOrder::AfterWindow`
+  /// are one-off moves with nothing to observe, and are never satisfied.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on Windows.
+  fn has_z_order(
+    &self,
+    z_order: &WindowZOrder,
+    in_front: &[WindowId],
+  ) -> bool;
+
   /// Sets the visibility of the window's title bar.
   ///
   /// # Platform-specific
@@ -415,6 +435,14 @@ impl NativeWindowWindowsExt for NativeWindow {
 
   fn set_z_order(&self, z_order: &WindowZOrder) -> crate::Result<()> {
     self.inner.set_z_order(z_order)
+  }
+
+  fn has_z_order(
+    &self,
+    z_order: &WindowZOrder,
+    in_front: &[WindowId],
+  ) -> bool {
+    self.inner.has_z_order(z_order, in_front)
   }
 
   fn set_title_bar_visibility(&self, visible: bool) -> crate::Result<()> {

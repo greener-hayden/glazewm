@@ -14,7 +14,8 @@ use objc2_core_graphics::{
 #[cfg(target_os = "macos")]
 use crate::platform_impl::AXUIElementExt;
 use crate::{
-  Color, CornerStyle, NativeWindow, OpacityValue, Rect, WindowZOrder,
+  Color, CornerStyle, NativeWindow, OpacityValue, Rect, WindowId,
+  WindowZOrder,
 };
 #[cfg(target_os = "windows")]
 use crate::{NativeSession, NativeWindowWindowsExt};
@@ -357,6 +358,32 @@ impl PlacementSession {
     {
       let _ = order;
       self.validate()
+    }
+  }
+
+  /// Observes whether native z-order already satisfies `order`.
+  ///
+  /// `in_front` lists the windows that a `WindowZOrder::Bottom` window
+  /// must sit behind.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: reads the always-on-top flag and the stacking order.
+  /// - macOS: always satisfied; the platform exposes no z-order.
+  pub fn has_z_order(
+    &self,
+    order: &WindowZOrder,
+    in_front: &[WindowId],
+  ) -> crate::Result<bool> {
+    #[cfg(target_os = "windows")]
+    {
+      Ok(self.window()?.has_z_order(order, in_front))
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = (order, in_front);
+      self.validate()?;
+      Ok(true)
     }
   }
 

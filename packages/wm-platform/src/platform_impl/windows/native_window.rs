@@ -31,14 +31,14 @@ use windows::{
         IsZoomed, SendNotifyMessageW, SetForegroundWindow,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
         SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
-        GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST, HWND_TOP,
-        HWND_TOPMOST, LWA_ALPHA, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-        SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA,
-        WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-        WPF_ASYNCWINDOWPLACEMENT, WS_DLGFRAME, WS_EX_LAYERED,
-        WS_THICKFRAME,
+        GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_OWNER, HWND_BOTTOM,
+        HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, LWA_ALPHA,
+        SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
+        SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+        SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA, WINDOWPLACEMENT,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WPF_ASYNCWINDOWPLACEMENT,
+        WS_DLGFRAME, WS_EX_LAYERED, WS_EX_TOPMOST, WS_THICKFRAME,
       },
     },
   },
@@ -403,6 +403,7 @@ impl NativeWindow {
       WindowZOrder::Top => HWND_TOP,
       WindowZOrder::Normal => HWND_NOTOPMOST,
       WindowZOrder::AfterWindow(window_id) => HWND(window_id.0),
+      WindowZOrder::Bottom => HWND_BOTTOM,
     };
 
     unsafe {
@@ -607,6 +608,7 @@ impl NativeWindow {
       WindowZOrder::Top => HWND_TOP,
       WindowZOrder::Normal => HWND_NOTOPMOST,
       WindowZOrder::AfterWindow(window_id) => HWND(window_id.0),
+      WindowZOrder::Bottom => HWND_BOTTOM,
     };
 
     let flags =
@@ -615,6 +617,45 @@ impl NativeWindow {
     unsafe { SetWindowPos(self.hwnd(), z_order_hwnd, 0, 0, 0, 0, flags) }?;
 
     Ok(())
+  }
+
+  /// Implements [`NativeWindowWindowsExt::has_z_order`].
+  pub(crate) fn has_z_order(
+    &self,
+    z_order: &WindowZOrder,
+    in_front: &[WindowId],
+  ) -> bool {
+    let is_topmost = self.has_window_style_ex(WS_EX_TOPMOST);
+
+    match z_order {
+      WindowZOrder::TopMost => is_topmost,
+      WindowZOrder::Normal => !is_topmost,
+      WindowZOrder::Bottom => !is_topmost && !self.is_above_any(in_front),
+      WindowZOrder::Top | WindowZOrder::AfterWindow(_) => false,
+    }
+  }
+
+  /// Whether any of the given windows is behind this one.
+  fn is_above_any(&self, windows: &[WindowId]) -> bool {
+    // Apps restack while this walks, so a link can lead back to a window
+    // already visited. The bound ends such a walk.
+    const MAX_STEPS: usize = 4096;
+
+    let mut behind = unsafe { GetWindow(self.hwnd(), GW_HWNDNEXT) };
+
+    for _ in 0..MAX_STEPS {
+      if behind.0 == 0 {
+        return false;
+      }
+
+      if windows.iter().any(|window| window.0 == behind.0) {
+        return true;
+      }
+
+      behind = unsafe { GetWindow(behind, GW_HWNDNEXT) };
+    }
+
+    false
   }
 
   /// Implements [`NativeWindowWindowsExt::set_title_bar_visibility`].

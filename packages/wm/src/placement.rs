@@ -6,12 +6,12 @@ use std::{
 use anyhow::Context;
 use uuid::Uuid;
 use wm_common::{
-  CursorJumpTrigger, DisplayState, HideCorner, HideMethod, WindowState,
-  WmEvent,
+  CursorJumpTrigger, DisplayState, HideCorner, HideMethod,
+  WindowEffectConfig, WindowState, WmEvent,
 };
 use wm_platform::{
   Color, ConcealMethod, CornerStyle, Delta, OpacityValue,
-  PlacementSession, Rect, WindowZOrder,
+  PlacementSession, Rect, WindowId, WindowZOrder,
 };
 
 use crate::{
@@ -58,6 +58,22 @@ fn focus_decorations(
     &config.value.window_effects.other_windows
   };
 
+  frame_decorations(&window.state(), effects)
+}
+
+/// Resolves the border and corners a window state allows.
+///
+/// A fullscreen window owns every pixel of its monitor. The compositor
+/// clips the corners of a rounded window and rings it with a translucent
+/// edge, and both show the desktop behind a window that fills the screen.
+fn frame_decorations(
+  state: &WindowState,
+  effects: &WindowEffectConfig,
+) -> (Option<Color>, CornerStyle) {
+  if matches!(state, WindowState::Fullscreen(_)) {
+    return (None, CornerStyle::Square);
+  }
+
   (
     effects.border.enabled.then(|| effects.border.color.clone()),
     if effects.corner_style.enabled {
@@ -66,6 +82,83 @@ fn focus_decorations(
       CornerStyle::Default
     },
   )
+}
+
+/// Resolves the opacity a window state allows, before any concealment.
+///
+/// A fullscreen window takes no opacity from the focus effects. An
+/// explicit command still applies.
+fn state_alpha(
+  state: &WindowState,
+  commanded: Option<OpacityValue>,
+  effects: &WindowEffectConfig,
+) -> Option<OpacityValue> {
+  commanded.or_else(|| {
+    (effects.transparency.enabled
+      && !matches!(state, WindowState::Fullscreen(_)))
+    .then_some(effects.transparency.opacity)
+  })
+}
+
+/// Resolves the stacking the WM holds a window to.
+///
+/// A fullscreen window covers its workspace only while it leads it, which
+/// is while it was the last window focused there. Otherwise it sits behind
+/// the workspace so the window that leads is visible.
+///
+/// Returns `None` to leave the stacking to the window. A fullscreen window
+/// that leads its workspace may keep an always-on-top flag it set itself.
+fn desired_stacking(
+  state: &WindowState,
+  leads_workspace: bool,
+) -> Option<WindowZOrder> {
+  match state {
+    WindowState::Floating(floating) if floating.shown_on_top => {
+      Some(WindowZOrder::TopMost)
+    }
+    WindowState::Fullscreen(_) if !leads_workspace => {
+      Some(WindowZOrder::Bottom)
+    }
+    WindowState::Fullscreen(fullscreen) if fullscreen.shown_on_top => {
+      Some(WindowZOrder::TopMost)
+    }
+    WindowState::Fullscreen(_) => None,
+    _ => Some(WindowZOrder::Normal),
+  }
+}
+
+/// Whether the window was the last one focused in its workspace.
+fn leads_workspace(window: &WindowContainer) -> bool {
+  window
+    .workspace()
+    .and_then(|workspace| {
+      workspace
+        .descendant_focus_order()
+        .find_map(|container| container.as_window_container().ok())
+    })
+    .is_some_and(|lead| lead.id() == window.id())
+}
+
+/// Gets the native ids of the other windows shown in the window's
+/// workspace.
+fn workspace_peers(window: &WindowContainer) -> Vec<WindowId> {
+  let id = window.id();
+  window
+    .workspace()
+    .map(|workspace| {
+      workspace
+        .descendants()
+        .filter_map(|container| container.as_window_container().ok())
+        .filter(|peer| {
+          peer.id() != id && peer.state() != WindowState::Minimized
+        })
+        .map(|peer| {
+          let native_id = peer.native().id();
+          native_id
+        })
+        .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Resolves the window's requested opacity, before any concealment.
@@ -79,12 +172,11 @@ fn requested_alpha(
   } else {
     &config.value.window_effects.other_windows
   };
-  intent.and_then(|intent| intent.opacity).or_else(|| {
-    effects
-      .transparency
-      .enabled
-      .then_some(effects.transparency.opacity)
-  })
+  state_alpha(
+    &window.state(),
+    intent.and_then(|intent| intent.opacity),
+    effects,
+  )
 }
 
 /// Resolves the window's requested border, corners, and title bar.
@@ -1913,21 +2005,30 @@ fn reconcile_managed(
       Some(entry.retry_at.map_or(at, |retry| retry.min(at)));
   }
   timer.mark("retire");
-  let z_order = match window.state() {
-    WindowState::Floating(ref state) if state.shown_on_top => {
-      WindowZOrder::TopMost
-    }
-    WindowState::Fullscreen(ref state) if state.shown_on_top => {
-      WindowZOrder::TopMost
-    }
-    _ => WindowZOrder::Normal,
-  };
+  let z_order = desired_stacking(&window.state(), leads_workspace(window));
   if visible
     && native_state != NativeState::Minimized
-    && (entry.stacking.as_ref() != Some(&z_order) || reorder)
+    && (entry.stacking != z_order || reorder)
   {
-    entry.native.set_z_order(&z_order)?;
-    entry.stacking = Some(z_order);
+    if let Some(order) = &z_order {
+      // Apps restack themselves, so the last write says nothing about
+      // where the window is now. Leaving the always-on-top band lifts a
+      // window over every normal window, and sending one to the bottom
+      // drops it under them; neither may repeat on a window already in
+      // place. Entering the band also raises the window within it, which
+      // a reorder asks for, so that write always goes out.
+      let settled = match order {
+        WindowZOrder::Normal => entry.native.has_z_order(order, &[])?,
+        WindowZOrder::Bottom => {
+          entry.native.has_z_order(order, &workspace_peers(window))?
+        }
+        _ => false,
+      };
+      if !settled {
+        entry.native.set_z_order(order)?;
+      }
+    }
+    entry.stacking = z_order;
   }
   timer.mark("z_order");
   // Taskbar membership is a round trip to the shell, measured at 1-8ms,
@@ -1956,7 +2057,110 @@ fn reconcile_managed(
 
 #[cfg(test)]
 mod tests {
+  use wm_common::{FloatingStateConfig, FullscreenStateConfig};
+
   use super::*;
+
+  /// Builds a fullscreen state with the given always-on-top preference.
+  fn fullscreen(shown_on_top: bool) -> WindowState {
+    WindowState::Fullscreen(FullscreenStateConfig {
+      maximized: true,
+      shown_on_top,
+    })
+  }
+
+  /// Builds focus effects that round corners, draw a border and fade.
+  fn decorated_effects() -> WindowEffectConfig {
+    let mut effects = WindowEffectConfig::default();
+    effects.border.enabled = true;
+    effects.corner_style.enabled = true;
+    effects.corner_style.style = CornerStyle::Rounded;
+    effects.transparency.enabled = true;
+    effects
+  }
+
+  #[test]
+  fn fullscreen_window_takes_no_frame_effects() {
+    let effects = decorated_effects();
+
+    assert_eq!(
+      frame_decorations(&fullscreen(false), &effects),
+      (None, CornerStyle::Square)
+    );
+    assert_eq!(state_alpha(&fullscreen(false), None, &effects), None);
+  }
+
+  #[test]
+  fn other_states_keep_configured_frame_effects() {
+    let effects = decorated_effects();
+
+    assert_eq!(
+      frame_decorations(&WindowState::Tiling, &effects),
+      (Some(effects.border.color.clone()), CornerStyle::Rounded)
+    );
+    assert_eq!(
+      state_alpha(&WindowState::Tiling, None, &effects),
+      Some(effects.transparency.opacity)
+    );
+  }
+
+  #[test]
+  fn commanded_opacity_applies_to_a_fullscreen_window() {
+    let commanded = decorated_effects().transparency.opacity;
+
+    assert_eq!(
+      state_alpha(
+        &fullscreen(false),
+        Some(commanded),
+        &WindowEffectConfig::default()
+      ),
+      Some(commanded)
+    );
+  }
+
+  #[test]
+  fn fullscreen_window_steps_behind_a_workspace_it_does_not_lead() {
+    for shown_on_top in [false, true] {
+      assert_eq!(
+        desired_stacking(&fullscreen(shown_on_top), false),
+        Some(WindowZOrder::Bottom)
+      );
+    }
+  }
+
+  #[test]
+  fn leading_fullscreen_window_keeps_its_own_stacking() {
+    assert_eq!(desired_stacking(&fullscreen(false), true), None);
+    assert_eq!(
+      desired_stacking(&fullscreen(true), true),
+      Some(WindowZOrder::TopMost)
+    );
+  }
+
+  #[test]
+  fn tiling_and_floating_stacking_ignores_the_workspace_lead() {
+    let floating = |shown_on_top| {
+      WindowState::Floating(FloatingStateConfig {
+        centered: true,
+        shown_on_top,
+      })
+    };
+
+    for leads in [false, true] {
+      assert_eq!(
+        desired_stacking(&WindowState::Tiling, leads),
+        Some(WindowZOrder::Normal)
+      );
+      assert_eq!(
+        desired_stacking(&floating(false), leads),
+        Some(WindowZOrder::Normal)
+      );
+      assert_eq!(
+        desired_stacking(&floating(true), leads),
+        Some(WindowZOrder::TopMost)
+      );
+    }
+  }
 
   #[test]
   fn retiring_cover_schedules_deferred_move_without_frame_clock() {

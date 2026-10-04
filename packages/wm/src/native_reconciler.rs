@@ -49,6 +49,8 @@ pub enum NativeState {
 pub struct DesiredFrame {
   pub rect: Rect,
   pub monitor: Rect,
+  /// The part of the monitor a maximized window is expected to fill.
+  pub working_area: Rect,
   pub dpi: u32,
   pub state: NativeState,
   /// Pixels the platform may pull a parked target back toward its
@@ -329,11 +331,22 @@ impl FrameReconciler {
         NativeState::Normal,
         NativeState::Minimized | NativeState::Maximized,
       ) => Some(NativeMutation::Restore(self.desired.rect.clone())),
-      (NativeState::Maximized, NativeState::Maximized) => (!self
-        .desired
-        .monitor
-        .contains_point(&observed.rect.center_point()))
-      .then(|| NativeMutation::Restore(self.desired.rect.clone())),
+      (NativeState::Maximized, NativeState::Maximized) => {
+        if !self
+          .desired
+          .monitor
+          .contains_point(&observed.rect.center_point())
+        {
+          Some(NativeMutation::Restore(self.desired.rect.clone()))
+        } else if self.fills_working_area(observed) {
+          None
+        } else {
+          // Some windows take the maximized state and keep their size;
+          // SDL pins a fixed-size window's maximum to its current size.
+          // The state alone then leaves the window where it was.
+          Some(NativeMutation::Frame(self.desired.rect.clone()))
+        }
+      }
       (NativeState::Maximized, NativeState::Minimized) => {
         Some(NativeMutation::Restore(self.desired.rect.clone()))
       }
@@ -359,6 +372,15 @@ impl FrameReconciler {
           .then(|| NativeMutation::Frame(self.desired.rect.clone()))
       }
     }
+  }
+
+  /// Whether a maximized window covers the area maximizing should fill.
+  ///
+  /// The OS can be off by 1px when positioning windows.
+  fn fills_working_area(&self, observed: &ObservedFrame) -> bool {
+    observed
+      .rect
+      .contains_rect(&self.desired.working_area.inset(1))
   }
 
   /// Requires native evidence before learning constraints.
@@ -443,6 +465,7 @@ mod tests {
       FrameReconciler::new(DesiredFrame {
         rect: rect.clone(),
         monitor: Rect::from_xy(0, 0, 1920, 1080),
+        working_area: Rect::from_xy(0, 0, 1920, 1040),
         dpi: 96,
         state: NativeState::Normal,
         parking_clamp: None,
@@ -704,6 +727,26 @@ mod tests {
     observed.state = NativeState::Maximized;
     observed.rect = Rect::from_xy(-8, -8, 1936, 1056);
     assert!(sync.next(&observed, Instant::now()).is_none());
+  }
+
+  /// Frames a window that took the maximized state and kept its size.
+  #[test]
+  fn frames_a_maximize_that_did_not_fill() {
+    let (mut sync, mut observed) = fixture();
+    sync.desired.state = NativeState::Maximized;
+    sync.desired.rect = sync.desired.monitor.clone();
+    observed.state = NativeState::Maximized;
+    observed.rect = Rect::from_xy(16, 52, 1888, 976);
+    let request = sync
+      .next(&observed, Instant::now())
+      .expect("Frame request.");
+    assert_eq!(
+      request.mutation,
+      NativeMutation::Frame(sync.desired.monitor.clone())
+    );
+
+    observed.rect = sync.desired.monitor.clone();
+    assert!(sync.converged(&observed));
   }
 
   /// Suspends all mutations during interactive control.

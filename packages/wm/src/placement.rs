@@ -1194,6 +1194,7 @@ fn desired_frame(
   Ok(DesiredFrame {
     rect: target.clone(),
     monitor: monitor.bounds.clone(),
+    working_area: monitor.working_area.clone(),
     dpi: native.expected_dpi(monitor.dpi)?,
     state,
     parking_clamp: parked

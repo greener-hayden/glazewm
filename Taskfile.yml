@@ -21,6 +21,12 @@ tasks:
     cmds:
       - cargo test --workspace {{if ne OS "windows"}}--exclude wm-watcher --exclude wm-platform{{end}} --locked
 
+  test:reconciliation:
+    desc: Run native reconciler and placement unit tests
+    cmds:
+      - cargo test -p wm --bin glazewm --locked native_reconciler::tests
+      - cargo test -p wm --bin glazewm --locked placement::tests
+
   test:desktop:
     desc: Run the platform tests in a desktop session
     cmds:

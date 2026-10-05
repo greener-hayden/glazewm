@@ -3,7 +3,13 @@ use tracing::{info, warn};
 use wm_common::{WindowRuleEvent, WmEvent};
 
 use crate::{
-  commands::{window::run_window_rules, workspace::sort_workspaces},
+  commands::{
+    window::run_window_rules,
+    workspace::{
+      bound_reassignment_target, reassign_workspaces_to_bound_monitors,
+      sort_workspaces,
+    },
+  },
   traits::{CommonGetters, TilingSizeGetters, WindowGetters},
   user_config::UserConfig,
   wm::WindowManager,
@@ -96,15 +102,27 @@ fn update_workspace_configs(
         if *workspace_config != workspace.config() {
           workspace.set_config(workspace_config.clone());
 
-          sort_workspaces(&monitor, config)?;
+          // Workspaces without a move target keep their position and are
+          // re-sorted here. Workspaces with a target are re-assigned
+          // together after the loop.
+          if bound_reassignment_target(workspace, state).is_none() {
+            sort_workspaces(&monitor, config)?;
 
-          state.emit_event(WmEvent::WorkspaceUpdated {
-            updated_workspace: workspace.to_dto()?,
-          });
+            state.emit_event(WmEvent::WorkspaceUpdated {
+              updated_workspace: workspace.to_dto()?,
+            });
+          }
         }
       }
     }
   }
+
+  // Re-assign workspaces that are not on their bound monitors: those
+  // whose configs just changed, and any still waiting from an earlier
+  // re-assignment. Handled as one batch so that moves which would empty
+  // their origin monitor (e.g. bound workspaces swapping monitors)
+  // resolve against each other.
+  reassign_workspaces_to_bound_monitors(&workspaces, state, config)?;
 
   Ok(())
 }
@@ -124,3 +142,7 @@ fn update_container_gaps(state: &mut WmState, config: &UserConfig) {
     workspace.set_gaps_config(config.value.gaps.clone());
   }
 }
+
+#[cfg(test)]
+#[path = "reload_config_tests.rs"]
+mod tests;

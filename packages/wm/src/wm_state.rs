@@ -144,6 +144,15 @@ impl WmState {
     }
   }
 
+  /// Marks the state as initialized.
+  ///
+  /// Test-only. Enables event emission, which is otherwise gated on
+  /// `populate` having run.
+  #[cfg(test)]
+  pub(crate) fn mark_initialized(&mut self) {
+    self.has_initialized = true;
+  }
+
   /// Populates the initial WM state by creating containers for all
   /// existing windows and monitors.
   pub fn populate(

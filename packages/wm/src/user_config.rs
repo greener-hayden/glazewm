@@ -81,6 +81,19 @@ impl UserConfig {
     Ok((config_value, config_str))
   }
 
+  /// Creates a config for tests from the given parsed value.
+  ///
+  /// Reads from and writes to no files.
+  #[cfg(test)]
+  pub(crate) fn mock(value: ParsedConfig) -> Self {
+    Self {
+      path: PathBuf::new(),
+      value,
+      value_str: String::new(),
+      window_rules_by_event: HashMap::new(),
+    }
+  }
+
   /// Initializes a new config file from the sample config resource.
   fn create_sample(config_path: &PathBuf) -> Result<()> {
     let parent_dir =

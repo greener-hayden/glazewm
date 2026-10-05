@@ -4,8 +4,9 @@
 //! mock builders in the model modules.
 
 use bon::bon;
+use tokio::sync::mpsc;
 use wm_common::{
-  FloatingStateConfig, GapsConfig, TilingDirection, WindowState,
+  FloatingStateConfig, GapsConfig, TilingDirection, WindowState, WmEvent,
   WorkspaceConfig,
 };
 use wm_platform::{Display, NativeWindow, Rect, RectDelta};
@@ -18,7 +19,35 @@ use crate::{
     Workspace,
   },
   traits::TilingSizeGetters,
+  wm_state::WmState,
 };
+
+/// Creates an empty `WmState` for command-level tests.
+///
+/// Returns the state and the receiving end of its event channel, so tests
+/// can assert emitted events.
+pub fn mock_state() -> (WmState, mpsc::UnboundedReceiver<WmEvent>) {
+  let (event_tx, event_rx) = mpsc::unbounded_channel();
+  let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+
+  let mut state =
+    WmState::new(wm_platform::Dispatcher::mock(), event_tx, exit_tx);
+  state.mark_initialized();
+
+  (state, event_rx)
+}
+
+/// Attaches a monitor to the state's root container.
+pub fn attach_monitor(
+  state: &WmState,
+  monitor: &Monitor,
+) -> anyhow::Result<()> {
+  attach_container(
+    &monitor.clone().into(),
+    &state.root_container.clone().into(),
+    None,
+  )
+}
 
 #[cfg(test)]
 mod tests {

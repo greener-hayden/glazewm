@@ -16,7 +16,8 @@ use objc2_core_graphics::{
 
 use crate::{
   platform_impl::{
-    self, ffi, AXUIElement, AXUIElementExt, AXValueExt, Application,
+    self, ffi, is_stall, AXUIElement, AXUIElementExt, AXValueExt,
+    Application,
   },
   Dispatcher, Point, Rect, ThreadBound, WindowId,
 };
@@ -274,12 +275,17 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::set_frame`].
   ///
+  /// Returns once the writes are delivered, not once they are applied:
+  /// see [`with_deferred_writes`]. Callers observe the result.
+  ///
   /// # Platform-specific
   ///
   /// - macOS returns success for a size write it then ignores while the
   ///   window is parked to a 1px sliver or straddles two displays. The
   ///   window is first staged fully onto the target's display at its
-  ///   current size, then resized, then moved into place.
+  ///   current size, then resized, then moved into place. A size still
+  ///   refused is corrected by the caller's next request, once the window
+  ///   is fully on one display.
   pub(crate) fn set_frame(&self, rect: &Rect) -> crate::Result<()> {
     let rect = rect.clone();
     let dispatcher = self.application.dispatcher.clone();
@@ -292,33 +298,26 @@ impl NativeWindow {
 
       // A bare move is safe from anywhere.
       if is_same_size {
-        write_position(el, rect.x(), rect.y())?;
-        return write_size(el, rect.width(), rect.height());
+        return with_deferred_writes(el, || {
+          delivered(write_position(el, rect.x(), rect.y()))?;
+          delivered(write_size(el, rect.width(), rect.height()))
+        });
       }
 
       let display =
         platform_impl::display_bounds_for_rect(&rect, &dispatcher)?;
 
-      if !display.contains_rect(&current) {
-        let staging = staging_origin(&current, &rect, &display);
-        write_position(el, staging.x, staging.y)?;
-      }
+      // The application applies these in order, so the size lands while
+      // the window is staged and the move follows it.
+      with_deferred_writes(el, || {
+        if !display.contains_rect(&current) {
+          let staging = staging_origin(&current, &rect, &display);
+          delivered(write_position(el, staging.x, staging.y))?;
+        }
 
-      write_size(el, rect.width(), rect.height())?;
-      write_position(el, rect.x(), rect.y())?;
-
-      // Fully on one display now, so a second ask is answerable.
-      let (width, height) = read_size(el)?;
-      if width != rect.width() || height != rect.height() {
-        tracing::debug!(
-          "Window took {width}x{height} for {}x{}; asking again.",
-          rect.width(),
-          rect.height()
-        );
-        write_size(el, rect.width(), rect.height())?;
-      }
-
-      Ok(())
+        delivered(write_size(el, rect.width(), rect.height()))?;
+        delivered(write_position(el, rect.x(), rect.y()))
+      })
     })
   }
 
@@ -410,13 +409,17 @@ impl NativeWindow {
           .is_ok_and(|cf_bool| cf_bool.value())
       });
 
-      // Disable enhanced UI if it was enabled.
+      // Disable enhanced UI if it was enabled. The application handles
+      // requests in order, so it is off for the writes that follow and on
+      // again after them without waiting on either.
       if was_enabled {
         let ax_bool = CFBoolean::new(false);
-        let _ = app_el.set_attribute::<CFBoolean>(
-          "AXEnhancedUserInterface",
-          &ax_bool.into(),
-        );
+        let _ = with_deferred_writes(app_el, || {
+          delivered(app_el.set_attribute::<CFBoolean>(
+            "AXEnhancedUserInterface",
+            &ax_bool.into(),
+          ))
+        });
       }
 
       // Execute the callback with the window element.
@@ -425,10 +428,12 @@ impl NativeWindow {
       // Restore enhanced UI if it was originally enabled.
       if was_enabled {
         let ax_bool = CFBoolean::new(true);
-        let _ = app_el.set_attribute::<CFBoolean>(
-          "AXEnhancedUserInterface",
-          &ax_bool.into(),
-        );
+        let _ = with_deferred_writes(app_el, || {
+          delivered(app_el.set_attribute::<CFBoolean>(
+            "AXEnhancedUserInterface",
+            &ax_bool.into(),
+          ))
+        });
       }
 
       result
@@ -662,6 +667,51 @@ fn read_frame(el: &CFRetained<AXUIElement>) -> crate::Result<Rect> {
     width,
     height,
   ))
+}
+
+/// Messaging timeout for writes whose outcome is observed afterwards.
+///
+/// An AX write blocks until the application has handled it, and a resize
+/// first makes the application lay out and draw at the new size (~31ms
+/// for kitty, ~97ms for Zen). Waiting buys only a receipt: a request that
+/// times out is still delivered and applied. Placement confirms the
+/// result from the window server and the application's move events, so
+/// several applications apply their writes in parallel instead of one
+/// after another on the event loop thread.
+///
+/// 2ms covers a write that needs no relayout (p50 0.2-0.4ms, p99 up to
+/// 2.2ms), so those still report their errors.
+const DEFERRED_WRITE_TIMEOUT_SECS: f32 = 0.002;
+
+/// Runs `writes` against `el` without waiting for the application to
+/// apply them.
+///
+/// Each write in `writes` must go through [`delivered`]: a slow write
+/// times out by design, and the writes after it still have to be sent.
+fn with_deferred_writes(
+  el: &AXUIElement,
+  writes: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<()> {
+  // SAFETY: `el` is a valid element. The timeout is client-side state
+  // for this element only.
+  unsafe { el.set_messaging_timeout(DEFERRED_WRITE_TIMEOUT_SECS) };
+
+  let result = writes();
+
+  // SAFETY: As above. `0` returns the element to the global timeout.
+  unsafe { el.set_messaging_timeout(0.0) };
+
+  result
+}
+
+/// Treats a write that timed out as delivered (see [`is_stall`]).
+///
+/// Any other error still fails the write.
+fn delivered(result: crate::Result<()>) -> crate::Result<()> {
+  match result {
+    Err(err) if is_stall(&err) => Ok(()),
+    result => result,
+  }
 }
 
 /// Writes `AXSize`.

@@ -37,7 +37,8 @@ impl AnimationContext {
   ///
   /// # Platform-specific
   ///
-  /// - macOS: A screenshot of the window as it is right now.
+  /// - macOS: A screenshot of the window as it is right now, together with
+  ///   any companions on screen around it.
   /// - Windows: Nothing is captured. The overlay is a live DWM thumbnail
   ///   of the window, so this returns a token immediately.
   pub fn capture_frame(
@@ -232,6 +233,44 @@ impl AnimationWindow {
     }
   }
 
+  /// Animates the layer through `frames`, evenly spaced over `duration`,
+  /// returning as soon as the animation is handed to the compositor.
+  ///
+  /// For motion a single timing curve cannot express, such as a spring
+  /// that overshoots or carries a different velocity on each edge. The
+  /// caller samples its own model, so the motion is the same one a
+  /// tick-driven backend draws. `on_complete` behaves as in
+  /// [`AnimationWindow::animate_to`].
+  ///
+  /// Only meaningful when [`AnimationWindow::SELF_ANIMATING`] is `true`.
+  /// A frame's opacity is used only when every frame has one.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: hands keyframes to Core Animation, which interpolates
+  ///   linearly between them on the render server.
+  /// - Windows: unimplemented; the caller ticks `update` instead.
+  pub fn animate_along<F>(
+    &self,
+    frames: &[(Rect, Option<OpacityValue>)],
+    duration: std::time::Duration,
+    on_complete: F,
+  ) -> crate::Result<()>
+  where
+    F: Fn() + Send + Sync + 'static,
+  {
+    #[cfg(target_os = "macos")]
+    {
+      self.inner.animate_along(frames, duration, on_complete)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+      let _ = (frames, duration, on_complete);
+      Ok(())
+    }
+  }
+
   /// Cancels compositor motion and retains a stationary overlay.
   pub fn stop_at(
     &self,
@@ -271,7 +310,8 @@ impl AnimationWindow {
   ///
   /// # Platform-specific
   ///
-  /// - macOS: always `true`; the platform has no companions.
+  /// - macOS: companions are captured into the source's image. `true` once
+  ///   one decorates the source where it now stands.
   /// - Windows: `true` once every companion reports `DWMWA_CLOAKED` as 0
   ///   or is gone.
   #[must_use]

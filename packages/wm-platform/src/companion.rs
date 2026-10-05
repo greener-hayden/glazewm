@@ -5,12 +5,36 @@
 //! managed window, the overlay draws each companion as a thumbnail
 //! beside the window's own, moved by the same transform. While the WM
 //! moves the real window, a companion-only overlay draws each companion
-//! anchored to the window's edges instead. Only Windows draws companions;
-//! the math lives here so it is testable everywhere.
+//! anchored to the window's edges instead. macOS has no live thumbnails,
+//! so its overlay captures the companions into the window's own
+//! screenshot. The math lives here so it is testable everywhere.
 
 use std::time::{Duration, Instant};
 
 use crate::Rect;
+
+/// How far a companion may reach past the frame of the window it
+/// decorates, and so how far an overlay extends past its path.
+///
+/// A border ring reaches a few pixels out at 100% and about three times
+/// that at 200% with a thick stroke. The margin is transparent, so it
+/// costs nothing to compose.
+pub const COMPANION_MARGIN_PX: i32 = 32;
+
+/// Whether `candidate`, a window of a decorating process, decorates the
+/// window at `frame`.
+///
+/// For platforms where a companion cannot name its window. A band of a
+/// ring lies within the margin around the frame and touches the frame.
+/// The ring of a neighbouring window lies within the margin too once the
+/// gap between the two is under the margin, but it does not touch the
+/// frame unless the gap is under the ring's own reach, where the two
+/// rings share pixels on screen anyway.
+#[must_use]
+pub(crate) fn decorates(candidate: &Rect, frame: &Rect) -> bool {
+  frame.inset(-COMPANION_MARGIN_PX).contains_rect(candidate)
+    && candidate.intersection_area(&frame.inset(-1)) > 0
+}
 
 /// Minimum spacing between two companion searches of one overlay.
 pub(crate) const DISCOVERY_INTERVAL: Duration = Duration::from_millis(16);
@@ -184,6 +208,25 @@ impl DiscoveryThrottle {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The four bands of a window's ring decorate it; a neighbour's ring
+  /// across a gap and an unrelated window do not.
+  #[test]
+  fn decorates_pairs_bands_with_their_window() {
+    let frame = Rect::from_xy(100, 100, 800, 600);
+    for band in [
+      Rect::from_ltrb(96, 96, 116, 704),
+      Rect::from_ltrb(884, 96, 904, 704),
+      Rect::from_ltrb(116, 96, 884, 103),
+      Rect::from_ltrb(116, 697, 884, 704),
+    ] {
+      assert!(decorates(&band, &frame), "{band:?}");
+    }
+    // The left band of a neighbour 16 px to the right.
+    assert!(!decorates(&Rect::from_ltrb(912, 96, 932, 704), &frame));
+    // A band of a larger window that encloses this one.
+    assert!(!decorates(&Rect::from_ltrb(0, 0, 20, 900), &frame));
+  }
 
   /// A slide moves the ring by the window's translation alone.
   #[test]

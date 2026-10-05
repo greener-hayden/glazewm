@@ -19,7 +19,7 @@ use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
   AnimationCapture, AnimationContext, AnimationWindow, CompanionOverlay,
   Dispatcher, EasingFunction, FrameClock, FrameSignal, NativeWindow,
-  OpacityValue, Rect, Spring, SpringState, WindowId,
+  OpacityValue, Rect, Spring, SpringState, WindowId, COMPANION_MARGIN_PX,
 };
 
 use crate::{
@@ -40,15 +40,6 @@ const OPEN_START_SCALE: f32 = 0.94;
 /// A spring measures opacity in these steps, so its 0.5 px settle
 /// tolerance becomes half an alpha step, below what a display shows.
 const ALPHA_STEPS: f64 = 255.0;
-
-/// How far an overlay extends past its path so companion thumbnails that
-/// reach outside the window's frame are not clipped.
-///
-/// A border ring reaches a few pixels out at 100% and about three times
-/// that at 200% with a thick stroke. The overlay has no redirection
-/// bitmap, so the transparent margin costs nothing to compose.
-#[cfg(target_os = "windows")]
-const COMPANION_MARGIN_PX: i32 = 32;
 
 /// Velocity of each rect edge, in px per second, ordered left, top,
 /// right, bottom.
@@ -448,6 +439,35 @@ impl AnimationSpec {
       }
     }
     bounds
+  }
+
+  /// Samples a spring's motion into evenly spaced frames, from its start
+  /// to its target, for a backend that animates for itself.
+  ///
+  /// Returns `None` for a curve easing, which such a backend expresses
+  /// as a timing function.
+  fn keyframes(&self) -> Option<Vec<(Rect, Option<OpacityValue>)>> {
+    /// Frames per second of motion. The compositor interpolates linearly
+    /// between frames, so this bounds the error, not the frame rate.
+    const SAMPLE_RATE: f64 = 120.0;
+    /// Most frames in one motion; a spring settles well within this.
+    const MAX_STEPS: u32 = 600;
+
+    self.spring?;
+    // LINT: The step count is clamped to `MAX_STEPS`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let steps = ((self.duration.as_secs_f64() * SAMPLE_RATE).ceil()
+      as u32)
+      .clamp(1, MAX_STEPS);
+
+    Some(
+      (0..=steps)
+        .map(|step| {
+          let elapsed = self.duration * step / steps;
+          (self.rect_at(elapsed), self.opacity_at(elapsed))
+        })
+        .collect(),
+    )
   }
 
   /// Returns the interpolated rect at the current animation progress.
@@ -993,10 +1013,7 @@ impl AnimationManager {
       // the margin they reach into. Its path usually encloses the landing
       // frame already; resizing anyway moves its origin a compositor frame
       // before the thumbnail follows, and the window blinks at the reveal.
-      #[cfg(target_os = "windows")]
       let bounds = rect.inset(-COMPANION_MARGIN_PX);
-      #[cfg(not(target_os = "windows"))]
-      let bounds = rect.clone();
       if !overlay.window.covers(&bounds) {
         overlay.window.resize(&bounds)?;
       }
@@ -1426,11 +1443,9 @@ impl AnimationManager {
     let outer_rect = {
       let outer_rect = animation.path_bounds();
       // Companions such as border rings extend past the window's frame,
-      // and the overlay clips their thumbnails to its own bounds.
-      // Without the margin a ring loses its outer half, or all of a
-      // band drawn wholly outside the frame, for the whole
-      // animation.
-      #[cfg(target_os = "windows")]
+      // and the overlay clips them to its own bounds. Without the
+      // margin a ring loses its outer half, or all of a band drawn
+      // wholly outside the frame, for the whole animation.
       let outer_rect = outer_rect.inset(-COMPANION_MARGIN_PX);
 
       #[cfg(target_os = "macos")]
@@ -1562,19 +1577,28 @@ impl AnimationManager {
     }
     let completion = completed.clone();
     let tick_tx = self.tick_tx.clone();
-    overlay
-      .window
-      .animate_to(
+    let on_complete = move || {
+      completion.store(true, Ordering::Release);
+      let _ = tick_tx.try_send(FrameSignal::Wake);
+    };
+    // A spring is sampled from the same model a tick-driven backend
+    // draws, so bounce and carried velocity survive. A curve easing is a
+    // timing function the compositor already has.
+    match anim.keyframes() {
+      Some(frames) => {
+        overlay
+          .window
+          .animate_along(&frames, anim.duration, on_complete)
+      }
+      None => overlay.window.animate_to(
         &anim.target_rect,
         anim.duration,
         &anim.easing,
         anim.target_opacity.as_ref(),
-        move || {
-          completion.store(true, Ordering::Release);
-          let _ = tick_tx.try_send(FrameSignal::Wake);
-        },
-      )
-      .map_err(Into::into)
+        on_complete,
+      ),
+    }
+    .map_err(Into::into)
   }
 
   /// Gives a launched motion its clock, with its first frame at
@@ -1794,6 +1818,33 @@ mod tests {
       bounce,
       ..AnimationEffectConfig::default()
     }
+  }
+
+  /// A spring's keyframes run from its start to exactly its target and
+  /// include the overshoot. A curve easing has none.
+  #[test]
+  fn spring_keyframes_span_the_motion() {
+    let (start, target) = (
+      Rect::from_xy(0, 0, 400, 300),
+      Rect::from_xy(1200, 0, 400, 300),
+    );
+    let effect = spring_effect(250, 0.3);
+    let spec = AnimationSpec::new(
+      start.clone(),
+      target.clone(),
+      None,
+      &effect,
+      false,
+      [0.0; 4],
+    );
+
+    let frames = spec.keyframes().expect("A spring has keyframes.");
+    assert_eq!(frames.first().map(|frame| &frame.0), Some(&start));
+    assert_eq!(frames.last().map(|frame| &frame.0), Some(&target));
+    assert!(frames.iter().any(|(rect, _)| rect.left > target.left));
+    assert!(frames.iter().all(|(_, opacity)| opacity.is_none()));
+
+    assert!(test_spec().keyframes().is_none());
   }
 
   /// A spring runs until it settles and then lands exactly.

@@ -8,18 +8,64 @@ use objc2_app_kit::{
   NSBackingStoreType, NSColor, NSFloatingWindowLevel, NSWindow,
   NSWindowAnimationBehavior, NSWindowOrderingMode, NSWindowStyleMask,
 };
-use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::CGImage;
+use objc2_core_foundation::{
+  CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGPoint,
+  CGRect, CGSize,
+};
 #[allow(deprecated)]
 use objc2_core_graphics::{
-  CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption,
+  kCGWindowBounds, kCGWindowNumber, kCGWindowOwnerName, CGImage,
+  CGRectMakeWithDictionaryRepresentation, CGWindowImageOption,
+  CGWindowListCopyWindowInfo, CGWindowListCreateImage,
+  CGWindowListCreateImageFromArray, CGWindowListOption,
 };
-use objc2_quartz_core::{CALayer, CAMediaTimingFunction, CATransaction};
+use objc2_foundation::{ns_string, NSArray, NSNumber, NSString, NSValue};
+use objc2_quartz_core::{
+  kCAAnimationLinear, CAKeyframeAnimation, CALayer, CAMediaTiming,
+  CAMediaTimingFunction, CATransaction,
+};
 
 use crate::{
-  Dispatcher, EasingFunction, NativeWindow, OpacityValue, Rect,
+  companion, Dispatcher, EasingFunction, NativeWindow, OpacityValue, Rect,
   ThreadBound, WindowId,
 };
+
+/// Process whose on-screen windows decorate managed windows.
+///
+/// A window of another process carries no property this process can
+/// read, so a companion is recognised by its owner and by where it
+/// stands. See `companion::decorates`.
+const COMPANION_OWNER: &str = "mover-borders";
+
+/// Where a capture that includes companions stood on screen.
+///
+/// The image covers `bounds`, which reaches past the source's `frame` on
+/// every side a companion does. The layer showing it is placed through
+/// the transform that takes `frame` to the animated rect, so a ring
+/// around the window stays around the animated window.
+#[derive(Clone, Debug, PartialEq)]
+struct CaptureExtent {
+  /// The source's frame when captured.
+  frame: Rect,
+  /// The captured region: `frame` joined with every companion.
+  bounds: Rect,
+}
+
+impl CaptureExtent {
+  /// Maps the rect the source is animated at to the rect its image
+  /// covers.
+  fn image_rect(&self, animated: &Rect) -> Rect {
+    companion::companion_rect(&self.bounds, &self.frame, animated)
+      .unwrap_or_else(|| animated.clone())
+  }
+
+  /// Maps a rect the image covers back to the rect of the source within
+  /// it. Inverse of `image_rect`, within a pixel of rounding.
+  fn source_rect(&self, image: &Rect) -> Rect {
+    companion::companion_rect(&self.frame, &self.bounds, image)
+      .unwrap_or_else(|| image.clone())
+  }
+}
 
 /// Cubic Bézier control points for an [`EasingFunction`].
 ///
@@ -29,9 +75,9 @@ use crate::{
 ///
 /// `Spring` is an approximation: the curve is the closest cubic to a
 /// critically damped spring over its settle time, within about 2% of the
-/// travel. It ignores bounce and does not carry velocity into a retarget,
-/// because the implicit layer animations used here take one timing
-/// function for every property and have no spring form.
+/// travel. It ignores bounce and velocity, because an implicit layer
+/// animation takes one timing function for every property. Callers with
+/// a configured spring use `AnimationWindow::animate_along` instead.
 const fn control_points(easing: &EasingFunction) -> (f32, f32, f32, f32) {
   match easing {
     EasingFunction::Linear => (0.0, 0.0, 1.0, 1.0),
@@ -97,6 +143,13 @@ pub(crate) struct AnimationWindow {
 
   /// Height of the primary display.
   display_height: i32,
+
+  /// How the captured image extends past the source, if it includes
+  /// companions.
+  extent: Option<CaptureExtent>,
+
+  /// The window this overlay stands in for.
+  source_id: WindowId,
 }
 
 impl AnimationWindow {
@@ -117,6 +170,8 @@ impl AnimationWindow {
     )>;
 
     let captured = capture.frame;
+    let extent = captured.extent.clone();
+    let layer_extent = extent.clone();
 
     let (ns_window, layer, display_height) =
       dispatcher.dispatch_sync(|| -> DispatchResult {
@@ -187,6 +242,7 @@ impl AnimationWindow {
           &layer,
           inner_rect,
           outer_rect,
+          layer_extent.as_ref(),
           opacity.as_ref(),
         );
         CATransaction::commit();
@@ -217,6 +273,8 @@ impl AnimationWindow {
       layer,
       display_height,
       outer_rect: outer_rect.clone(),
+      extent,
+      source_id: window.id(),
     })
   }
 
@@ -239,7 +297,13 @@ impl AnimationWindow {
     opacity: Option<&OpacityValue>,
   ) -> crate::Result<()> {
     self.layer.with(|layer| {
-      Self::update_layer(layer, inner_rect, &self.outer_rect, opacity);
+      Self::update_layer(
+        layer,
+        inner_rect,
+        &self.outer_rect,
+        self.extent.as_ref(),
+        opacity,
+      );
     })
   }
 
@@ -271,6 +335,7 @@ impl AnimationWindow {
     F: Fn() + Send + Sync + 'static,
   {
     let outer_rect = self.outer_rect.clone();
+    let extent = self.extent.clone();
     let target_rect = target_rect.clone();
     let easing = easing.clone();
     let opacity = opacity.copied();
@@ -296,10 +361,129 @@ impl AnimationWindow {
         layer,
         &target_rect,
         &outer_rect,
+        extent.as_ref(),
         opacity.as_ref(),
       );
       CATransaction::commit();
     })
+  }
+
+  /// Implements [`AnimationWindow::animate_along`].
+  ///
+  /// Adds explicit keyframe animations for the layer's position, bounds
+  /// and, when every frame has one, opacity. The model values are set to
+  /// the last frame first, so the layer rests there once the animations
+  /// are removed.
+  pub(crate) fn animate_along<F>(
+    &self,
+    frames: &[(Rect, Option<OpacityValue>)],
+    duration: Duration,
+    on_complete: F,
+  ) -> crate::Result<()>
+  where
+    F: Fn() + Send + Sync + 'static,
+  {
+    let Some((target_rect, target_opacity)) = frames.last().cloned()
+    else {
+      return Err(crate::Error::Platform(
+        "Keyframe animation needs at least one frame.".to_string(),
+      ));
+    };
+    let outer_rect = self.outer_rect.clone();
+    let extent = self.extent.clone();
+    let frames = frames.to_vec();
+
+    self.layer.with(move |layer| {
+      let mut positions = Vec::with_capacity(frames.len());
+      let mut bounds = Vec::with_capacity(frames.len());
+      let mut opacities = Vec::with_capacity(frames.len());
+
+      for (rect, opacity) in &frames {
+        let frame = Self::layer_frame(rect, &outer_rect, extent.as_ref());
+        // The layer keeps its default anchor point, so its position is
+        // the centre of its frame.
+        let center = CGPoint::new(
+          frame.origin.x + frame.size.width / 2.0,
+          frame.origin.y + frame.size.height / 2.0,
+        );
+        let size = CGRect::new(CGPoint::ZERO, frame.size);
+        // SAFETY: Both wrap plain geometry structs by value.
+        unsafe {
+          positions.push(NSValue::valueWithPoint(center));
+          bounds.push(NSValue::valueWithRect(size));
+        }
+        if let Some(opacity) = opacity {
+          opacities.push(NSNumber::new_f32(opacity.0));
+        }
+      }
+
+      CATransaction::begin();
+      let completion = RcBlock::new(on_complete);
+      // SAFETY: The transaction copies the owned, static callback. This
+      // reports completion/removal only, never a presentation fence.
+      unsafe { CATransaction::setCompletionBlock(Some(&completion)) };
+      CATransaction::setDisableActions(true);
+      layer.removeAllAnimations();
+      Self::update_layer(
+        layer,
+        &target_rect,
+        &outer_rect,
+        extent.as_ref(),
+        target_opacity.as_ref(),
+      );
+
+      // A zero duration means "use the default" to Core Animation, which
+      // would play a quarter-second animation between frames that are
+      // already at the target. The model values above are the whole
+      // motion then, and the completion block still runs.
+      if !duration.is_zero() {
+        Self::add_keyframes(
+          layer,
+          ns_string!("position"),
+          &positions,
+          duration,
+        );
+        Self::add_keyframes(
+          layer,
+          ns_string!("bounds"),
+          &bounds,
+          duration,
+        );
+        if opacities.len() == frames.len() {
+          Self::add_keyframes(
+            layer,
+            ns_string!("opacity"),
+            &opacities,
+            duration,
+          );
+        }
+      }
+      CATransaction::commit();
+    })
+  }
+
+  /// Adds a linear keyframe animation of `key_path` through `values`,
+  /// evenly spaced over `duration`.
+  ///
+  /// `values` must hold the value type `key_path` animates.
+  fn add_keyframes<T: objc2::Message>(
+    layer: &Retained<CALayer>,
+    key_path: &NSString,
+    values: &[Retained<T>],
+    duration: Duration,
+  ) {
+    let values = NSArray::from_retained_slice(values);
+    let animation =
+      CAKeyframeAnimation::animationWithKeyPath(Some(key_path));
+    // SAFETY: `kCAAnimationLinear` is an immutable framework constant.
+    animation.setCalculationMode(unsafe { kCAAnimationLinear });
+    animation.setDuration(duration.as_secs_f64());
+    // SAFETY: Callers pass the value type their key path animates. The
+    // cast only erases the array's element type.
+    unsafe {
+      animation.setValues(Some(values.cast_unchecked::<AnyObject>()));
+    }
+    layer.addAnimation_forKey(&animation, Some(key_path));
   }
 
   /// Cancels active animations and writes a stationary frame atomically.
@@ -312,7 +496,13 @@ impl AnimationWindow {
       CATransaction::begin();
       CATransaction::setDisableActions(true);
       layer.removeAllAnimations();
-      Self::update_layer(layer, rect, &self.outer_rect, opacity);
+      Self::update_layer(
+        layer,
+        rect,
+        &self.outer_rect,
+        self.extent.as_ref(),
+        opacity,
+      );
       CATransaction::commit();
     })
   }
@@ -325,11 +515,15 @@ impl AnimationWindow {
       unsafe { layer.presentationLayer() }.map(|presented| {
         let local =
           Rect::from(presented.frame()).flip_y(self.outer_rect.height());
-        Rect::from_xy(
+        let image = Rect::from_xy(
           self.outer_rect.x() + local.x(),
           self.outer_rect.y() + local.y(),
           local.width(),
           local.height(),
+        );
+        self.extent.as_ref().map_or_else(
+          || image.clone(),
+          |extent| extent.source_rect(&image),
         )
       })
     })
@@ -337,10 +531,26 @@ impl AnimationWindow {
 
   /// Implements [`AnimationWindow::companions_revealed`].
   ///
-  /// Always `true`; macOS has no companions.
-  #[allow(clippy::unused_self)]
+  /// `true` for an image without companions, which has nothing to hand
+  /// back. Otherwise `true` once a companion decorates the source where
+  /// it now stands, or when the source or the window list is gone, so a
+  /// failure never holds the overlay.
   pub(crate) fn companions_revealed(&self) -> bool {
-    true
+    if self.extent.is_none() {
+      return true;
+    }
+    let Some(windows) = on_screen_windows() else {
+      return true;
+    };
+    let Some(source) =
+      windows.iter().find(|window| window.id == self.source_id.0)
+    else {
+      return true;
+    };
+    windows.iter().any(|window| {
+      window.owner == COMPANION_OWNER
+        && companion::decorates(&window.bounds, &source.bounds)
+    })
   }
 
   /// Implements [`AnimationWindow::destroy`].
@@ -359,8 +569,29 @@ impl AnimationWindow {
     layer: &Retained<CALayer>,
     inner_rect: &Rect,
     outer_rect: &Rect,
+    extent: Option<&CaptureExtent>,
     opacity: Option<&OpacityValue>,
   ) {
+    layer.setFrame(Self::layer_frame(inner_rect, outer_rect, extent));
+
+    if let Some(opacity) = opacity {
+      layer.setOpacity(opacity.0);
+    }
+  }
+
+  /// Converts the screen rect the source is drawn at to the layer's
+  /// frame within the window, in AppKit coordinates (bottom-left origin).
+  ///
+  /// With an `extent` the layer's image reaches past the source, so the
+  /// layer covers the rect that image maps to.
+  fn layer_frame(
+    inner_rect: &Rect,
+    outer_rect: &Rect,
+    extent: Option<&CaptureExtent>,
+  ) -> CGRect {
+    let image_rect = extent.map(|extent| extent.image_rect(inner_rect));
+    let inner_rect = image_rect.as_ref().unwrap_or(inner_rect);
+
     // `inner_rect` needs to be positioned relative to the window's frame.
     let offset_rect = Rect::from_xy(
       inner_rect.x() - outer_rect.x(),
@@ -369,29 +600,40 @@ impl AnimationWindow {
       inner_rect.height(),
     );
 
-    // `setFrame` expects AppKit coordinates (bottom-left origin).
-    layer.setFrame(offset_rect.flip_y(outer_rect.height()).into());
-
-    if let Some(opacity) = opacity {
-      layer.setOpacity(opacity.0);
-    }
+    offset_rect.flip_y(outer_rect.height()).into()
   }
 }
 
-/// A screen capture of a window via `CGWindowListCreateImage`.
+/// A screen capture of a window, taken before its overlay exists.
 pub(crate) struct AnimationCapture {
   frame: CapturedFrame,
 }
 
-/// A screen capture of a window via `CGWindowListCreateImage`.
+/// A screen capture of a window, with its companions when it has any.
 struct CapturedFrame {
   cg_image: CFRetained<CGImage>,
+
+  /// Where the image stood on screen, when it includes companions.
+  /// `None` for an image of exactly the window.
+  extent: Option<CaptureExtent>,
 }
 
 impl CapturedFrame {
   /// Captures a single frame of a given window.
-  #[allow(deprecated)]
+  ///
+  /// A window with companions on screen is captured together with them,
+  /// so a border ring travels with the window's image. Anything else is
+  /// captured alone, as is every window when the companion search fails.
   fn new(window_id: WindowId) -> crate::Result<Self> {
+    if let Some(captured) = Self::with_companions(window_id) {
+      return Ok(captured);
+    }
+    Self::alone(window_id)
+  }
+
+  /// Captures the window alone, bounded by its own frame.
+  #[allow(deprecated)]
+  fn alone(window_id: WindowId) -> crate::Result<Self> {
     // Use `CGRectNull` to capture the minimum rectangle that encloses the
     // window. See: https://developer.apple.com/documentation/coregraphics/cgwindowlistcreateimage(_:_:_:_:)
     let cg_rect_null = CGRect::new(
@@ -422,6 +664,155 @@ impl CapturedFrame {
       "Failed to create window screenshot.".to_string(),
     ))?;
 
-    Ok(Self { cg_image: image })
+    Ok(Self {
+      cg_image: image,
+      extent: None,
+    })
+  }
+
+  /// Captures the window and its on-screen companions as one image.
+  ///
+  /// Returns `None` when the window has no companions on screen or any
+  /// step fails; the caller then captures the window alone.
+  #[allow(deprecated)]
+  fn with_companions(window_id: WindowId) -> Option<Self> {
+    let windows = on_screen_windows()?;
+    let frame = windows
+      .iter()
+      .find(|window| window.id == window_id.0)?
+      .bounds
+      .clone();
+
+    let companions = windows
+      .iter()
+      .filter(|window| {
+        window.owner == COMPANION_OWNER
+          && companion::decorates(&window.bounds, &frame)
+      })
+      .collect::<Vec<_>>();
+    if companions.is_empty() {
+      return None;
+    }
+
+    let bounds = companions
+      .iter()
+      .fold(frame.clone(), |bounds, window| bounds.union(&window.bounds));
+
+    // The array holds window IDs themselves, not pointers to them, which
+    // is the form `CGWindowListCreateImageFromArray` documents.
+    let mut ids = std::iter::once(window_id.0)
+      .chain(companions.iter().map(|window| window.id))
+      .map(|id| id as usize as *const std::ffi::c_void)
+      .collect::<Vec<_>>();
+    let count = isize::try_from(ids.len()).ok()?;
+    // SAFETY: `ids` holds `count` values and outlives the call. Null
+    // callbacks make the array store them as plain values, with nothing
+    // to retain or release.
+    let array = unsafe {
+      CFArray::new(None, ids.as_mut_ptr(), count, std::ptr::null())
+    }?;
+
+    // SAFETY: The array holds window IDs, as the function requires.
+    // Nominal resolution for the reason given in `alone`.
+    let image = unsafe {
+      CGWindowListCreateImageFromArray(
+        bounds.clone().into(),
+        &array,
+        CGWindowImageOption::NominalResolution,
+      )
+    }?;
+
+    Some(Self {
+      cg_image: image,
+      extent: Some(CaptureExtent { frame, bounds }),
+    })
+  }
+}
+
+/// One on-screen window, as the window server lists it.
+struct ListedWindow {
+  id: u32,
+  /// Name of the owning process; empty when the server omits it.
+  owner: String,
+  /// Bounds in screen coordinates.
+  bounds: Rect,
+}
+
+/// Lists every on-screen window, front to back.
+///
+/// Windows the server describes incompletely are skipped. Returns `None`
+/// when the list itself is unavailable.
+fn on_screen_windows() -> Option<Vec<ListedWindow>> {
+  let windows =
+    CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, 0)?;
+  // SAFETY: Window services returns dictionaries with string keys and
+  // Core Foundation values, retaining all of those objects.
+  let windows =
+    unsafe { windows.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+
+  Some(
+    windows
+      .iter()
+      .filter_map(|info| {
+        // SAFETY: The framework provides these immutable dictionary keys.
+        let (number, owner, bounds) = unsafe {
+          (kCGWindowNumber, kCGWindowOwnerName, kCGWindowBounds)
+        };
+        let id = info
+          .get(number)?
+          .downcast_ref::<CFNumber>()?
+          .as_i64()
+          .and_then(|id| u32::try_from(id).ok())?;
+        let owner = info
+          .get(owner)
+          .and_then(|owner| {
+            owner.downcast_ref::<CFString>().map(ToString::to_string)
+          })
+          .unwrap_or_default();
+        let dictionary = info.get(bounds)?;
+        let dictionary = dictionary.downcast_ref::<CFDictionary>()?;
+        let mut rect = CGRect::ZERO;
+        // SAFETY: The checked dictionary is retained and `rect` is a live
+        // output rectangle for the duration of this synchronous call.
+        unsafe {
+          CGRectMakeWithDictionaryRepresentation(
+            Some(dictionary),
+            &raw mut rect,
+          )
+        }
+        .then(|| ListedWindow {
+          id,
+          owner,
+          bounds: rect.into(),
+        })
+      })
+      .collect(),
+  )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A capture that includes a ring keeps the ring around the window
+  /// wherever the window is drawn, and maps back to the window's rect.
+  #[test]
+  fn extent_carries_companions_through_the_transform() {
+    let extent = CaptureExtent {
+      frame: Rect::from_xy(100, 100, 800, 600),
+      bounds: Rect::from_ltrb(96, 96, 904, 704),
+    };
+
+    let moved = Rect::from_xy(1000, 300, 800, 600);
+    let image = extent.image_rect(&moved);
+    assert_eq!(image, Rect::from_ltrb(996, 296, 1804, 904));
+    assert_eq!(extent.source_rect(&image), moved);
+
+    // Scaled to half size, the ring's reach halves with the window.
+    let scaled = Rect::from_xy(0, 0, 400, 300);
+    assert_eq!(
+      extent.image_rect(&scaled),
+      Rect::from_ltrb(-2, -2, 402, 302)
+    );
   }
 }

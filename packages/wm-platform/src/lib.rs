@@ -3,9 +3,9 @@
 #![feature(iterator_try_collect)]
 
 mod animation_window;
-// LINT: Only Windows draws companions; the math compiles everywhere so
-// it stays testable.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+// LINT: Each platform uses part of the companion math; all of it
+// compiles everywhere so it stays testable.
+#[allow(dead_code)]
 mod companion;
 mod dispatcher;
 mod display;
@@ -41,6 +41,7 @@ pub use windows_session::{
 pub mod test_utils;
 
 pub use animation_window::*;
+pub use companion::COMPANION_MARGIN_PX;
 pub use dispatcher::*;
 pub use display::*;
 pub use display_listener::*;

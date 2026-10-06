@@ -256,8 +256,24 @@ impl PlacementSession {
   }
 
   /// Observes native visibility, including Windows compositor cloaking.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: validates ownership first.
+  /// - macOS: makes no validation read: visibility is the owning
+  ///   application's hidden flag, which needs no window. Callers validate
+  ///   once per pass, as [`Self::observe`] does for its own reads, so a
+  ///   window that is gone fails there and not here. A new caller must
+  ///   validate first, or it gets `Ok` for a dead window.
   pub fn is_visible(&self) -> crate::Result<bool> {
-    self.window()?.is_visible()
+    #[cfg(target_os = "windows")]
+    {
+      self.window()?.is_visible()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      self.native.is_visible()
+    }
   }
 
   /// Reads the window's current placement coordinate scale.
@@ -895,6 +911,41 @@ mod tests {
         "`{name}` made native calls."
       );
     }
+  }
+
+  #[test]
+  fn visibility_makes_no_counted_native_calls() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), dead_element);
+
+    // A reconciliation pass reads visibility up to three times: before
+    // and after each of the two writes that can change it.
+    let (results, spent) =
+      counted(|| [(); 3].map(|()| session.is_visible()));
+
+    // Each read used to validate the window first, costing an `AXRole`
+    // read apiece. The application's hidden flag needs no window, and
+    // reading it is an in-process property read that is not counted.
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(spent, NativeCallSnapshot::default());
+  }
+
+  #[test]
+  fn a_dead_window_fails_validation_and_observation() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), dead_element);
+
+    // `is_visible` no longer fails for a dead window, so the caller's
+    // `validate` and `observe` are what reject one. This pins those two,
+    // not the order the reconciler calls them in.
+    assert!(matches!(
+      session.validate(),
+      Err(crate::Error::WindowNotFound)
+    ));
+    assert!(matches!(
+      session.observe(),
+      Err(crate::Error::WindowNotFound)
+    ));
   }
 
   #[test]

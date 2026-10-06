@@ -2,10 +2,10 @@ use std::{
   path::Path,
   sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    mpsc, Arc, Mutex, MutexGuard, PoisonError,
   },
   thread::ThreadId,
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 #[cfg(target_os = "macos")]
@@ -56,6 +56,106 @@ use crate::{
 
 /// Type alias for a closure to be executed by the event loop.
 pub type DispatchFn = dyn FnOnce() + Send + 'static;
+
+/// How long `Dispatcher::dispatch_sync` waits for the event loop to start
+/// a closure before giving up on it.
+const DISPATCH_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs a closure on the event loop thread and waits for its result.
+///
+/// `enqueue` hands a `'static` closure to the event loop, which is
+/// expected to run it at most once. The closure `dispatch_fn` may borrow
+/// from the caller's stack, so this function must not return while the
+/// event loop could still touch it:
+///
+/// - The closure lives in a slot shared with the queued wrapper, and
+///   whoever `take()`s it from the slot owns it. The queued wrapper only
+///   holds the slot, so it is `'static` and harmless if it outlives this
+///   call.
+/// - If the event loop has not started the closure within `timeout`, the
+///   caller takes it back, drops it on this thread and returns an error.
+///   It never runs afterwards.
+/// - If the event loop already started it, the caller keeps waiting, with
+///   no further bound, until the closure finishes. Returning earlier would
+///   let it run against a dead stack frame.
+pub(crate) fn dispatch_sync_via<F, R>(
+  enqueue: impl FnOnce(Box<DispatchFn>) -> crate::Result<()>,
+  dispatch_fn: F,
+  timeout: Duration,
+) -> crate::Result<R>
+where
+  F: FnOnce() -> R + Send,
+  R: Send,
+{
+  /// Locks the slot, ignoring poison since it is only held to `take()`.
+  fn lock(
+    slot: &Mutex<Option<Box<DispatchFn>>>,
+  ) -> MutexGuard<'_, Option<Box<DispatchFn>>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+  }
+
+  let (result_tx, result_rx) = mpsc::channel();
+
+  let local_fn: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
+    if result_tx.send(dispatch_fn()).is_err() {
+      tracing::error!("Failed to send closure result.");
+    }
+  });
+
+  // SAFETY: The erased closure is only reachable through `slot`. This
+  // function returns only once the closure is either dropped here, after
+  // being taken back from the slot, or has finished running on the event
+  // loop (it has sent its result, or was dropped while unwinding). The
+  // queued wrapper owns the slot but not the closure once it has been
+  // taken, so nothing borrowed from the caller's frame outlives the call.
+  let erased_fn = unsafe {
+    std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Box<DispatchFn>>(
+      local_fn,
+    )
+  };
+
+  let slot = Arc::new(Mutex::new(Some(erased_fn)));
+  let queued_slot = Arc::clone(&slot);
+
+  // On failure, `slot` still owns the closure and drops it on return.
+  enqueue(Box::new(move || {
+    // Release the lock before running so the caller can reach the slot.
+    let queued_fn = lock(&queued_slot).take();
+
+    if let Some(queued_fn) = queued_fn {
+      queued_fn();
+    }
+  }))?;
+
+  match result_rx.recv_timeout(timeout) {
+    Ok(result) => Ok(result),
+    Err(mpsc::RecvTimeoutError::Timeout) => {
+      let reclaimed_fn = lock(&slot).take();
+
+      if let Some(reclaimed_fn) = reclaimed_fn {
+        // Never started, and now never will.
+        drop(reclaimed_fn);
+        return Err(crate::Error::ChannelRecv(
+          mpsc::RecvTimeoutError::Timeout,
+        ));
+      }
+
+      // The event loop already took the closure, so it is running or
+      // done, and it may be borrowing from this stack frame.
+      tracing::warn!(
+        "Event loop closure still running after {timeout:?}; waiting for \
+         it to finish."
+      );
+
+      result_rx.recv().map_err(|_| {
+        crate::Error::ChannelRecv(mpsc::RecvTimeoutError::Disconnected)
+      })
+    }
+    Err(err @ mpsc::RecvTimeoutError::Disconnected) => {
+      Err(crate::Error::ChannelRecv(err))
+    }
+  }
+}
 
 /// A callback that pre-processes window procedure messages received by the
 /// event loop.
@@ -481,9 +581,25 @@ impl Dispatcher {
   /// If the current thread is the event loop thread, the function is
   /// executed directly.
   ///
-  /// Returns a `Result` with the closure's return value.
-  #[allow(clippy::missing_panics_doc)]
+  /// Returns a `Result` with the closure's return value. Errors if the
+  /// event loop does not start the closure within 5 seconds, in which case
+  /// the closure is dropped without ever running. A closure that has
+  /// already started is waited for, however long it takes.
   pub fn dispatch_sync<F, R>(&self, dispatch_fn: F) -> crate::Result<R>
+  where
+    F: FnOnce() -> R + Send,
+    R: Send,
+  {
+    self.dispatch_sync_with_timeout(dispatch_fn, DISPATCH_SYNC_TIMEOUT)
+  }
+
+  /// Implements [`Self::dispatch_sync`] with a caller-chosen timeout.
+  #[allow(clippy::missing_panics_doc)]
+  pub(crate) fn dispatch_sync_with_timeout<F, R>(
+    &self,
+    dispatch_fn: F,
+    timeout: Duration,
+  ) -> crate::Result<R>
   where
     F: FnOnce() -> R + Send,
     R: Send,
@@ -498,22 +614,27 @@ impl Dispatcher {
       return Ok(dispatch_fn());
     }
 
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
     let hop_started = Instant::now();
 
     // TODO: Block until event loop source is set.
-    self.source.as_ref().unwrap().send_dispatch_sync(move || {
-      let result = dispatch_fn();
+    let source = self.source.as_ref().unwrap();
+    let mut enqueued = false;
+    let result = dispatch_sync_via(
+      |queued_fn| {
+        source.send_dispatch_async(queued_fn)?;
+        enqueued = true;
+        Ok(())
+      },
+      dispatch_fn,
+      timeout,
+    );
 
-      if result_tx.send(result).is_err() {
-        tracing::error!("Failed to send closure result.");
-      }
-    })?;
+    // Only hops that reached the event loop are counted.
+    if enqueued {
+      NativeCallStats::record_hop(hop_started.elapsed());
+    }
 
-    let result = result_rx.recv_timeout(std::time::Duration::from_secs(5));
-    NativeCallStats::record_hop(hop_started.elapsed());
-
-    result.map_err(crate::Error::ChannelRecv)
+    result
   }
 
   /// Gets the thread ID of the event loop thread.
@@ -765,17 +886,29 @@ impl Dispatcher {
     }
     #[cfg(target_os = "macos")]
     {
-      // TODO: This should block indefinitely. Currently, it gets timed out
-      // after 5 seconds.
-      let _ = self.dispatch_sync(|| {
+      // TODO: This should block indefinitely. Currently, the caller stops
+      // waiting after 5 seconds while the dialog stays open. The closure
+      // owns its text and is queued with `dispatch_async` so that giving
+      // up on a modal that is already running stays sound, without
+      // `dispatch_sync` waiting for the user to dismiss it.
+      let (title, message) = (title.to_owned(), message.to_owned());
+      let (shown_tx, shown_rx) = std::sync::mpsc::channel();
+
+      let queued = self.dispatch_async(move || {
         let mtm = MainThreadMarker::new().unwrap();
 
         let alert = NSAlert::new(mtm);
-        alert.setMessageText(&NSString::from_str(title));
-        alert.setInformativeText(&NSString::from_str(message));
+        alert.setMessageText(&NSString::from_str(&title));
+        alert.setInformativeText(&NSString::from_str(&message));
         alert.setAlertStyle(NSAlertStyle::Critical);
         alert.runModal();
+
+        let _ = shown_tx.send(());
       });
+
+      if queued.is_ok() {
+        let _ = shown_rx.recv_timeout(DISPATCH_SYNC_TIMEOUT);
+      }
     }
   }
 }
@@ -788,9 +921,184 @@ impl std::fmt::Debug for Dispatcher {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::{Arc, Mutex};
+  use std::{
+    sync::{
+      atomic::{AtomicBool, Ordering},
+      Arc, Mutex,
+    },
+    thread::ThreadId,
+    time::{Duration, Instant},
+  };
 
-  use crate::{EventLoop, NativeCallStats};
+  use super::dispatch_sync_via;
+  use crate::{DispatchFn, EventLoop, NativeCallStats};
+
+  /// Records the thread that drops it.
+  struct DropRecorder(Arc<Mutex<Option<ThreadId>>>);
+
+  impl Drop for DropRecorder {
+    fn drop(&mut self) {
+      *self.0.lock().unwrap() = Some(std::thread::current().id());
+    }
+  }
+
+  #[test]
+  fn dispatch_sync_via_drops_unstarted_closure_on_caller() {
+    let dropped_on = Arc::new(Mutex::new(None));
+    let ran = Arc::new(AtomicBool::new(false));
+    let queue: Mutex<Vec<Box<DispatchFn>>> = Mutex::new(Vec::new());
+
+    let recorder = DropRecorder(dropped_on.clone());
+    let ran_clone = ran.clone();
+    let result = dispatch_sync_via(
+      |queued_fn| {
+        queue.lock().unwrap().push(queued_fn);
+        Ok(())
+      },
+      move || {
+        let _recorder = &recorder;
+        ran_clone.store(true, Ordering::SeqCst);
+      },
+      Duration::from_millis(20),
+    );
+
+    assert!(matches!(result, Err(crate::Error::ChannelRecv(_))));
+    assert_eq!(
+      *dropped_on.lock().unwrap(),
+      Some(std::thread::current().id()),
+      "Closure must be dropped on the caller's thread before returning."
+    );
+
+    // The event loop gets to the queued wrapper too late.
+    let queued = std::mem::take(&mut *queue.lock().unwrap());
+    assert_eq!(queued.len(), 1);
+    for queued_fn in queued {
+      queued_fn();
+    }
+    assert!(!ran.load(Ordering::SeqCst));
+  }
+
+  #[test]
+  fn dispatch_sync_via_drops_closure_when_enqueue_fails() {
+    let dropped_on = Arc::new(Mutex::new(None));
+
+    let recorder = DropRecorder(dropped_on.clone());
+    let result: crate::Result<()> = dispatch_sync_via(
+      |_| Err(crate::Error::ChannelSend),
+      move || {
+        let _recorder = &recorder;
+      },
+      Duration::from_millis(20),
+    );
+
+    assert!(matches!(result, Err(crate::Error::ChannelSend)));
+    assert_eq!(
+      *dropped_on.lock().unwrap(),
+      Some(std::thread::current().id())
+    );
+  }
+
+  #[test]
+  fn dispatch_sync_via_waits_for_running_closure() {
+    const RUN_FOR: Duration = Duration::from_millis(300);
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let finished = AtomicBool::new(false);
+
+    let started_at = Instant::now();
+    let result = std::thread::scope(|scope| {
+      let result = dispatch_sync_via(
+        |queued_fn| {
+          // Stands in for the event loop. Enqueueing returns only once the
+          // closure has started, so the timeout below always expires while
+          // it is running.
+          scope.spawn(queued_fn);
+          started_rx.recv().unwrap();
+          Ok(())
+        },
+        || {
+          started_tx.send(()).unwrap();
+          std::thread::sleep(RUN_FOR);
+          finished.store(true, Ordering::SeqCst);
+          7
+        },
+        Duration::from_millis(50),
+      );
+
+      // Checked inside the scope, before the "loop" thread is joined: the
+      // caller itself must not return until the closure is done.
+      assert!(finished.load(Ordering::SeqCst));
+      result
+    });
+
+    assert!(matches!(result, Ok(7)));
+    assert!(started_at.elapsed() >= RUN_FOR);
+  }
+
+  #[test]
+  fn dispatch_sync_drops_unstarted_closure_on_timeout() {
+    // An event loop that is never run, so the closure never starts.
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+    let dropped_on = Arc::new(Mutex::new(None));
+    let ran = Arc::new(AtomicBool::new(false));
+
+    let (dropped_on_clone, ran_clone) = (dropped_on.clone(), ran.clone());
+    let timed_out_dispatcher = dispatcher.clone();
+    let (result, caller_id) = std::thread::spawn(move || {
+      let recorder = DropRecorder(dropped_on_clone);
+      let result = timed_out_dispatcher.dispatch_sync_with_timeout(
+        move || {
+          let _recorder = &recorder;
+          ran_clone.store(true, Ordering::SeqCst);
+        },
+        Duration::from_millis(50),
+      );
+      (result, std::thread::current().id())
+    })
+    .join()
+    .unwrap();
+
+    // Now let the loop run: it must find nothing to execute.
+    std::thread::spawn(move || {
+      dispatcher.dispatch_sync(|| {}).unwrap();
+      dispatcher.stop_event_loop().unwrap();
+    });
+    event_loop.run().unwrap();
+
+    assert!(matches!(result, Err(crate::Error::ChannelRecv(_))));
+    assert_eq!(*dropped_on.lock().unwrap(), Some(caller_id));
+    assert!(!ran.load(Ordering::SeqCst));
+  }
+
+  #[test]
+  fn dispatch_sync_waits_for_closure_running_past_timeout() {
+    const RUN_FOR: Duration = Duration::from_millis(500);
+
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+    let finished = Arc::new(AtomicBool::new(false));
+
+    let finished_clone = finished.clone();
+    let caller = std::thread::spawn(move || {
+      let result = dispatcher.dispatch_sync_with_timeout(
+        || {
+          std::thread::sleep(RUN_FOR);
+          finished_clone.store(true, Ordering::SeqCst);
+        },
+        Duration::from_millis(200),
+      );
+      let finished_on_return = finished_clone.load(Ordering::SeqCst);
+
+      dispatcher.stop_event_loop().unwrap();
+      (result.is_ok(), finished_on_return)
+    });
+
+    event_loop.run().unwrap();
+    let (ok, finished_on_return) = caller.join().unwrap();
+
+    assert!(ok);
+    assert!(finished_on_return);
+    assert!(finished.load(Ordering::SeqCst));
+  }
 
   #[test]
   fn dispatch_after_stop_fails() {

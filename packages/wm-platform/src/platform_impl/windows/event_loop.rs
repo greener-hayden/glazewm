@@ -97,30 +97,6 @@ impl EventLoopSource {
     }
   }
 
-  #[allow(clippy::unnecessary_wraps)]
-  pub(crate) fn send_dispatch_sync<F>(
-    &self,
-    dispatch_fn: F,
-  ) -> crate::Result<()>
-  where
-    F: FnOnce() + Send,
-  {
-    let dispatch_fn: Box<Box<dyn FnOnce() + Send>> =
-      Box::new(Box::new(dispatch_fn));
-    let callback_ptr = Box::into_raw(dispatch_fn);
-
-    unsafe {
-      PostMessageW(
-        HWND(self.message_window_handle),
-        WM_DISPATCH_CALLBACK.with(|v| *v),
-        WPARAM(callback_ptr as _),
-        LPARAM(0),
-      )?;
-    }
-
-    Ok(())
-  }
-
   /// Asks the event loop to stop.
   ///
   /// Succeeds without posting when the loop has already exited, since its

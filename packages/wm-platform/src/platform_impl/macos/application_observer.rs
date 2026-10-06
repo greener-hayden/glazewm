@@ -532,8 +532,8 @@ impl Drop for ApplicationObserver {
     // Ownership is moved into the closure as raw addresses (an extra
     // retain on the source, plus the context box), since `CFRetained`
     // and raw pointers are not `Send`. `dispatch_async` either runs the
-    // closure (now or later) or fails without ever enqueueing it — there
-    // is no ambiguous timeout state, unlike `dispatch_sync`.
+    // closure (now or later) or fails without ever enqueueing it, and
+    // it never blocks the caller on a hung event loop.
     let source_addr =
       CFRetained::into_raw(self.observer_source.clone()).as_ptr() as usize;
     let context_addr = self.context_ptr as usize;

@@ -1,6 +1,9 @@
-use std::sync::{
-  atomic::{AtomicBool, Ordering},
-  mpsc, Arc,
+use std::{
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+  },
+  time::Duration,
 };
 
 use objc2::MainThreadMarker;
@@ -11,7 +14,11 @@ use objc2_core_foundation::{
   CFRunLoopSourceContext,
 };
 
-use crate::{DispatchFn, Dispatcher};
+use crate::{dispatcher::dispatch_sync_via, DispatchFn, Dispatcher};
+
+/// How long `send_stop` waits for the main thread to start stopping
+/// `NSApplication`.
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How the run loop behind an [`EventLoopSource`] is asked to stop.
 #[derive(Clone, Copy)]
@@ -62,26 +69,6 @@ impl EventLoopSource {
     Ok(())
   }
 
-  pub(crate) fn send_dispatch_sync<F>(
-    &self,
-    dispatch_fn: F,
-  ) -> crate::Result<()>
-  where
-    F: FnOnce() + Send,
-  {
-    // SAFETY: Usage of this function needs to be in a synchronous
-    // context where the dispatch function will be executed before the
-    // caller's stack frame is dropped.
-    let dispatch_fn_static = unsafe {
-      std::mem::transmute::<
-        Box<dyn FnOnce() + Send>,
-        Box<dyn FnOnce() + Send + 'static>,
-      >(Box::new(dispatch_fn))
-    };
-
-    self.send_dispatch_async(dispatch_fn_static)
-  }
-
   pub(crate) fn send_stop(&self) -> crate::Result<()> {
     // A bare run loop is stopped directly. `CFRunLoopStop` is safe to
     // call from another thread, and dispatching the stop onto a thread
@@ -92,25 +79,21 @@ impl EventLoopSource {
       return Ok(());
     }
 
-    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    dispatch_sync_via(
+      |stop_fn| self.send_dispatch_async(stop_fn),
+      || {
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
-    self.send_dispatch_sync(|| {
-      let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        // Call `stop()` to mark the run loop for termination.
+        let ns_app = NSApplication::sharedApplication(mtm);
+        ns_app.stop(None);
 
-      // Call `stop()` to mark the run loop for termination.
-      let ns_app = NSApplication::sharedApplication(mtm);
-      ns_app.stop(None);
-
-      // `stop()` only takes effect after processing a subsequent UI event.
-      // Post a dummy event so the application actually exits.
-      ns_app.abortModal();
-
-      let _ = result_tx.send(());
-    })?;
-
-    result_rx
-      .recv_timeout(std::time::Duration::from_secs(3))
-      .map_err(crate::Error::ChannelRecv)
+        // `stop()` only takes effect after processing a subsequent UI
+        // event. Post a dummy event so the application actually exits.
+        ns_app.abortModal();
+      },
+      STOP_TIMEOUT,
+    )
   }
 }
 

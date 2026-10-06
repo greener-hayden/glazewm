@@ -275,6 +275,13 @@ impl NativeWindow {
     Ok(())
   }
 
+  /// Implements [`NativeWindow::focus_deferred_raise`].
+  ///
+  /// Setting the foreground window has no raise to defer.
+  pub(crate) fn focus_deferred_raise(&self) -> crate::Result<()> {
+    self.focus()
+  }
+
   /// Implements [`NativeWindow::focus`].
   pub(crate) fn focus(&self) -> crate::Result<()> {
     let input = [INPUT {

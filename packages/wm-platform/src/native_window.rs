@@ -606,6 +606,22 @@ impl NativeWindow {
     self.inner.focus()
   }
 
+  /// Sets focus to the window like [`Self::focus`], without waiting
+  /// for the application to acknowledge the raise.
+  ///
+  /// The raise is still delivered, so a window that overlaps another can
+  /// come to the front after a focus change that follows it. Use it for
+  /// windows that do not overlap their neighbours.
+  ///
+  /// # Platform-specific
+  ///
+  /// - **Windows**: Same as [`Self::focus`].
+  /// - **macOS**: The raise waits at most for the deferred write timeout,
+  ///   and one that takes longer is not an error.
+  pub fn focus_deferred_raise(&self) -> crate::Result<()> {
+    self.inner.focus_deferred_raise()
+  }
+
   /// Closes the window.
   ///
   /// # Platform-specific

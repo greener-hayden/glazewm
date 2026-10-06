@@ -97,6 +97,17 @@ impl PlacementSession {
   /// - macOS: `true`; the state is an accessibility attribute.
   pub const STATE_READS_ASK_APP: bool = cfg!(target_os = "macos");
 
+  /// Whether native focus may go to a window once its frame write is
+  /// accepted, without waiting to see the write applied.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: `false`; frame writes are posted asynchronously, so focus
+  ///   waits for the move to land.
+  /// - macOS: `true`; focus does not depend on the frame, and waiting for
+  ///   it costs the application's relayout.
+  pub const FOCUS_ON_ACCEPTED_WRITE: bool = cfg!(target_os = "macos");
+
   /// Whether the event listener already concealed this source.
   #[must_use]
   pub fn opening_concealed(&self) -> bool {

@@ -423,10 +423,20 @@ impl NativeWindow {
 
   /// Implements [`NativeWindow::focus`].
   pub(crate) fn focus(&self) -> crate::Result<()> {
+    self.focus_with(RaiseWait::Acknowledged)
+  }
+
+  /// Implements [`NativeWindow::focus_deferred_raise`].
+  pub(crate) fn focus_deferred_raise(&self) -> crate::Result<()> {
+    self.focus_with(RaiseWait::Deferred)
+  }
+
+  /// Focuses the window, then raises it as `raise_wait` says.
+  fn focus_with(&self, raise_wait: RaiseWait) -> crate::Result<()> {
     let psn = self.application.psn()?;
     self.set_front_process(&psn)?;
     self.set_key_window(&psn)?;
-    self.raise()
+    self.raise(raise_wait)
   }
 
   /// Implements [`NativeWindow::close`].
@@ -511,7 +521,7 @@ impl NativeWindow {
     })??
   }
 
-  fn raise(&self) -> crate::Result<()> {
+  fn raise(&self, raise_wait: RaiseWait) -> crate::Result<()> {
     self.with_element(move |el| -> crate::Result<()> {
       // This has a couple of caveats:
       // - Some windows do not get raised without first calling
@@ -525,18 +535,24 @@ impl NativeWindow {
       // API. It's also the reason why the GlazeWM feature of bringing all
       // tiling/floating windows to the front on focus change is not
       // implemented for macOS.
-      NativeCallStats::record(NativeCall::AxAction);
-      let result =
-        unsafe { el.perform_action(&CFString::from_str("AXRaise")) };
+      let raise = || {
+        NativeCallStats::record(NativeCall::AxAction);
+        let result =
+          unsafe { el.perform_action(&CFString::from_str("AXRaise")) };
 
-      if result != AXError::Success {
-        return Err(crate::Error::Accessibility(
-          "AXRaise".to_string(),
-          result.0,
-        ));
+        if result == AXError::Success {
+          Ok(())
+        } else {
+          Err(crate::Error::Accessibility("AXRaise".to_string(), result.0))
+        }
+      };
+
+      match raise_wait {
+        RaiseWait::Acknowledged => raise(),
+        RaiseWait::Deferred => {
+          with_deferred_writes(el, || delivered(raise()))
+        }
       }
-
-      Ok(())
     })?
   }
 
@@ -755,6 +771,16 @@ fn read_frame(el: &CFRetained<AXUIElement>) -> crate::Result<Rect> {
 /// 2.2ms), so those still report their errors.
 const DEFERRED_WRITE_TIMEOUT_SECS: f32 = 0.002;
 
+/// How long a raise waits for the application to acknowledge it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RaiseWait {
+  /// Waits for the application, up to the global messaging timeout.
+  Acknowledged,
+  /// Waits only for [`DEFERRED_WRITE_TIMEOUT_SECS`]. A raise that times
+  /// out is still delivered, so it counts as sent (see [`delivered`]).
+  Deferred,
+}
+
 /// Runs `writes` against `el` without waiting for the application to
 /// apply them.
 ///
@@ -835,6 +861,33 @@ mod tests {
     right: 0,
     bottom: 1324,
   };
+
+  #[test]
+  fn delivered_maps_a_stall_to_success() {
+    let stall = crate::Error::Accessibility(
+      "AXRaise".to_string(),
+      AXError::CannotComplete.0,
+    );
+    assert!(delivered(Err(stall)).is_ok());
+    assert!(delivered(Ok(())).is_ok());
+  }
+
+  #[test]
+  fn delivered_keeps_every_other_error() {
+    let refused = crate::Error::Accessibility(
+      "AXRaise".to_string(),
+      AXError::InvalidUIElement.0,
+    );
+    assert!(matches!(
+      delivered(Err(refused)),
+      Err(crate::Error::Accessibility(_, code))
+        if code == AXError::InvalidUIElement.0
+    ));
+    assert!(matches!(
+      delivered(Err(crate::Error::WindowNotFound)),
+      Err(crate::Error::WindowNotFound)
+    ));
+  }
 
   #[test]
   fn keeps_a_target_that_already_fits() {

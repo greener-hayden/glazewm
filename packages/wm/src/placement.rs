@@ -302,6 +302,51 @@ fn reconcile_candidates(
     .collect()
 }
 
+/// What native focus waits on for one window.
+///
+/// Plain data, so which states let focus go ahead can be checked without a
+/// native window.
+#[derive(Clone, Copy, Debug)]
+struct FocusGate {
+  /// The window's source is still hidden or being restored.
+  has_source: bool,
+  phase: ReconcilePhase,
+  /// The request accepted last was a frame write.
+  frame_write_accepted: bool,
+  desired_state: NativeState,
+  /// The state the window was last seen in.
+  observed_state: Option<NativeState>,
+  /// The window is confirmed shown, with no visibility change pending.
+  shown: bool,
+}
+
+/// Whether native focus can go to the window now.
+///
+/// Focus waits for the window to be shown, then for its frame. A settled
+/// frame is enough, and so is a frame write the application has accepted:
+/// focus does not depend on where the window ends up, and waiting for the
+/// write to be seen applied delays it by the application's relayout. That
+/// holds only while the window is in the normal state and stays there. A
+/// restore, minimize or maximize in flight changes what focus acts on.
+fn focus_ready(gate: FocusGate) -> bool {
+  if gate.has_source
+    || !gate.shown
+    || gate.desired_state == NativeState::Minimized
+  {
+    return false;
+  }
+
+  match gate.phase {
+    ReconcilePhase::Converged | ReconcilePhase::Failed => true,
+    ReconcilePhase::Accepted => {
+      gate.frame_write_accepted
+        && gate.desired_state == NativeState::Normal
+        && gate.observed_state == Some(NativeState::Normal)
+    }
+    ReconcilePhase::Pending | ReconcilePhase::Suspended => false,
+  }
+}
+
 /// Chooses the windows a sync reconciles.
 ///
 /// Returns each chosen window's id, mapped to whether it is restacked.
@@ -1156,21 +1201,37 @@ pub fn platform_sync(
     } else if let Some(entry) = state.native_sync.windows.get(&id) {
       if entry.frame.desired.state == NativeState::Minimized {
         state.native_sync.focus = None;
-      } else if entry.source.is_none()
-        && entry.frame.settled()
-        && entry.frame.desired.state != NativeState::Minimized
-        && !entry.visibility_pending
-        && entry
-          .visibility
-          .as_ref()
-          .is_some_and(|(visible, _)| *visible)
-      {
+      } else if focus_ready(FocusGate {
+        has_source: entry.source.is_some(),
+        phase: entry.frame.phase,
+        frame_write_accepted: PlacementSession::FOCUS_ON_ACCEPTED_WRITE
+          && entry.frame.frame_write_accepted(),
+        desired_state: entry.frame.desired.state,
+        observed_state: entry.frame.observed_state(),
+        shown: !entry.visibility_pending
+          && entry
+            .visibility
+            .as_ref()
+            .is_some_and(|(visible, _)| *visible),
+      }) {
         let focus_span = PerfSpan::start("native_focus");
-        if let Err(err) = entry
-          .native
-          .window()
-          .and_then(wm_platform::NativeWindow::focus)
-        {
+        // A raise that is not waited for can land after a later focus
+        // change, so the window may end up above the one focused next.
+        // Tiling windows do not overlap one another, which bounds that to
+        // a floating or fullscreen window focused in that gap. Floating
+        // and fullscreen windows overlap others, so their raise is waited
+        // for.
+        let focused_tiling = matches!(
+          focused.as_window_container(),
+          Ok(WindowContainer::TilingWindow(_))
+        );
+        if let Err(err) = entry.native.window().and_then(|native| {
+          if focused_tiling {
+            native.focus_deferred_raise()
+          } else {
+            native.focus()
+          }
+        }) {
           tracing::warn!("Window focus failed: {err}");
         }
         focus_span.finish(SLOW_CALL, format_args!("window={id}"));
@@ -2828,6 +2889,126 @@ mod tests {
     assert!(coordinator.deadline(false).unwrap() <= Instant::now());
     assert!(coordinator.deadline(true).is_none());
     assert!(coordinator.deferred_moves.contains(&id));
+  }
+
+  /// A focus gate that is open, for the tables below to close one input
+  /// at a time.
+  fn open_gate() -> FocusGate {
+    FocusGate {
+      has_source: false,
+      phase: ReconcilePhase::Converged,
+      frame_write_accepted: false,
+      desired_state: NativeState::Normal,
+      observed_state: Some(NativeState::Normal),
+      shown: true,
+    }
+  }
+
+  /// A gate whose frame write has been accepted and not yet seen applied.
+  fn accepted_gate() -> FocusGate {
+    FocusGate {
+      phase: ReconcilePhase::Accepted,
+      frame_write_accepted: true,
+      ..open_gate()
+    }
+  }
+
+  /// Focus follows the frame: a settled one, or a frame write accepted for
+  /// a window that is normal and stays so.
+  #[test]
+  fn focus_ready_follows_the_frame() {
+    let phase = |phase| FocusGate {
+      phase,
+      ..open_gate()
+    };
+    let cases = [
+      ("converged", open_gate(), true),
+      ("failed", phase(ReconcilePhase::Failed), true),
+      ("pending", phase(ReconcilePhase::Pending), false),
+      ("suspended", phase(ReconcilePhase::Suspended), false),
+      ("accepted frame write", accepted_gate(), true),
+      (
+        "accepted state change",
+        FocusGate {
+          frame_write_accepted: false,
+          ..accepted_gate()
+        },
+        false,
+      ),
+      (
+        "accepted frame write, observed maximized",
+        FocusGate {
+          observed_state: Some(NativeState::Maximized),
+          ..accepted_gate()
+        },
+        false,
+      ),
+      (
+        "accepted frame write, observed minimized",
+        FocusGate {
+          observed_state: Some(NativeState::Minimized),
+          ..accepted_gate()
+        },
+        false,
+      ),
+      (
+        "accepted frame write, not observed",
+        FocusGate {
+          observed_state: None,
+          ..accepted_gate()
+        },
+        false,
+      ),
+      (
+        "accepted frame write, desired maximized",
+        FocusGate {
+          desired_state: NativeState::Maximized,
+          ..accepted_gate()
+        },
+        false,
+      ),
+    ];
+
+    for (name, gate, expected) in cases {
+      assert_eq!(focus_ready(gate), expected, "{name}");
+    }
+  }
+
+  /// A held source, a window not yet shown, or one meant to be minimized
+  /// blocks focus whatever its frame is doing.
+  #[test]
+  fn focus_ready_blocked_whatever_the_frame() {
+    for (frame, base) in
+      [("settled", open_gate()), ("accepted", accepted_gate())]
+    {
+      let blocked = [
+        (
+          "source held",
+          FocusGate {
+            has_source: true,
+            ..base
+          },
+        ),
+        (
+          "not shown",
+          FocusGate {
+            shown: false,
+            ..base
+          },
+        ),
+        (
+          "desired minimized",
+          FocusGate {
+            desired_state: NativeState::Minimized,
+            ..base
+          },
+        ),
+      ];
+
+      for (name, gate) in blocked {
+        assert!(!focus_ready(gate), "{name}, {frame} frame");
+      }
+    }
   }
 
   /// Focus on a window without a session waits instead of being recorded

@@ -629,6 +629,7 @@ mod macos {
 
     reads(dispatcher, &window)?;
     read_after_write(&window, helper.window_id)?;
+    raise_after_write(&window)?;
     passes(dispatcher, helper)
   }
 
@@ -826,6 +827,126 @@ mod macos {
     report("AXSize write, 2 ms timeout, with hop", &write);
     report("AXRole read right after the write", &after);
     report("window server read right after the write", &after_server);
+
+    Ok(())
+  }
+
+  /// Performs `AXRaise`, waiting at most `timeout_secs` for the
+  /// application when given, and for the global timeout otherwise.
+  ///
+  /// Returns the raw result, so a stall can be told from a refusal.
+  fn raise(el: &AXUIElement, timeout_secs: Option<f32>) -> AXError {
+    // SAFETY: `el` is a valid element and the timeout is client-side
+    // state for this element alone. `0` returns it to the global timeout.
+    unsafe {
+      if let Some(timeout_secs) = timeout_secs {
+        el.set_messaging_timeout(timeout_secs);
+      }
+      let result = el.perform_action(&CFString::from_str("AXRaise"));
+      if timeout_secs.is_some() {
+        el.set_messaging_timeout(0.0);
+      }
+      result
+    }
+  }
+
+  /// `AXRaise` straight after a resize, waited for and under the deferred
+  /// write timeout.
+  ///
+  /// This is the raise the window manager sends when it focuses a
+  /// window. The helper holds a resize for `SLOW_RELAYOUT`, so a raise
+  /// that waits for the application waits for that relayout; the
+  /// deferred one gives up after 2 ms with the request delivered.
+  fn raise_after_write(window: &BoundElement) -> BenchResult<()> {
+    let settle = SLOW_RELAYOUT + Duration::from_millis(50);
+    let rounds = 20;
+
+    let original = window
+      .with(|el| {
+        read(el, "AXSize").and_then(|value| {
+          let value = value.downcast::<AXValue>().ok()?;
+          let mut size = CGSize::ZERO;
+
+          // SAFETY: `size` is a live `CGSize` and the type matches.
+          unsafe {
+            value
+              .value(AXValueType::CGSize, NonNull::from(&mut size).cast())
+          }
+          .then_some(size)
+        })
+      })?
+      .ok_or("could not read the helper window's size")?;
+
+    let mut idle = Vec::new();
+    let mut waited = Vec::new();
+    let mut deferred = Vec::new();
+    let mut stalled = 0;
+    let mut refused = 0;
+
+    for round in 0..rounds * 2 {
+      std::thread::sleep(settle);
+
+      // Every round resizes: the size toggles each round, so the helper
+      // always has a relayout to run. The two raises take turns in pairs,
+      // so each follows both the grown and the original size.
+      let defer = (round / 2) % 2 == 1;
+      let grown = round % 2 == 0;
+      let (width, height) = if grown {
+        (original.width + 20.0, original.height + 20.0)
+      } else {
+        (original.width, original.height)
+      };
+
+      let start = Instant::now();
+      let _ = window.with(|el| raise(el, None))?;
+      idle.push(start.elapsed());
+
+      std::thread::sleep(settle);
+      let delivered =
+        window.with(|el| write_size_deferred(el, width, height))?;
+
+      if !delivered {
+        return Err("the helper window rejects size writes".into());
+      }
+
+      let start = Instant::now();
+      let result = window.with(|el| {
+        raise(el, defer.then_some(DEFERRED_WRITE_TIMEOUT_SECS))
+      })?;
+      let elapsed = start.elapsed();
+
+      if defer {
+        deferred.push(elapsed);
+        match result {
+          AXError::Success => {}
+          result if result.0 == AX_CANNOT_COMPLETE => stalled += 1,
+          _ => refused += 1,
+        }
+      } else {
+        waited.push(elapsed);
+        if result != AXError::Success {
+          refused += 1;
+        }
+      }
+    }
+
+    // Put the helper window back where it began.
+    std::thread::sleep(settle);
+    let _ = window.with(|el| {
+      write_size_deferred(el, original.width, original.height)
+    })?;
+
+    println!(
+      "  AXRaise right after a resize ({} ms relayout by construction):",
+      SLOW_RELAYOUT.as_millis()
+    );
+    report("AXRaise, helper idle", &idle);
+    report("AXRaise after the write, waited for", &waited);
+    report("AXRaise after the write, 2 ms timeout", &deferred);
+    println!(
+      "  2 ms raises that timed out: {stalled} of {}; refused: {refused}",
+      deferred.len()
+    );
 
     Ok(())
   }

@@ -137,6 +137,9 @@ pub struct FrameReconciler {
   pub phase: ReconcilePhase,
   attempts: u8,
   accepted_at: Option<Instant>,
+  /// Whether the request accepted last was a frame write, rather than a
+  /// state change. Meaningful only while `phase` is `Accepted`.
+  accepted_frame_write: bool,
   previous: Option<ObservedFrame>,
   stable_since: Option<Instant>,
   /// The last frame write, until the application is seen to apply it.
@@ -173,6 +176,7 @@ impl FrameReconciler {
       phase: ReconcilePhase::Pending,
       attempts: 0,
       accepted_at: None,
+      accepted_frame_write: false,
       previous: None,
       stable_since: None,
       unapplied: None,
@@ -194,6 +198,7 @@ impl FrameReconciler {
     self.phase = ReconcilePhase::Pending;
     self.attempts = 0;
     self.accepted_at = None;
+    self.accepted_frame_write = false;
     self.previous = None;
     self.stable_since = None;
   }
@@ -206,12 +211,17 @@ impl FrameReconciler {
     )
   }
 
-  /// Whether reconciliation reached a terminal outcome.
-  pub fn settled(&self) -> bool {
-    matches!(
-      self.phase,
-      ReconcilePhase::Converged | ReconcilePhase::Failed
-    )
+  /// Whether the request accepted last was a frame write.
+  ///
+  /// Only an `Accepted` frame has one outstanding; in any other phase
+  /// the write, if any, has been confirmed or replaced.
+  pub fn frame_write_accepted(&self) -> bool {
+    self.phase == ReconcilePhase::Accepted && self.accepted_frame_write
+  }
+
+  /// The state the window was last observed in, if it was observed.
+  pub fn observed_state(&self) -> Option<NativeState> {
+    self.previous.as_ref().map(|observed| observed.state)
   }
 
   /// Cancels pending mutations during user control.
@@ -263,6 +273,8 @@ impl FrameReconciler {
     }
     self.phase = ReconcilePhase::Accepted;
     self.accepted_at = Some(now);
+    self.accepted_frame_write =
+      matches!(request.mutation, NativeMutation::Frame(_));
     self.attempts = self.attempts.saturating_add(1);
     if let NativeMutation::Frame(rect) = &request.mutation {
       self.unapplied = Some(UnappliedWrite {
@@ -527,11 +539,11 @@ mod tests {
     sync.accepted(&request, now);
     assert!(sync.next(&observed, now).is_none());
     assert_eq!(sync.phase, ReconcilePhase::Accepted);
-    assert!(sync.in_flight() && !sync.settled());
+    assert!(sync.in_flight());
     observed.state = NativeState::Normal;
     assert!(sync.next(&observed, now).is_none());
     assert_eq!(sync.phase, ReconcilePhase::Converged);
-    assert!(sync.settled() && !sync.in_flight());
+    assert!(!sync.in_flight());
   }
 
   /// Rejects stale completion after retargeting.
@@ -770,6 +782,52 @@ mod tests {
     sync.observe(&applied, now + Duration::from_millis(20));
     assert_eq!(sync.phase, ReconcilePhase::Converged);
     assert_eq!(sync.deadline(), None);
+  }
+
+  /// Only a frame write that is accepted and not yet seen applied counts,
+  /// and a retarget forgets it.
+  #[test]
+  fn tracks_an_accepted_frame_write_until_it_is_confirmed() {
+    let (mut sync, observed) = fixture();
+    assert!(!sync.frame_write_accepted());
+    assert_eq!(sync.observed_state(), None);
+
+    let now = Instant::now();
+    advance(&mut sync);
+    let request = sync.next(&observed, now).expect("Frame write.");
+    assert!(!sync.frame_write_accepted());
+    sync.accepted(&request, now);
+    assert!(sync.frame_write_accepted());
+    assert_eq!(sync.observed_state(), Some(NativeState::Normal));
+
+    advance(&mut sync);
+    assert!(!sync.frame_write_accepted());
+
+    let request = sync
+      .next(&observed, now + RETRY_WAIT)
+      .expect("Frame write.");
+    sync.accepted(&request, now + RETRY_WAIT);
+    assert!(sync.frame_write_accepted());
+    let applied = ObservedFrame {
+      rect: sync.desired.rect.clone(),
+      ..observed
+    };
+    sync.observe(&applied, now + RETRY_WAIT);
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+    assert!(!sync.frame_write_accepted());
+  }
+
+  /// A state change in flight is not a frame write.
+  #[test]
+  fn a_restore_is_not_an_accepted_frame_write() {
+    let (mut sync, mut observed) = fixture();
+    observed.state = NativeState::Maximized;
+    let now = Instant::now();
+    let request = sync.next(&observed, now).expect("Restore request.");
+    sync.accepted(&request, now);
+    assert_eq!(sync.phase, ReconcilePhase::Accepted);
+    assert!(!sync.frame_write_accepted());
+    assert_eq!(sync.observed_state(), Some(NativeState::Maximized));
   }
 
   /// Position refusals cannot manufacture a size constraint.

@@ -81,7 +81,12 @@ pub fn handle_window_focused(
       // churn. Defer the follow so churn can cancel it; genuine
       // force-shows survive the debounce.
       if config.value.general.hide_method == HideMethod::PlaceInCorner {
-        info!("Deferring off-screen follow: {window}");
+        info!(
+          "Deferring off-screen follow: id={} display_state={:?} wm_focused={}: {window}",
+          window.id(),
+          window.display_state(),
+          focused_container.id(),
+        );
 
         state.defer_follow(window.id());
 

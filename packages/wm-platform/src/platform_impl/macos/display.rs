@@ -447,11 +447,22 @@ pub(crate) fn primary_display(
 
 /// Bounds of the display showing most of `rect`.
 ///
-/// Falls back to the display nearest the rect's centre.
+/// `owning_display` is the bounds of the display the caller already knows
+/// `rect` is placed on. It is returned as is when it wholly contains
+/// `rect`, which skips walking every screen. A rect that reaches past it
+/// takes the display with the largest overlap, falling back to the display
+/// nearest the rect's centre, so the result matches a walk without a hint.
 pub(crate) fn display_bounds_for_rect(
   rect: &Rect,
+  owning_display: Option<&Rect>,
   dispatcher: &Dispatcher,
 ) -> crate::Result<Rect> {
+  if let Some(display) = owning_display {
+    if display.contains_rect(rect) {
+      return Ok(display.clone());
+    }
+  }
+
   let bounds = all_displays(dispatcher)?
     .iter()
     .map(crate::Display::bounds)
@@ -531,4 +542,88 @@ pub(crate) fn nearest_display(
       .or_else(|| primary_display(dispatcher).ok())
       .ok_or(crate::Error::DisplayNotFound)
   })?
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{EventLoop, NativeCallStats};
+
+  /// Runs `body` on a worker thread against a live event loop, the way
+  /// the window manager calls into the platform.
+  fn with_event_loop<T: Send + 'static>(
+    body: impl FnOnce(&Dispatcher) -> T + Send + 'static,
+  ) -> T {
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+
+    let thread = std::thread::spawn(move || {
+      let result = body(&dispatcher);
+      dispatcher.stop_event_loop().unwrap();
+      result
+    });
+
+    event_loop.run().unwrap();
+    thread.join().unwrap()
+  }
+
+  #[test]
+  fn owning_display_skips_the_screen_walk() {
+    let (bounds, spent) = with_event_loop(|dispatcher| {
+      let owning = Rect::from_xy(100, 100, 1920, 1080);
+      let target = Rect::from_xy(200, 200, 800, 600);
+
+      let before = NativeCallStats::snapshot();
+      let bounds =
+        display_bounds_for_rect(&target, Some(&owning), dispatcher);
+      (bounds, NativeCallStats::snapshot().since(&before))
+    });
+
+    assert_eq!(bounds.unwrap(), Rect::from_xy(100, 100, 1920, 1080));
+    // Counters are process-wide: run with `--test-threads=1`.
+    assert_eq!(spent.screen_enumerations, 0);
+    assert_eq!(spent.hops, 0);
+  }
+
+  #[test]
+  fn straddling_target_falls_back_to_the_screen_walk() {
+    let spent = with_event_loop(|dispatcher| {
+      // Overlaps the target without containing it.
+      let owning = Rect::from_xy(500, 200, 1920, 1080);
+      let target = Rect::from_xy(200, 200, 800, 600);
+
+      let before = NativeCallStats::snapshot();
+      let _ = display_bounds_for_rect(&target, Some(&owning), dispatcher);
+      NativeCallStats::snapshot().since(&before)
+    });
+
+    assert_eq!(spent.screen_enumerations, 1);
+  }
+
+  #[test]
+  fn unrelated_owning_display_falls_back_to_the_screen_walk() {
+    let spent = with_event_loop(|dispatcher| {
+      // Far from any real display.
+      let owning = Rect::from_xy(-90_000, -90_000, 100, 100);
+      let target = Rect::from_xy(200, 200, 800, 600);
+
+      let before = NativeCallStats::snapshot();
+      let _ = display_bounds_for_rect(&target, Some(&owning), dispatcher);
+      NativeCallStats::snapshot().since(&before)
+    });
+
+    assert_eq!(spent.screen_enumerations, 1);
+  }
+
+  #[test]
+  fn no_owning_display_walks_the_screens_once() {
+    let spent = with_event_loop(|dispatcher| {
+      let target = Rect::from_xy(200, 200, 800, 600);
+
+      let before = NativeCallStats::snapshot();
+      let _ = display_bounds_for_rect(&target, None, dispatcher);
+      NativeCallStats::snapshot().since(&before)
+    });
+
+    assert_eq!(spent.screen_enumerations, 1);
+  }
 }

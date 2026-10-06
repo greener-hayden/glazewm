@@ -653,6 +653,19 @@ impl PlacementSession {
     self.window()?.set_frame(rect)
   }
 
+  /// Requests a native frame, given the bounds of the display it is
+  /// placed on.
+  ///
+  /// Behaves like [`PlacementSession::set_frame`], but spares macOS from
+  /// enumerating screens to find the display. Windows ignores `display`.
+  pub fn set_frame_on_display(
+    &self,
+    rect: &Rect,
+    display: &Rect,
+  ) -> crate::Result<()> {
+    self.window()?.set_frame_on_display(rect, display)
+  }
+
   /// Changes an accessibility boolean on the owning application thread.
   #[cfg(target_os = "macos")]
   fn set_boolean(

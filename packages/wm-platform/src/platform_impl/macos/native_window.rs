@@ -289,7 +289,31 @@ impl NativeWindow {
   ///   refused is corrected by the caller's next request, once the window
   ///   is fully on one display.
   pub(crate) fn set_frame(&self, rect: &Rect) -> crate::Result<()> {
+    self.write_frame(rect, None)
+  }
+
+  /// Implements [`NativeWindow::set_frame_on_display`].
+  pub(crate) fn set_frame_on_display(
+    &self,
+    rect: &Rect,
+    display: &Rect,
+  ) -> crate::Result<()> {
+    self.write_frame(rect, Some(display))
+  }
+
+  /// Writes `rect`, staging the window onto a display first if needed.
+  ///
+  /// `display` is the bounds of the display `rect` belongs to. It is used
+  /// when it wholly contains `rect`; otherwise (or when `None`) the
+  /// display is looked up by walking every screen. A bare move needs no
+  /// display.
+  fn write_frame(
+    &self,
+    rect: &Rect,
+    display: Option<&Rect>,
+  ) -> crate::Result<()> {
     let rect = rect.clone();
+    let display = display.cloned();
     let dispatcher = self.application.dispatcher.clone();
 
     self.with_enhanced_ui_disabled(move |el| -> crate::Result<()> {
@@ -306,8 +330,11 @@ impl NativeWindow {
         });
       }
 
-      let display =
-        platform_impl::display_bounds_for_rect(&rect, &dispatcher)?;
+      let display = platform_impl::display_bounds_for_rect(
+        &rect,
+        display.as_ref(),
+        &dispatcher,
+      )?;
 
       // The application applies these in order, so the size lands while
       // the window is staged and the move follows it.

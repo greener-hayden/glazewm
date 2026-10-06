@@ -1376,10 +1376,13 @@ fn reconcile_frame(
 ) -> anyhow::Result<ObservedFrame> {
   let observed = observe(&entry.native)?;
   if let Some(request) = entry.frame.next(&observed, now) {
+    // The display the request belongs to, so macOS need not enumerate
+    // screens to find it.
+    let monitor = entry.frame.desired.monitor.clone();
     entry.frame.apply(&request, now, |mutation| {
       match mutation {
         NativeMutation::Frame(rect) => {
-          entry.native.set_frame(rect)?;
+          entry.native.set_frame_on_display(rect, &monitor)?;
           placed(rect);
         }
         NativeMutation::Restore(rect) => entry.native.restore(rect)?,

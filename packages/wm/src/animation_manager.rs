@@ -1439,7 +1439,8 @@ impl AnimationManager {
     // past the window and onto the neighbouring display — where the
     // outgoing workspace is seen sliding across a monitor it was never
     // on. A switch belongs to one display; only a window genuinely moving
-    // between them should be drawn across both.
+    // between them should be drawn across both. The crop is the owning
+    // monitor's bounds, which spares a display lookup per window.
     let outer_rect = {
       let outer_rect = animation.path_bounds();
       // Companions such as border rings extend past the window's frame,
@@ -1449,21 +1450,24 @@ impl AnimationManager {
       let outer_rect = outer_rect.inset(-COMPANION_MARGIN_PX);
 
       #[cfg(target_os = "macos")]
-      if self.displays_have_separate_spaces || plan.trigger.is_slide() {
-        let display_bounds =
-          dispatcher.nearest_display(&window.native())?.bounds()?;
-
-        outer_rect.crop(&display_bounds)
-      } else {
-        outer_rect
-      }
-
+      let separate_spaces = self.displays_have_separate_spaces;
       #[cfg(not(target_os = "macos"))]
-      if plan.trigger.is_slide() {
-        outer_rect.crop(&monitor_properties.bounds)
-      } else {
-        outer_rect
-      }
+      let separate_spaces = false;
+
+      crop_to_animation_area(
+        &outer_rect,
+        plan.trigger.is_slide(),
+        &monitor_properties.bounds,
+        || {
+          separate_spaces
+            .then(|| {
+              anyhow::Ok(
+                dispatcher.nearest_display(&window.native())?.bounds()?,
+              )
+            })
+            .transpose()
+        },
+      )?
     };
 
     let capture = self.pending_captures.remove(&window.id());
@@ -1712,9 +1716,85 @@ impl AnimationManager {
   }
 }
 
+/// Crops `outer_rect` to the area an animation may be drawn on.
+///
+/// A slide is cropped to its owning monitor's bounds, so it never needs
+/// the window's own display. Any other animation is cropped to
+/// `window_display` when it yields bounds, and left whole when it yields
+/// `None`.
+fn crop_to_animation_area(
+  outer_rect: &Rect,
+  is_slide: bool,
+  monitor_bounds: &Rect,
+  window_display: impl FnOnce() -> anyhow::Result<Option<Rect>>,
+) -> anyhow::Result<Rect> {
+  if is_slide {
+    return Ok(outer_rect.crop(monitor_bounds));
+  }
+
+  Ok(match window_display()? {
+    Some(display_bounds) => outer_rect.crop(&display_bounds),
+    None => outer_rect.clone(),
+  })
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn slide_crops_to_the_monitor_without_a_display_lookup() {
+    let outer = Rect::from_xy(-500, 100, 3000, 400);
+    let monitor = Rect::from_xy(0, 0, 1920, 1080);
+    let mut lookups = 0;
+
+    // A switch of 8 windows asks for no per-window display.
+    for _ in 0..8 {
+      let cropped = crop_to_animation_area(&outer, true, &monitor, || {
+        lookups += 1;
+        Ok(Some(Rect::from_xy(0, 0, 10, 10)))
+      })
+      .expect("Crop should succeed.");
+
+      assert_eq!(cropped, Rect::from_xy(0, 100, 1920, 400));
+    }
+
+    assert_eq!(lookups, 0);
+  }
+
+  #[test]
+  fn non_slide_crops_to_the_windows_display_when_it_has_one() {
+    let outer = Rect::from_xy(-500, 100, 3000, 400);
+    let monitor = Rect::from_xy(0, 0, 1920, 1080);
+    let mut lookups = 0;
+
+    let cropped = crop_to_animation_area(&outer, false, &monitor, || {
+      lookups += 1;
+      Ok(Some(Rect::from_xy(100, 0, 800, 1080)))
+    })
+    .expect("Crop should succeed.");
+
+    assert_eq!(cropped, Rect::from_xy(100, 100, 800, 400));
+    assert_eq!(lookups, 1);
+
+    let whole =
+      crop_to_animation_area(&outer, false, &monitor, || Ok(None))
+        .expect("Crop should succeed.");
+
+    assert_eq!(whole, outer);
+  }
+
+  #[test]
+  fn non_slide_propagates_a_failed_display_lookup() {
+    let outer = Rect::from_xy(0, 0, 100, 100);
+    let monitor = Rect::from_xy(0, 0, 1920, 1080);
+
+    let result = crop_to_animation_area(&outer, false, &monitor, || {
+      anyhow::bail!("No display.")
+    });
+
+    assert!(result.is_err());
+  }
 
   #[test]
   fn trigger_selection_is_shared_and_ordered() {

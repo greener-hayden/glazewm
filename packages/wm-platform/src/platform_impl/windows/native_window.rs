@@ -216,6 +216,15 @@ impl NativeWindow {
     Ok(())
   }
 
+  /// Implements [`NativeWindow::set_frame_on_display`].
+  pub(crate) fn set_frame_on_display(
+    &self,
+    rect: &Rect,
+    _display: &Rect,
+  ) -> crate::Result<()> {
+    self.set_frame(rect)
+  }
+
   /// Implements [`NativeWindow::resize`].
   pub(crate) fn resize(
     &self,

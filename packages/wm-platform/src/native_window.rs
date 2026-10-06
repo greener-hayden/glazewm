@@ -562,6 +562,27 @@ impl NativeWindow {
     self.inner.set_frame(rect)
   }
 
+  /// Repositions and resizes the window to the specified rectangle, given
+  /// the bounds of the display `rect` is placed on.
+  ///
+  /// Behaves like [`NativeWindow::set_frame`], but spares the platform
+  /// from looking the display up itself.
+  ///
+  /// # Platform-specific
+  ///
+  /// - **macOS**: Uses `display` to stage the window onto the target's
+  ///   display when it wholly contains `rect`. Otherwise the display is
+  ///   looked up by walking every screen, as in
+  ///   [`NativeWindow::set_frame`].
+  /// - **Windows**: Ignores `display`.
+  pub fn set_frame_on_display(
+    &self,
+    rect: &Rect,
+    display: &Rect,
+  ) -> crate::Result<()> {
+    self.inner.set_frame_on_display(rect, display)
+  }
+
   /// Resizes the window to the specified size.
   pub fn resize(&self, width: i32, height: i32) -> crate::Result<()> {
     self.inner.resize(width, height)

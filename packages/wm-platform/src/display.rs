@@ -79,6 +79,27 @@ impl DisplayExtWindows for Display {
   }
 }
 
+/// Geometry and scaling of a display, read together.
+///
+/// Returned by [`Display::properties`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayProperties {
+  /// The display name.
+  pub name: String,
+
+  /// The full bounds rectangle of the display.
+  pub bounds: Rect,
+
+  /// The working area rectangle (excluding system UI).
+  pub working_area: Rect,
+
+  /// The scale factor of the display.
+  pub scale_factor: f32,
+
+  /// The DPI of the display.
+  pub dpi: u32,
+}
+
 /// Represents a logical display space where windows can be placed.
 ///
 /// # Platform-specific
@@ -101,6 +122,22 @@ impl Display {
   /// Gets the display name.
   pub fn name(&self) -> crate::Result<String> {
     self.inner.name()
+  }
+
+  /// Gets the name, bounds, working area, scale factor and DPI of the
+  /// display in one read.
+  ///
+  /// Prefer this over reading the same values one by one, which can cost
+  /// a round trip each.
+  ///
+  /// # Platform-specific
+  ///
+  /// - **macOS**: A single hop to the main thread, where the individual
+  ///   getters hop once each.
+  /// - **Windows**: A single `GetMonitorInfoW` call, where the individual
+  ///   getters call it once each.
+  pub fn properties(&self) -> crate::Result<DisplayProperties> {
+    self.inner.properties()
   }
 
   /// Gets the full bounds rectangle of the display.

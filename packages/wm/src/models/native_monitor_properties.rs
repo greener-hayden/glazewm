@@ -24,6 +24,9 @@ impl NativeMonitorProperties {
   pub fn try_from(native_display: &Display) -> anyhow::Result<Self> {
     let display_device = native_display.main_device()?;
 
+    // Read in one go, which on macOS is a single hop to the main thread.
+    let properties = native_display.properties()?;
+
     Ok(Self {
       #[cfg(target_os = "macos")]
       device_uuid: display_device.id().0,
@@ -38,11 +41,11 @@ impl NativeMonitorProperties {
         .refresh_rate()
         .ok()
         .map(|rate| rate as u32),
-      device_name: native_display.name()?,
-      working_area: native_display.working_area()?,
-      bounds: native_display.bounds()?,
-      dpi: native_display.dpi()?,
-      scale_factor: native_display.scale_factor()?,
+      device_name: properties.name,
+      working_area: properties.working_area,
+      bounds: properties.bounds,
+      dpi: properties.dpi,
+      scale_factor: properties.scale_factor,
     })
   }
 }

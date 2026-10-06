@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{mem::ManuallyDrop, ops::Deref, sync::Arc};
 
 use objc2::{rc::Retained, MainThreadMarker};
 use objc2_app_kit::NSScreen;
-use objc2_core_foundation::{CFRetained, CFUUID};
+use objc2_core_foundation::{CFRetained, CGRect, CFUUID};
 use objc2_core_graphics::{
   CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode,
   CGDisplayMirrorsDisplay, CGDisplayMode, CGDisplayRotation, CGError,
@@ -12,18 +12,84 @@ use objc2_foundation::{ns_string, NSNumber};
 
 use crate::{
   platform_impl::ffi, ConnectionState, Dispatcher, DisplayDeviceId,
-  DisplayId, MirroringState, NativeCall, NativeCallStats, Point, Rect,
-  ThreadBound,
+  DisplayId, DisplayProperties, MirroringState, NativeCall,
+  NativeCallStats, Point, Rect, ThreadBound,
 };
+
+/// An `NSScreen` that releases without making the dropping thread wait.
+///
+/// A bare `ThreadBound` hops to the main thread synchronously when it is
+/// dropped, which the window manager thread would pay for every display
+/// it drops. This hands the release to the main thread and moves on.
+#[derive(Debug)]
+struct ScreenHandle(ManuallyDrop<ThreadBound<Retained<NSScreen>>>);
+
+impl ScreenHandle {
+  /// Takes ownership of a screen bound to the main thread.
+  fn new(screen: ThreadBound<Retained<NSScreen>>) -> Self {
+    Self(ManuallyDrop::new(screen))
+  }
+}
+
+impl Deref for ScreenHandle {
+  type Target = ThreadBound<Retained<NSScreen>>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+impl Drop for ScreenHandle {
+  fn drop(&mut self) {
+    // SAFETY: `self.0` is never used again after this point.
+    let screen = unsafe { ManuallyDrop::take(&mut self.0) };
+    screen.drop_async();
+  }
+}
+
+/// Converts a Core Graphics rectangle into a `Rect`, truncating to whole
+/// pixels.
+#[allow(clippy::cast_possible_truncation)]
+fn rect_from_cg(rect: CGRect) -> Rect {
+  Rect::from_xy(
+    rect.origin.x as i32,
+    rect.origin.y as i32,
+    rect.size.width as i32,
+    rect.size.height as i32,
+  )
+}
+
+/// Gets the working area of a screen in the same coordinate space as
+/// `CGDisplayBounds`.
+fn screen_working_area(screen: &NSScreen) -> Rect {
+  let primary_display_bounds =
+    rect_from_cg(CGDisplayBounds(CGMainDisplayID()));
+
+  // Convert `NSScreen::visibleFrame` into the same coordinate space as
+  // `CGDisplayBounds`.
+  Rect::from(screen.visibleFrame()).flip_y(primary_display_bounds.height())
+}
+
+/// Gets the scale factor of a screen.
+#[allow(clippy::cast_possible_truncation)]
+fn screen_scale_factor(screen: &NSScreen) -> f32 {
+  screen.backingScaleFactor() as f32
+}
+
+/// Gets the DPI that corresponds to a scale factor.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn dpi_from_scale_factor(scale_factor: f32) -> u32 {
+  (72.0 * scale_factor) as u32
+}
 
 /// Platform-specific implementation of [`Display`].
 #[derive(Clone, Debug)]
 pub(crate) struct Display {
   cg_display_id: CGDirectDisplayID,
   #[cfg(not(feature = "test_utils"))]
-  ns_screen: Arc<ThreadBound<Retained<NSScreen>>>,
+  ns_screen: Arc<ScreenHandle>,
   #[cfg(feature = "test_utils")]
-  ns_screen: Option<Arc<ThreadBound<Retained<NSScreen>>>>,
+  ns_screen: Option<Arc<ScreenHandle>>,
 }
 
 impl Display {
@@ -43,7 +109,7 @@ impl Display {
       })?
       .ok_or(crate::Error::DisplayNotFound)?;
 
-    let ns_screen = Arc::new(ns_screen);
+    let ns_screen = Arc::new(ScreenHandle::new(ns_screen));
     #[cfg(feature = "test_utils")]
     let ns_screen = Some(ns_screen);
     Ok(Self {
@@ -76,6 +142,7 @@ impl Display {
       self
         .ns_screen
         .as_deref()
+        .map(Deref::deref)
         .ok_or(crate::Error::DisplayNotFound)
     }
   }
@@ -93,59 +160,43 @@ impl Display {
     })?
   }
 
+  /// Implements [`Display::properties`].
+  pub(crate) fn properties(&self) -> crate::Result<DisplayProperties> {
+    let bounds = self.bounds()?;
+
+    // Everything that needs the screen is read in one hop.
+    self.screen()?.with(|screen| {
+      let scale_factor = screen_scale_factor(screen);
+
+      DisplayProperties {
+        name: screen.localizedName().to_string(),
+        bounds,
+        working_area: screen_working_area(screen),
+        scale_factor,
+        dpi: dpi_from_scale_factor(scale_factor),
+      }
+    })
+  }
+
   /// Implements [`Display::bounds`].
   #[allow(clippy::unnecessary_wraps)]
   pub(crate) fn bounds(&self) -> crate::Result<Rect> {
-    let cg_rect = CGDisplayBounds(self.cg_display_id);
-
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(Rect::from_xy(
-      cg_rect.origin.x as i32,
-      cg_rect.origin.y as i32,
-      cg_rect.size.width as i32,
-      cg_rect.size.height as i32,
-    ))
+    Ok(rect_from_cg(CGDisplayBounds(self.cg_display_id)))
   }
 
   /// Implements [`Display::working_area`].
   pub(crate) fn working_area(&self) -> crate::Result<Rect> {
-    let screen = self.screen()?;
-    let primary_display_bounds = {
-      let bounds = CGDisplayBounds(CGMainDisplayID());
-
-      #[allow(clippy::cast_possible_truncation)]
-      Rect::from_xy(
-        bounds.origin.x as i32,
-        bounds.origin.y as i32,
-        bounds.size.width as i32,
-        bounds.size.height as i32,
-      )
-    };
-
-    screen.with(|screen| {
-      // Convert `NSScreen::visibleFrame` into the same coordinate space as
-      // `CGDisplayBounds`.
-      Ok(
-        Rect::from(screen.visibleFrame())
-          .flip_y(primary_display_bounds.height()),
-      )
-    })?
+    self.screen()?.with(|screen| screen_working_area(screen))
   }
 
   /// Implements [`Display::scale_factor`].
   pub(crate) fn scale_factor(&self) -> crate::Result<f32> {
-    #[allow(clippy::cast_possible_truncation)]
-    self
-      .screen()?
-      .with(|screen| screen.backingScaleFactor() as f32)
+    self.screen()?.with(|screen| screen_scale_factor(screen))
   }
 
   /// Implements [`Display::dpi`].
   pub(crate) fn dpi(&self) -> crate::Result<u32> {
-    let scale_factor = self.scale_factor()?;
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok((72.0 * scale_factor) as u32)
+    Ok(dpi_from_scale_factor(self.scale_factor()?))
   }
 
   /// Implements [`Display::is_primary`].
@@ -625,5 +676,51 @@ mod tests {
     });
 
     assert_eq!(spent.screen_enumerations, 1);
+  }
+
+  #[test]
+  fn properties_match_the_individual_getters_in_one_hop() {
+    let (properties, expected, spent) = with_event_loop(|dispatcher| {
+      let display = dispatcher.displays().unwrap().remove(0);
+
+      let before = NativeCallStats::snapshot();
+      let properties = display.properties().unwrap();
+      let spent = NativeCallStats::snapshot().since(&before);
+
+      let expected = DisplayProperties {
+        name: display.name().unwrap(),
+        bounds: display.bounds().unwrap(),
+        working_area: display.working_area().unwrap(),
+        scale_factor: display.scale_factor().unwrap(),
+        dpi: display.dpi().unwrap(),
+      };
+
+      (properties, expected, spent)
+    });
+
+    assert_eq!(properties, expected);
+    // Counters are process-wide: run with `--test-threads=1`.
+    assert_eq!(spent.hops, 1);
+  }
+
+  #[test]
+  fn topology_read_takes_one_hop_per_display() {
+    let (displays, spent) = with_event_loop(|dispatcher| {
+      let before = NativeCallStats::snapshot();
+
+      // What a topology change does: list, read and drop every display.
+      let displays = dispatcher.sorted_displays().unwrap();
+      let count = displays.len();
+      for display in &displays {
+        display.properties().unwrap();
+      }
+      drop(displays);
+
+      (count, NativeCallStats::snapshot().since(&before))
+    });
+
+    // One hop to list the displays, one more to read each of them, and
+    // none to drop them.
+    assert_eq!(spent.hops, 1 + displays as u64);
   }
 }

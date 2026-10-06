@@ -18,8 +18,8 @@ use windows::{
 
 use crate::{
   display::{
-    ConnectionState, DisplayDeviceId, DisplayId, MirroringState,
-    OutputTechnology,
+    ConnectionState, DisplayDeviceId, DisplayId, DisplayProperties,
+    MirroringState, OutputTechnology,
   },
   Dispatcher, NativeWindow, Point, Rect,
 };
@@ -49,6 +49,35 @@ impl Display {
         .trim_end_matches('\0')
         .to_string(),
     )
+  }
+
+  /// Implements [`Display::properties`].
+  pub(crate) fn properties(&self) -> crate::Result<DisplayProperties> {
+    let monitor_info = self.monitor_info_ex()?;
+    let bounds = monitor_info.monitorInfo.rcMonitor;
+    let working_area = monitor_info.monitorInfo.rcWork;
+    let dpi = self.dpi()?;
+
+    Ok(DisplayProperties {
+      name: String::from_utf16_lossy(&monitor_info.szDevice)
+        .trim_end_matches('\0')
+        .to_string(),
+      bounds: Rect::from_ltrb(
+        bounds.left,
+        bounds.top,
+        bounds.right,
+        bounds.bottom,
+      ),
+      working_area: Rect::from_ltrb(
+        working_area.left,
+        working_area.top,
+        working_area.right,
+        working_area.bottom,
+      ),
+      #[allow(clippy::cast_precision_loss)]
+      scale_factor: dpi as f32 / 96.0,
+      dpi,
+    })
   }
 
   /// Implements [`Display::bounds`].

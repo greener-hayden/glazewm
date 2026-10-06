@@ -149,6 +149,61 @@ impl<T> ThreadBound<T> {
     }
   }
 
+  /// Consumes the wrapper and drops the inner value on the event loop
+  /// thread, without waiting for it to get there.
+  ///
+  /// Dropping the wrapper blocks until the event loop thread has dropped
+  /// the value. Use this where the caller is not a thread that can afford
+  /// that hop, and nothing needs the value to be gone by the time it
+  /// returns. The drop runs inline on the event loop thread.
+  ///
+  /// Like dropping the wrapper, the value is leaked rather than dropped on
+  /// the wrong thread if the event loop has stopped or stops before it
+  /// reaches the queued drop.
+  pub fn drop_async(self)
+  where
+    T: 'static,
+  {
+    /// Carries a value to the event loop thread to be dropped there.
+    ///
+    /// The value stays in a `ManuallyDrop`, so a closure that is dropped
+    /// without running leaks it instead of dropping it on whichever
+    /// thread dropped the closure.
+    struct Deferred<T>(ManuallyDrop<T>);
+
+    // SAFETY: The value is only ever dropped by the closure below, which
+    // runs on the event loop thread the value is bound to.
+    unsafe impl<T> Send for Deferred<T> {}
+
+    // Prevent `Drop` from running, which would hop synchronously.
+    let mut this = ManuallyDrop::new(self);
+
+    // SAFETY: `self` is wrapped in `ManuallyDrop`, so neither field is
+    // used or dropped again after being moved out here.
+    let (value, dispatcher) = unsafe {
+      (
+        ManuallyDrop::take(&mut this.value),
+        std::ptr::read(&raw const this.dispatcher),
+      )
+    };
+
+    if !mem::needs_drop::<T>() {
+      return;
+    }
+
+    let deferred = Deferred(ManuallyDrop::new(value));
+
+    let _ = dispatcher.dispatch_async(move || {
+      // Taking the whole struct keeps the closure capturing `Deferred`
+      // (which is `Send`) rather than its non-`Send` field.
+      let mut deferred = deferred;
+
+      // SAFETY: Runs on the event loop thread the value was created on
+      // (guaranteed by `new`), and the value is never used again.
+      unsafe { ManuallyDrop::drop(&mut deferred.0) };
+    });
+  }
+
   /// Execute a closure with `&T` on the event loop thread.
   ///
   /// Runs synchronously and returns the closure's result.
@@ -220,5 +275,117 @@ impl<T> Drop for ThreadBound<T> {
         ManuallyDrop::drop(&mut *(value_ptr as *mut ManuallyDrop<T>));
       });
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::{Arc, Mutex};
+
+  use super::*;
+  use crate::{EventLoop, NativeCallStats};
+
+  /// Records the thread it is dropped on.
+  struct DropProbe(Arc<Mutex<Option<ThreadId>>>);
+
+  impl Drop for DropProbe {
+    fn drop(&mut self) {
+      *self.0.lock().unwrap() = Some(std::thread::current().id());
+    }
+  }
+
+  /// Binds a probe to the event loop thread from a worker thread.
+  fn bound_probe(
+    dispatcher: &Dispatcher,
+    dropped_on: &Arc<Mutex<Option<ThreadId>>>,
+  ) -> ThreadBound<DropProbe> {
+    let probe = DropProbe(dropped_on.clone());
+
+    dispatcher
+      .dispatch_sync(|| ThreadBound::new(probe, dispatcher.clone()))
+      .unwrap()
+  }
+
+  #[test]
+  fn drop_async_drops_on_the_event_loop_thread_without_a_hop() {
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+    let dropped_on = Arc::new(Mutex::new(None));
+
+    let worker_dropped_on = dropped_on.clone();
+    let worker = std::thread::spawn(move || {
+      let bound = bound_probe(&dispatcher, &worker_dropped_on);
+
+      let before = NativeCallStats::snapshot();
+      bound.drop_async();
+      let spent = NativeCallStats::snapshot().since(&before);
+
+      // Queued after the drop, so it only returns once the drop has run.
+      dispatcher.dispatch_sync(|| {}).unwrap();
+      let event_loop_thread = dispatcher.thread_id();
+
+      dispatcher.stop_event_loop().unwrap();
+      (spent.hops, event_loop_thread)
+    });
+
+    event_loop.run().unwrap();
+    let (hops, event_loop_thread) = worker.join().unwrap();
+
+    // Counters are process-wide and other tests may hop meanwhile, so the
+    // exact count only holds where the tests run one at a time (macOS).
+    #[cfg(target_os = "macos")]
+    assert_eq!(hops, 0);
+    #[cfg(not(target_os = "macos"))]
+    let _ = hops;
+    assert_eq!(*dropped_on.lock().unwrap(), Some(event_loop_thread));
+  }
+
+  #[test]
+  fn drop_async_leaks_instead_of_dropping_after_the_loop_stopped() {
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+    let dropped_on = Arc::new(Mutex::new(None));
+
+    let worker_dropped_on = dropped_on.clone();
+    let worker = std::thread::spawn(move || {
+      let bound = bound_probe(&dispatcher, &worker_dropped_on);
+
+      dispatcher.stop_event_loop().unwrap();
+      bound.drop_async();
+    });
+
+    event_loop.run().unwrap();
+    worker.join().unwrap();
+
+    // Dropping on the worker thread instead would be unsound.
+    assert_eq!(*dropped_on.lock().unwrap(), None);
+  }
+
+  #[test]
+  fn drop_waits_for_the_event_loop_thread_to_drop() {
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+    let dropped_on = Arc::new(Mutex::new(None));
+
+    let worker_dropped_on = dropped_on.clone();
+    let worker = std::thread::spawn(move || {
+      let bound = bound_probe(&dispatcher, &worker_dropped_on);
+
+      let before = NativeCallStats::snapshot();
+      drop(bound);
+      let spent = NativeCallStats::snapshot().since(&before);
+
+      // Already dropped by the time `drop` returned.
+      let dropped = worker_dropped_on.lock().unwrap().is_some();
+      dispatcher.stop_event_loop().unwrap();
+      (dropped, spent.hops)
+    });
+
+    event_loop.run().unwrap();
+    let (dropped, hops) = worker.join().unwrap();
+
+    assert!(dropped);
+    // Other tests may hop meanwhile, so only a lower bound holds, except
+    // where the tests run one at a time (macOS).
+    assert!(hops >= 1);
+    #[cfg(target_os = "macos")]
+    assert_eq!(hops, 1);
   }
 }

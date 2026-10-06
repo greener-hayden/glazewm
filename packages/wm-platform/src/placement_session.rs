@@ -72,6 +72,18 @@ pub struct PlacementSession {
 }
 
 impl PlacementSession {
+  /// Whether the platform stacks windows natively.
+  ///
+  /// When `false`, [`Self::set_z_order`] does nothing and
+  /// [`Self::has_z_order`] is always satisfied, so restacking a
+  /// workspace has no effect to reconcile.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: `true`.
+  /// - macOS: `false`; the platform exposes no z-order.
+  pub const HAS_NATIVE_Z_ORDER: bool = cfg!(target_os = "windows");
+
   /// Whether the event listener already concealed this source.
   #[must_use]
   pub fn opening_concealed(&self) -> bool {

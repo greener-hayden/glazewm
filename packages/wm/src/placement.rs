@@ -225,6 +225,119 @@ fn focus_effects_stale(
   })
 }
 
+/// What one window contributes to choosing the windows a sync touches.
+#[derive(Clone, Copy, Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct ReconcileCandidate {
+  id: Uuid,
+  workspace: Uuid,
+  /// Released windows wait for native recovery and are never reconciled.
+  retired: bool,
+  /// The layout changed this window's geometry or state.
+  redraw: bool,
+  /// A transaction, presentation or visibility change is still settling.
+  pending: bool,
+  /// A native event or command marked the window for another pass.
+  dirty: bool,
+  /// An animation starts or continues this window's motion.
+  planned: bool,
+  /// Native focus is still waiting to be applied to this window.
+  ///
+  /// Applying it needs a settled frame, so the window has to be
+  /// reconciled even when nothing else asks for it. A frame suspended by
+  /// a finished drag, for one, only restarts in a pass.
+  focus_pending: bool,
+  /// The applied effects differ from what the new focus asks for.
+  ///
+  /// Only read when `ReconcileSignals::focus_effects_changed` is set.
+  effects_stale: bool,
+}
+
+/// What the sync as a whole asks for, apart from any one window.
+struct ReconcileSignals<'a> {
+  /// Workspaces whose windows need restacking.
+  reorder_workspaces: &'a HashSet<Uuid>,
+  /// Every window's effects are stale, such as after a config reload.
+  all_effects_changed: bool,
+  /// Focus moved, so only the windows whose effects it changes are stale.
+  focus_effects_changed: bool,
+}
+
+/// Gathers each window's facts for `select_reconcile_set`.
+///
+/// Reads only WM state. `effects_stale` is compared only when focus is
+/// the sole reason a window could be stale.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_candidates(
+  windows: &[WindowContainer],
+  redraw: &HashSet<Uuid>,
+  dirty: &HashSet<Uuid>,
+  plans: &HashMap<Uuid, AnimationPlan<'_>>,
+  all_effects_changed: bool,
+  focus_effects_changed: bool,
+  state: &WmState,
+  config: &UserConfig,
+) -> anyhow::Result<Vec<ReconcileCandidate>> {
+  windows
+    .iter()
+    .map(|window| {
+      let id = window.id();
+      let entry = state.native_sync.windows.get(&id);
+      Ok(ReconcileCandidate {
+        id,
+        workspace: window.workspace().context("No workspace.")?.id(),
+        retired: entry.is_some_and(|entry| entry.retired),
+        redraw: redraw.contains(&id),
+        pending: entry.is_some_and(|entry| {
+          entry.settling() || entry.visibility_pending
+        }),
+        dirty: dirty.contains(&id),
+        planned: plans.contains_key(&id),
+        focus_pending: state.native_sync.focus == Some(id),
+        effects_stale: focus_effects_changed
+          && !all_effects_changed
+          && focus_effects_stale(window, &state.native_sync, config),
+      })
+    })
+    .collect()
+}
+
+/// Chooses the windows a sync reconciles.
+///
+/// Returns each chosen window's id, mapped to whether it is restacked.
+/// Reconciling a window costs native calls, so a focus change must not
+/// reach every window on its workspace when only restacking asks for it.
+/// Platforms without native z-order have nothing to restack. A focus
+/// change there reaches only the window gaining focus, which native focus
+/// waits on, and the windows whose effects it changes.
+fn select_reconcile_set(
+  candidates: &[ReconcileCandidate],
+  signals: &ReconcileSignals<'_>,
+  has_native_z_order: bool,
+) -> HashMap<Uuid, bool> {
+  candidates
+    .iter()
+    .filter(|candidate| !candidate.retired)
+    .filter_map(|candidate| {
+      let reorder = has_native_z_order
+        && signals.reorder_workspaces.contains(&candidate.workspace);
+      // Restacking reconciled the focus target along with its workspace.
+      let focus_target = !has_native_z_order && candidate.focus_pending;
+      let effects_changed = signals.all_effects_changed
+        || (signals.focus_effects_changed && candidate.effects_stale);
+
+      (candidate.redraw
+        || effects_changed
+        || reorder
+        || focus_target
+        || candidate.pending
+        || candidate.dirty
+        || candidate.planned)
+        .then_some((candidate.id, reorder))
+    })
+    .collect()
+}
+
 /// Distinguishes untouched and applied opacity.
 #[derive(PartialEq)]
 enum AppliedOpacity {
@@ -698,7 +811,7 @@ pub fn platform_sync(
   .iter()
   .map(CommonGetters::id)
   .collect::<HashSet<_>>();
-  let mut reorder = state
+  let mut reorder_workspaces = state
     .pending_sync
     .workspaces_to_reorder()
     .iter()
@@ -706,7 +819,7 @@ pub fn platform_sync(
     .collect::<HashSet<_>>();
   if state.pending_sync.needs_focus_update() {
     if let Some(workspace) = focused.workspace() {
-      reorder.insert(workspace.id());
+      reorder_workspaces.insert(workspace.id());
     }
   }
   let all_effects_changed = state.pending_sync.needs_all_effects_update();
@@ -742,37 +855,32 @@ pub fn platform_sync(
     focused.as_window_container().ok().map(|window| window.id()),
   );
 
+  let selected = select_reconcile_set(
+    &reconcile_candidates(
+      &windows,
+      &redraw,
+      &dirty,
+      &plans,
+      all_effects_changed,
+      focus_effects_changed,
+      state,
+      config,
+    )?,
+    &ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed,
+      focus_effects_changed,
+    },
+    PlacementSession::HAS_NATIVE_Z_ORDER,
+  );
+
   let hide_corners = state.monitors_by_hide_corner();
   let mut reconciled = 0;
   for window in &windows {
     let id = window.id();
-    let pending = state
-      .native_sync
-      .windows
-      .get(&id)
-      .is_some_and(|entry| entry.settling() || entry.visibility_pending);
-    let workspace = window.workspace().context("No workspace.")?;
-    let needs_reorder = reorder.contains(&workspace.id());
-    if state
-      .native_sync
-      .windows
-      .get(&id)
-      .is_some_and(|entry| entry.retired)
-    {
+    let Some(&needs_reorder) = selected.get(&id) else {
       continue;
-    }
-    let effects_changed = all_effects_changed
-      || (focus_effects_changed
-        && focus_effects_stale(window, &state.native_sync, config));
-    if !redraw.contains(&id)
-      && !effects_changed
-      && !needs_reorder
-      && !pending
-      && !dirty.contains(&id)
-      && !plans.contains_key(&id)
-    {
-      continue;
-    }
+    };
     let monitor = window.monitor().context("No monitor.")?;
     let pass = ReconcilePass {
       owner: &monitor,
@@ -2114,6 +2222,216 @@ mod tests {
     effects.corner_style.style = CornerStyle::Rounded;
     effects.transparency.enabled = true;
     effects
+  }
+
+  /// Builds a workspace of idle windows, none of which ask for a pass.
+  fn idle_workspace(count: usize) -> (Uuid, Vec<ReconcileCandidate>) {
+    let workspace = Uuid::new_v4();
+    let candidates = (0..count)
+      .map(|_| ReconcileCandidate {
+        id: Uuid::new_v4(),
+        workspace,
+        retired: false,
+        redraw: false,
+        pending: false,
+        dirty: false,
+        planned: false,
+        focus_pending: false,
+        effects_stale: false,
+      })
+      .collect();
+
+    (workspace, candidates)
+  }
+
+  #[test]
+  fn focus_change_reconciles_two_windows_without_native_z_order() {
+    let (workspace, mut candidates) = idle_workspace(10);
+    // Focus moved from the first window to the second.
+    candidates[0].effects_stale = true;
+    candidates[1].effects_stale = true;
+    let reorder_workspaces = HashSet::from([workspace]);
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: false,
+      focus_effects_changed: true,
+    };
+
+    let without = select_reconcile_set(&candidates, &signals, false);
+    let with = select_reconcile_set(&candidates, &signals, true);
+
+    assert_eq!(
+      without,
+      HashMap::from([
+        (candidates[0].id, false),
+        (candidates[1].id, false)
+      ])
+    );
+    assert_eq!(with.len(), 10);
+    assert!(with.values().all(|reorder| *reorder));
+  }
+
+  #[test]
+  fn keyboard_focus_reconciles_only_the_window_gaining_focus() {
+    // A focus command queues no effects update; the echo of the
+    // application's own focus event does that later.
+    let (workspace, mut candidates) = idle_workspace(10);
+    candidates[3].focus_pending = true;
+    let reorder_workspaces = HashSet::from([workspace]);
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: false,
+      focus_effects_changed: false,
+    };
+
+    assert_eq!(
+      select_reconcile_set(&candidates, &signals, false),
+      HashMap::from([(candidates[3].id, false)])
+    );
+    assert_eq!(
+      select_reconcile_set(&candidates, &signals, true).len(),
+      10
+    );
+  }
+
+  #[test]
+  fn focus_echo_without_effects_reconciles_nothing_without_z_order() {
+    // Native focus was applied by the earlier sync, so none is pending.
+    let (workspace, candidates) = idle_workspace(10);
+    let reorder_workspaces = HashSet::from([workspace]);
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: false,
+      focus_effects_changed: true,
+    };
+
+    assert!(select_reconcile_set(&candidates, &signals, false).is_empty());
+    assert_eq!(
+      select_reconcile_set(&candidates, &signals, true).len(),
+      10
+    );
+  }
+
+  #[test]
+  fn other_workspaces_are_not_restacked() {
+    let (_, mut candidates) = idle_workspace(3);
+    let (other, others) = idle_workspace(3);
+    candidates.extend(others);
+    let reorder_workspaces = HashSet::from([other]);
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: false,
+      focus_effects_changed: false,
+    };
+
+    let selected = select_reconcile_set(&candidates, &signals, true);
+
+    assert_eq!(selected.len(), 3);
+    assert!(candidates[3..]
+      .iter()
+      .all(|candidate| selected.get(&candidate.id) == Some(&true)));
+  }
+
+  #[test]
+  fn capability_does_not_hide_other_reasons_to_reconcile() {
+    let (workspace, mut candidates) = idle_workspace(6);
+    candidates[0].redraw = true;
+    candidates[1].pending = true;
+    candidates[2].dirty = true;
+    candidates[3].planned = true;
+    candidates[4].retired = true;
+    candidates[4].redraw = true;
+    let reorder_workspaces = HashSet::from([workspace]);
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: false,
+      focus_effects_changed: false,
+    };
+
+    let selected = select_reconcile_set(&candidates, &signals, false);
+
+    assert_eq!(
+      selected,
+      candidates[..4]
+        .iter()
+        .map(|candidate| (candidate.id, false))
+        .collect()
+    );
+  }
+
+  #[test]
+  fn all_effects_update_still_reaches_every_window() {
+    let (_, candidates) = idle_workspace(10);
+    let reorder_workspaces = HashSet::new();
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: true,
+      focus_effects_changed: false,
+    };
+
+    assert_eq!(
+      select_reconcile_set(&candidates, &signals, false).len(),
+      10
+    );
+  }
+
+  /// The selection as it was written inline before it became a function.
+  fn selected_before_extraction(
+    candidate: &ReconcileCandidate,
+    signals: &ReconcileSignals<'_>,
+  ) -> Option<bool> {
+    let needs_reorder =
+      signals.reorder_workspaces.contains(&candidate.workspace);
+    if candidate.retired {
+      return None;
+    }
+    let effects_changed = signals.all_effects_changed
+      || (signals.focus_effects_changed && candidate.effects_stale);
+
+    (candidate.redraw
+      || effects_changed
+      || needs_reorder
+      || candidate.pending
+      || candidate.dirty
+      || candidate.planned)
+      .then_some(needs_reorder)
+  }
+
+  #[test]
+  fn native_z_order_selection_matches_the_inline_original() {
+    let workspace = Uuid::new_v4();
+    // Every combination of the ten boolean inputs, with the focus target
+    // ignored by the oracle.
+    for bits in 0u32..1 << 10 {
+      let flag = |bit: u32| bits & (1 << bit) != 0;
+      let candidate = ReconcileCandidate {
+        id: Uuid::new_v4(),
+        workspace: if flag(0) { workspace } else { Uuid::new_v4() },
+        retired: flag(1),
+        redraw: flag(2),
+        pending: flag(3),
+        dirty: flag(4),
+        planned: flag(5),
+        focus_pending: flag(9),
+        effects_stale: flag(6),
+      };
+      let reorder_workspaces = HashSet::from([workspace]);
+      let signals = ReconcileSignals {
+        reorder_workspaces: &reorder_workspaces,
+        all_effects_changed: flag(7),
+        focus_effects_changed: flag(8),
+      };
+
+      let expected = selected_before_extraction(&candidate, &signals)
+        .map(|reorder| (candidate.id, reorder));
+      let actual = select_reconcile_set(
+        std::slice::from_ref(&candidate),
+        &signals,
+        true,
+      );
+
+      assert_eq!(actual.into_iter().next(), expected, "bits={bits:#b}");
+    }
   }
 
   #[test]

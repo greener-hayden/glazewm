@@ -36,11 +36,14 @@ pub fn handle_window_moved_or_resized(
   let found_window = state.window_from_native(native_window);
 
   if let Some(window) = found_window {
-    // Every frame tick reconciles a window whose presentation the clock
-    // drives. Native motion echoes each of its own writes, and queueing a
-    // commit for each echo doubled the commits per frame. That tick is
-    // also what confirms such a window's frame write, which the write's
-    // own observation no longer does (see `reconcile_frame`).
+    // The frame clock reconciles a window whose presentation it drives.
+    // Native motion echoes each of its own writes, and queueing a commit
+    // for each echo doubled the commits per frame. A tick is also what
+    // confirms such a window's frame write, which the write's own
+    // observation no longer does (see `reconcile_frame`). Where the
+    // platform animates for itself, a tick reconciles only when
+    // `PlacementCoordinator::tick_due` finds work, and an unconfirmed
+    // write is one of the things that makes it due.
     if !state.animation_manager.drives_frames(&window.id()) {
       state.native_sync.observe(window.id());
     }

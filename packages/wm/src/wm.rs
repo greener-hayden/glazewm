@@ -234,18 +234,24 @@ impl WindowManager {
   }
 
   /// Advances presentation from native signals, never a polling interval.
+  ///
+  /// Where the platform animates for itself, a tick starts a sync only
+  /// when `PlacementCoordinator::tick_due` finds something it can change.
+  /// Elsewhere every tick syncs, as it draws the motion.
   pub fn update_animations(
     &mut self,
     signal: wm_platform::FrameSignal,
     config: &UserConfig,
   ) -> anyhow::Result<()> {
     let mut signal = Some(signal);
+    let mut unavailable = false;
     while let Some(current) = signal {
       match current {
         wm_platform::FrameSignal::Presented(frame) => {
           self.state.native_sync.presented(frame);
         }
         wm_platform::FrameSignal::Unavailable => {
+          unavailable = true;
           self.state.native_sync.presentation_failed();
         }
         wm_platform::FrameSignal::Wake => {}
@@ -263,7 +269,16 @@ impl WindowManager {
     for id in self.state.animation_manager.take_failures() {
       self.state.native_sync.cancel_presentation(id);
     }
-    self.recover_placement(config, SyncTrigger::Tick)
+    if !wm_platform::AnimationWindow::SELF_ANIMATING
+      || unavailable
+      || self.state.native_sync.tick_due(
+        self.state.native_sync.presented_frame(),
+        &self.state.animation_manager,
+      )
+    {
+      self.recover_placement(config, SyncTrigger::Tick)?;
+    }
+    Ok(())
   }
 
   pub fn process_commands(

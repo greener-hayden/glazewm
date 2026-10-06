@@ -58,6 +58,22 @@ impl MotionPreparation {
     }
   }
 
+  /// The lowest compositor frame this preparation still waits to pass,
+  /// among those at or above `from`.
+  ///
+  /// Readiness needs a frame later than the overlay's, and one later than
+  /// the frame that first saw the current geometry converged. A gate
+  /// below `from` was passed by the pass that ran at `from`, so it holds
+  /// nothing up. Over-reporting is harmless: a stale geometry gate only
+  /// wakes one pass that finds nothing to do.
+  pub fn frame_gate(&self, from: u64) -> Option<u64> {
+    [self.overlay_frame, self.geometry.map(|(_, after)| after)]
+      .into_iter()
+      .flatten()
+      .filter(|gate| *gate >= from)
+      .min()
+  }
+
   /// Starts only after current geometry and a subsequent compositor
   /// boundary.
   pub fn ready(&self, generation: u64, frame: u64) -> bool {

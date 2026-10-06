@@ -430,11 +430,26 @@ impl RetireFence {
     false
   }
 
+  /// The lowest compositor frame this fence still waits to pass, among
+  /// those at or above `from`.
+  ///
+  /// The fence waits for a frame after `after`, then after the frame that
+  /// saw the companions revealed. Between the two, and past the hold, it
+  /// is rechecked by `recheck_at` instead.
+  fn frame_gate(&self, from: u64) -> Option<u64> {
+    [Some(self.after), self.revealed_at]
+      .into_iter()
+      .flatten()
+      .filter(|gate| *gate >= from)
+      .min()
+  }
+
   /// When a fence that is not yet due should be checked again, without
   /// relying on compositor ticks.
   ///
-  /// `None` while the source awaits composition; that wait already
-  /// follows the frame clock.
+  /// `None` while the source awaits composition; that wait is a frame
+  /// gate (see `frame_gate`), which `PlacementCoordinator::tick_due`
+  /// watches.
   fn recheck_at(
     &self,
     compositor_frame: u64,
@@ -490,12 +505,161 @@ impl ManagedWindow {
   /// pass, which this keeps scheduled for a window whose echo is not
   /// marked (see `reconcile_frame`).
   fn settling(&self) -> bool {
+    self.settling_view(false).settling()
+  }
+
+  /// Borrows what keeps the window settling.
+  ///
+  /// `running` is whether the animation manager owns released motion for
+  /// the window.
+  fn settling_view(&self, running: bool) -> SettlingView<'_> {
+    SettlingView {
+      frame: &self.frame,
+      motion: self.motion.as_ref(),
+      source: self.source.as_ref(),
+      retire_after: self.retire_after.as_ref(),
+      decoration: self.decoration.as_ref(),
+      visibility_pending: self.visibility_pending,
+      cancelled: self.cancelled,
+      running,
+      retry_at: self.retry_at,
+    }
+  }
+}
+
+/// Everything that keeps one window settling, apart from its native
+/// session.
+///
+/// Holding no session, it can be built in a test, so what wakes each
+/// settling state is checked without a native window.
+#[derive(Clone, Copy)]
+struct SettlingView<'a> {
+  frame: &'a FrameReconciler,
+  motion: Option<&'a MotionOwner>,
+  source: Option<&'a SourceLease>,
+  retire_after: Option<&'a RetireFence>,
+  decoration: Option<&'a DecorationPhase>,
+  visibility_pending: bool,
+  cancelled: bool,
+  /// The animation manager owns released motion for the window.
+  running: bool,
+  /// When the pass that last ran asked to see the window again.
+  retry_at: Option<Instant>,
+}
+
+/// What brings a settling window back for its next pass.
+///
+/// A window that falls asleep on none of these is stranded until some
+/// unrelated sync. See `SettlingView::wake`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Wake {
+  /// Nothing else is guaranteed to bring the window back, so the next
+  /// tick must.
+  immediate: bool,
+  /// The lowest compositor frame the window waits to pass.
+  gate: Option<u64>,
+  /// Released motion that ends by setting its completion flag.
+  completion: bool,
+  /// A time deadline brings the window back, with no tick needed.
+  deadline: bool,
+}
+
+impl Wake {
+  /// Whether the window is certain to be reconciled again.
+  #[cfg(test)]
+  fn covered(self) -> bool {
+    self.immediate
+      || self.gate.is_some()
+      || self.completion
+      || self.deadline
+  }
+}
+
+impl SettlingView<'_> {
+  /// Whether reconciliation still owes the window work.
+  fn settling(&self) -> bool {
     self.motion.is_some()
       || self.source.is_some()
       || self.retire_after.is_some()
       || self.decoration.is_some()
       || self.frame.in_flight()
   }
+
+  /// Finds what ends the window's wait, given that its last pass saw
+  /// compositor frame `synced`.
+  ///
+  /// Every settling state must report at least one source (`covered`).
+  /// A state that is not a known wait reports `immediate`, which costs a
+  /// pass per tick but never a stranded window.
+  fn wake(&self, synced: u64) -> Wake {
+    let preparation = self.motion.and_then(MotionOwner::preparation);
+    let fence = self.retire_after;
+    let revealing = match self.decoration {
+      Some(DecorationPhase::Revealing(fence)) => Some(fence),
+      _ => None,
+    };
+    let gate = [
+      preparation.and_then(|motion| motion.frame_gate(synced)),
+      fence.and_then(|fence| fence.frame_gate(synced)),
+      revealing.and_then(|fence| fence.frame_gate(synced)),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    // Motion that only its completion ends. A source concealed behind a
+    // cover with no preparation left is the cover's running motion, and
+    // a decoration being drawn is a native motion's.
+    let awaits_completion =
+      matches!(self.motion, Some(MotionOwner::Native { .. }))
+        || matches!(self.decoration, Some(DecorationPhase::Drawing))
+        || (preparation.is_none()
+          && self.source.is_some_and(|source| !source.restoring));
+    Wake {
+      // A write or a visibility change is confirmed only by a later
+      // pass, and a window whose clock drives it queues no echo for it.
+      immediate: self.cancelled
+        || self.frame.in_flight()
+        || self.visibility_pending
+        || (awaits_completion && !self.running),
+      gate,
+      completion: self.running,
+      deadline: preparation.is_some()
+        || self.frame.deadline().is_some()
+        || self.retry_at.is_some(),
+    }
+  }
+}
+
+/// Whether a frame tick has anything for a pass to do.
+///
+/// Where the platform animates for itself, the tick carries no motion, so
+/// a pass is due only when a wait can have ended. A pass at `synced` left
+/// every frame gate below it passed, so the tick is due once `presented`
+/// is beyond the lowest gate not passed then. Time deadlines and queued
+/// events start passes of their own.
+///
+/// `completed` is whether any motion has set its completion flag. It is
+/// read rather than inferred from a `Wake` signal, which a full tick
+/// channel can drop.
+fn tick_due<'a>(
+  presented: u64,
+  synced: u64,
+  clock_failed: bool,
+  completed: bool,
+  windows: impl IntoIterator<Item = SettlingView<'a>>,
+) -> bool {
+  if clock_failed || completed {
+    return true;
+  }
+  let mut lowest_gate = None;
+  for window in windows.into_iter().filter(SettlingView::settling) {
+    let wake = window.wake(synced);
+    if wake.immediate {
+      return true;
+    }
+    lowest_gate = lowest_gate.into_iter().chain(wake.gate).min();
+  }
+  lowest_gate.is_some_and(|gate| presented > gate)
 }
 
 /// Serializes application-window mutation decisions.
@@ -515,6 +679,9 @@ pub struct PlacementCoordinator {
   layout_dirty: bool,
   batch: u64,
   presented_frame: u64,
+  /// The compositor frame the last completed sync read, which every frame
+  /// gate below it had already been passed by.
+  synced_frame: u64,
   clock_failed: bool,
 }
 
@@ -522,6 +689,49 @@ impl PlacementCoordinator {
   /// Records a real compositor boundary, independent of any motion clock.
   pub fn presented(&mut self, frame: u64) {
     self.presented_frame = self.presented_frame.max(frame);
+  }
+
+  /// Returns the last compositor boundary recorded by `presented`.
+  pub fn presented_frame(&self) -> u64 {
+    self.presented_frame
+  }
+
+  /// Whether a tick at `presented_frame` can change what a sync does.
+  ///
+  /// For platforms that animate for themselves, where a tick carries no
+  /// motion. Otherwise every tick syncs, because it draws the motion.
+  /// Due when any of these holds:
+  /// - A running motion set its completion flag.
+  /// - The frame passed the lowest frame gate left open by the last sync:
+  ///   overlay readiness, a retire fence or a companion hold.
+  /// - A settling window's frame write or visibility change is
+  ///   unconfirmed, or its presentation was cancelled. Their echoes queue
+  ///   no sync of their own for a window the clock drives, so the tick
+  ///   confirms them. A window that is not settling never makes a tick
+  ///   due: a hidden application cannot change state on a tick, and its
+  ///   retry deadline polls it.
+  /// - The clock failed.
+  ///
+  /// Anything else that settles waits on a deadline, which starts its
+  /// own sync.
+  pub fn tick_due(
+    &self,
+    presented_frame: u64,
+    animations: &crate::animation_manager::AnimationManager,
+  ) -> bool {
+    tick_due(
+      presented_frame,
+      self.synced_frame,
+      self.clock_failed,
+      animations.has_completed_motion(),
+      self
+        .windows
+        .iter()
+        .filter(|(_, window)| !window.retired)
+        .map(|(id, window)| {
+          window.settling_view(animations.is_running(id))
+        }),
+    )
   }
 
   /// Invalidates readiness after loss of compositor service.
@@ -983,6 +1193,8 @@ pub fn platform_sync(
   release_ready(state);
   state.animation_manager.begin_pending();
   state.pending_sync.clear();
+  // Only a sync that ran to here has passed every gate below this frame.
+  state.native_sync.synced_frame = compositor_frame;
   let t_total = span.elapsed();
   span.finish(
     SLOW_SPAN,
@@ -2690,5 +2902,688 @@ mod tests {
     assert!(!observed_visible(false, true, false));
     assert!(!observed_visible(false, false, true));
     assert!(observed_visible(true, false, false));
+  }
+}
+
+/// Tests for when a frame tick has work for a pass.
+#[cfg(test)]
+mod tick_due_tests {
+  use super::*;
+
+  /// Where the application has a window, before and after the slide.
+  const HOME: (i32, i32) = (100, 100);
+  const PARKED: (i32, i32) = (1919, 1079);
+  const TILE: (i32, i32) = (400, 100);
+
+  /// Builds a frame target at `at`.
+  fn desired(at: (i32, i32)) -> DesiredFrame {
+    DesiredFrame {
+      rect: Rect::from_xy(at.0, at.1, 500, 400),
+      monitor: Rect::from_xy(0, 0, 1920, 1080),
+      working_area: Rect::from_xy(0, 0, 1920, 1040),
+      dpi: 96,
+      state: NativeState::Normal,
+      parking_clamp: None,
+    }
+  }
+
+  /// Builds an observation of a window at `at`.
+  fn observed(at: (i32, i32)) -> ObservedFrame {
+    ObservedFrame {
+      rect: desired(at).rect,
+      dpi: 96,
+      state: NativeState::Normal,
+    }
+  }
+
+  /// Builds a frame that has converged on `at`.
+  fn converged(at: (i32, i32), now: Instant) -> FrameReconciler {
+    let mut frame = FrameReconciler::new(desired(at));
+    frame.observe(&observed(at), now);
+    assert!(!frame.in_flight());
+    frame
+  }
+
+  /// A window's settling state, owned so a view can borrow it.
+  struct Parts {
+    frame: FrameReconciler,
+    motion: Option<MotionOwner>,
+    source: Option<SourceLease>,
+    retire_after: Option<RetireFence>,
+    decoration: Option<DecorationPhase>,
+    visibility_pending: bool,
+    cancelled: bool,
+    running: bool,
+    retry_at: Option<Instant>,
+  }
+
+  impl Parts {
+    /// Builds a window with nothing settling.
+    fn idle(now: Instant) -> Self {
+      Self {
+        frame: converged(HOME, now),
+        motion: None,
+        source: None,
+        retire_after: None,
+        decoration: None,
+        visibility_pending: false,
+        cancelled: false,
+        running: false,
+        retry_at: None,
+      }
+    }
+
+    /// Borrows the state as a view.
+    fn view(&self) -> SettlingView<'_> {
+      SettlingView {
+        frame: &self.frame,
+        motion: self.motion.as_ref(),
+        source: self.source.as_ref(),
+        retire_after: self.retire_after.as_ref(),
+        decoration: self.decoration.as_ref(),
+        visibility_pending: self.visibility_pending,
+        cancelled: self.cancelled,
+        running: self.running,
+        retry_at: self.retry_at,
+      }
+    }
+
+    /// Builds a window parked behind its running cover.
+    fn sliding(now: Instant) -> Self {
+      Self {
+        frame: converged(PARKED, now),
+        source: Some(SourceLease::default()),
+        running: true,
+        ..Self::idle(now)
+      }
+    }
+
+    /// Builds a window whose overlay waits for compositor frame `gate`.
+    fn preparing(gate: u64, now: Instant) -> Self {
+      Self {
+        motion: Some(MotionOwner::Overlay(MotionPreparation::new(
+          1,
+          Some(gate),
+          now,
+          true,
+        ))),
+        ..Self::idle(now)
+      }
+    }
+
+    /// Builds a window whose retire fence waits for frame `after`.
+    fn fenced(after: u64, now: Instant) -> Self {
+      Self {
+        retire_after: Some(RetireFence::new(after, now)),
+        ..Self::idle(now)
+      }
+    }
+  }
+
+  /// Runs `tick_due` over `windows`.
+  fn due(
+    presented: u64,
+    synced: u64,
+    completed: bool,
+    windows: &[Parts],
+  ) -> bool {
+    tick_due(
+      presented,
+      synced,
+      false,
+      completed,
+      windows.iter().map(Parts::view),
+    )
+  }
+
+  #[test]
+  fn nothing_settling_is_never_due() {
+    let now = Instant::now();
+    assert!(!due(9, 0, false, &[]));
+    assert!(!due(9, 0, false, &[Parts::idle(now)]));
+  }
+
+  #[test]
+  fn a_failed_clock_is_always_due() {
+    assert!(tick_due(1, 1, true, false, []));
+  }
+
+  /// A completion whose `Wake` was dropped from the full tick channel
+  /// still shows in its flag, so the next tick of any kind is due.
+  #[test]
+  fn a_lost_wake_is_found_by_its_completion_flag() {
+    let now = Instant::now();
+    let windows = [Parts::sliding(now)];
+    assert!(!due(5, 5, false, &windows));
+    assert!(due(5, 5, true, &windows));
+  }
+
+  #[test]
+  fn a_converged_slide_is_not_due_between_gates() {
+    let now = Instant::now();
+    let windows = [Parts::sliding(now), Parts::sliding(now)];
+    for presented in 1..=40 {
+      assert!(!due(presented, 1, false, &windows));
+    }
+  }
+
+  #[test]
+  fn an_unconfirmed_frame_write_is_due_every_tick() {
+    let now = Instant::now();
+    let mut window = Parts::sliding(now);
+    window.frame = FrameReconciler::new(desired(PARKED));
+    assert!(window.frame.in_flight());
+    assert!(due(2, 2, false, &[window]));
+  }
+
+  #[test]
+  fn an_unconfirmed_visibility_change_is_due_every_tick() {
+    let now = Instant::now();
+    let mut window = Parts::sliding(now);
+    window.visibility_pending = true;
+    assert!(due(2, 2, false, &[window]));
+  }
+
+  #[test]
+  fn a_cancelled_presentation_is_due_only_while_settling() {
+    let now = Instant::now();
+    let mut idle = Parts::idle(now);
+    idle.cancelled = true;
+    assert!(!due(2, 2, false, &[idle]));
+    let mut sliding = Parts::sliding(now);
+    sliding.cancelled = true;
+    assert!(due(2, 2, false, &[sliding]));
+  }
+
+  #[test]
+  fn overlay_readiness_is_due_once_its_frame_is_passed() {
+    let now = Instant::now();
+    let windows = [Parts::sliding(now), Parts::preparing(10, now)];
+    assert!(!due(9, 8, false, &windows));
+    assert!(!due(10, 8, false, &windows));
+    assert!(due(11, 8, false, &windows));
+  }
+
+  /// A gate the last sync had already passed holds nothing up.
+  #[test]
+  fn a_gate_passed_by_the_last_sync_is_not_due_again() {
+    let now = Instant::now();
+    let windows = [Parts::preparing(10, now)];
+    assert!(due(11, 9, false, &windows));
+    assert!(!due(11, 11, false, &windows));
+  }
+
+  #[test]
+  fn the_lowest_open_gate_decides() {
+    let now = Instant::now();
+    let windows = [
+      Parts::preparing(20, now),
+      Parts::fenced(12, now),
+      Parts::fenced(30, now),
+    ];
+    assert!(!due(12, 5, false, &windows));
+    assert!(due(13, 5, false, &windows));
+  }
+
+  #[test]
+  fn a_retire_fence_is_due_after_composition_then_after_the_reveal() {
+    let now = Instant::now();
+    let mut window = Parts::fenced(10, now);
+    assert!(!due(10, 10, false, &[Parts::fenced(10, now)]));
+    assert!(due(11, 10, false, &[Parts::fenced(10, now)]));
+    // The pass at frame 11 sees the companions revealed.
+    let mut fence = window.retire_after.take().expect("Fence.");
+    assert!(!fence.due(11, now, || true));
+    window.retire_after = Some(fence);
+    window.retry_at = Some(now);
+    assert!(!due(11, 11, false, &[Parts::idle(now), window]));
+  }
+
+  #[test]
+  fn a_revealed_fence_is_due_one_frame_later() {
+    let now = Instant::now();
+    let mut fence = RetireFence::new(10, now);
+    assert!(!fence.due(11, now, || true));
+    let window = Parts {
+      retire_after: Some(fence),
+      ..Parts::idle(now)
+    };
+    assert!(!due(11, 11, false, std::slice::from_ref(&window)));
+    assert!(due(12, 11, false, std::slice::from_ref(&window)));
+  }
+
+  /// A fence past its composition gate with no reveal yet is rechecked at
+  /// its own deadline, never by ticks.
+  #[test]
+  fn a_polled_fence_does_not_wake_ticks() {
+    let now = Instant::now();
+    let fence = RetireFence::new(10, now);
+    assert!(fence.frame_gate(11).is_none());
+    assert!(fence.recheck_at(11, now).is_some());
+    let window = Parts {
+      retire_after: Some(fence),
+      retry_at: fence.recheck_at(11, now),
+      ..Parts::idle(now)
+    };
+    assert!(!due(30, 11, false, &[window]));
+  }
+
+  #[test]
+  fn a_revealing_companion_hold_follows_the_same_gates() {
+    let now = Instant::now();
+    let window = Parts {
+      decoration: Some(DecorationPhase::Revealing(RetireFence::new(
+        10, now,
+      ))),
+      ..Parts::idle(now)
+    };
+    assert!(!due(10, 10, false, std::slice::from_ref(&window)));
+    assert!(due(11, 10, false, std::slice::from_ref(&window)));
+  }
+
+  /// Every combination of the fields that keep a window settling.
+  ///
+  /// `synced` is the frame the last sync read. A fence either waits for a
+  /// frame after it, or has passed its source frame and seen the
+  /// companions revealed.
+  fn every_state(now: Instant, synced: u64) -> Vec<Parts> {
+    let waiting = RetireFence::new(synced + 3, now);
+    let mut revealed = RetireFence::new(synced.saturating_sub(2), now);
+    assert!(!revealed.due(synced, now, || true));
+    let mut states = Vec::new();
+    for in_flight in [false, true] {
+      for motion in 0..4 {
+        for source in 0..3 {
+          for retire in 0..3 {
+            for decoration in 0..3 {
+              for flags in 0..16_u8 {
+                let fence = if retire == 2 { revealed } else { waiting };
+                states.push(Parts {
+                  frame: if in_flight {
+                    FrameReconciler::new(desired(HOME))
+                  } else {
+                    converged(HOME, now)
+                  },
+                  motion: match motion {
+                    0 => None,
+                    1 => Some(MotionOwner::Native { batch: 1 }),
+                    2 => {
+                      Some(MotionOwner::Overlay(MotionPreparation::new(
+                        1,
+                        Some(synced + 1),
+                        now,
+                        true,
+                      )))
+                    }
+                    _ => Some(MotionOwner::Overlay(
+                      MotionPreparation::new(1, None, now, true),
+                    )),
+                  },
+                  source: match source {
+                    0 => None,
+                    1 => Some(SourceLease { restoring: false }),
+                    _ => Some(SourceLease { restoring: true }),
+                  },
+                  retire_after: (retire > 0).then_some(fence),
+                  decoration: match decoration {
+                    0 => None,
+                    1 => Some(DecorationPhase::Drawing),
+                    _ => Some(DecorationPhase::Revealing(fence)),
+                  },
+                  visibility_pending: flags & 1 != 0,
+                  cancelled: flags & 2 != 0,
+                  running: flags & 4 != 0,
+                  retry_at: None,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+    states
+  }
+
+  /// Whether the pass that last ran would have asked for a deadline: the
+  /// rule at the end of `reconcile_managed`.
+  fn pass_sets_retry(state: &Parts, synced: u64, now: Instant) -> bool {
+    let rechecks = |fence: Option<&RetireFence>| {
+      fence.is_some_and(|fence| fence.recheck_at(synced, now).is_some())
+    };
+    state.visibility_pending
+      || state.source.as_ref().is_some_and(|source| source.restoring)
+      || rechecks(state.retire_after.as_ref())
+      || rechecks(match state.decoration.as_ref() {
+        Some(DecorationPhase::Revealing(fence)) => Some(fence),
+        _ => None,
+      })
+  }
+
+  /// Every settling state has a deadline, a frame gate, a completion flag
+  /// or an immediate wake, so none can fall asleep with no way back.
+  #[test]
+  fn every_settling_state_has_a_way_back() {
+    let now = Instant::now();
+    let synced = 10;
+    let mut settling = 0;
+    for state in every_state(now, synced) {
+      if !state.view().settling() {
+        continue;
+      }
+      settling += 1;
+      let wake = state.view().wake(synced);
+      assert!(
+        wake.covered() || pass_sets_retry(&state, synced, now),
+        "Stranded settling state: {wake:?}",
+      );
+    }
+    assert!(settling > 1000, "Enumerated {settling} settling states.");
+  }
+
+  /// A fence waits for a frame or for its own recheck, never for neither.
+  #[test]
+  fn a_fence_always_has_a_gate_or_a_recheck() {
+    let now = Instant::now();
+    for after in 0..6 {
+      for synced in 0..9 {
+        let mut fence = RetireFence::new(after, now);
+        for revealed_at in [None, Some(after + 1)] {
+          fence.revealed_at = revealed_at;
+          assert!(
+            fence.frame_gate(synced).is_some()
+              || fence.recheck_at(synced, now).is_some(),
+            "after {after}, synced {synced}, revealed {revealed_at:?}",
+          );
+        }
+      }
+    }
+  }
+
+  /// One window of a simulated workspace slide.
+  struct SimWindow {
+    parts: Parts,
+    /// Where the application has the window.
+    app: ObservedFrame,
+    /// A frame write the application applies when the frame is reached.
+    landing: Option<(u64, Rect)>,
+    /// Frames the application takes to apply a write.
+    delay: u64,
+    /// The frame at which the running motion sets its completion flag.
+    completes_at: Option<u64>,
+  }
+
+  /// How many frames a simulated slide runs.
+  const SLIDE_FRAMES: u64 = 20;
+
+  /// A workspace slide over several windows, one pass at a time.
+  ///
+  /// Mirrors the order of `reconcile_managed`, `release_ready` and
+  /// `begin_pending` on the pieces that decide timing: `FrameReconciler`,
+  /// `MotionPreparation` and `RetireFence`. The application lands its
+  /// writes on its own schedule, so both ways of driving it see the same
+  /// world. Time stands still; deadlines are covered by their own tests.
+  struct Slide {
+    now: Instant,
+    windows: Vec<SimWindow>,
+    presented: u64,
+    synced: u64,
+    /// Every transition, with the pass frame it happened at.
+    log: Vec<(u64, usize, &'static str)>,
+    syncs: u64,
+  }
+
+  impl Slide {
+    /// Starts a slide of windows whose applications take `delays` frames
+    /// to apply a write.
+    fn start(delays: &[u64]) -> Self {
+      let now = Instant::now();
+      let windows = delays
+        .iter()
+        .map(|delay| {
+          let mut parts = Parts::preparing(0, now);
+          parts.frame = converged(HOME, now);
+          SimWindow {
+            parts,
+            app: observed(HOME),
+            landing: None,
+            delay: *delay,
+            completes_at: None,
+          }
+        })
+        .collect();
+      let mut slide = Self {
+        now,
+        windows,
+        presented: 0,
+        synced: 0,
+        log: Vec::new(),
+        syncs: 0,
+      };
+      slide.sync();
+      slide
+    }
+
+    /// Whether any window still needs the frame clock.
+    fn clock_runs(&self) -> bool {
+      self
+        .windows
+        .iter()
+        .any(|window| window.parts.view().settling())
+    }
+
+    /// Whether any motion has set its completion flag.
+    fn completed(&self) -> bool {
+      self.windows.iter().any(|window| {
+        window.parts.running
+          && window.completes_at.is_some_and(|at| at <= self.presented)
+      })
+    }
+
+    /// Whether a tick at the current frame is due.
+    fn due(&self) -> bool {
+      tick_due(
+        self.presented,
+        self.synced,
+        false,
+        self.completed(),
+        self.windows.iter().map(|window| window.parts.view()),
+      )
+    }
+
+    /// Runs one commit at the presented frame.
+    fn sync(&mut self) {
+      let frame = self.presented;
+      let now = self.now;
+      self.syncs += 1;
+      for (index, window) in self.windows.iter_mut().enumerate() {
+        let completed = window.completes_at.is_some_and(|at| at <= frame);
+        Self::pass(window, index, frame, completed, now, &mut self.log);
+      }
+      // `release_ready`: a batch starts together.
+      let blocked = self.windows.iter().any(|window| {
+        window
+          .parts
+          .motion
+          .as_ref()
+          .and_then(MotionOwner::preparation)
+          .is_some_and(|motion| {
+            !motion.ready(window.parts.frame.generation, frame)
+          })
+      });
+      if !blocked {
+        for (index, window) in self.windows.iter_mut().enumerate() {
+          if window.parts.motion.take().is_some() {
+            window.parts.running = true;
+            window.completes_at = Some(frame + SLIDE_FRAMES);
+            self.log.push((frame, index, "released"));
+          }
+        }
+      }
+      self.synced = frame;
+    }
+
+    /// Runs one window's pass at `frame`.
+    fn pass(
+      window: &mut SimWindow,
+      index: usize,
+      frame: u64,
+      completed: bool,
+      now: Instant,
+      log: &mut Vec<(u64, usize, &'static str)>,
+    ) {
+      let parts = &mut window.parts;
+      parts.retry_at = None;
+      if let Some((_, rect)) =
+        window.landing.take_if(|(at, _)| *at <= frame)
+      {
+        window.app.rect = rect;
+      }
+      let observed = window.app.clone();
+      if parts.running && completed {
+        parts.running = false;
+        window.completes_at = None;
+        if let Some(source) = &mut parts.source {
+          source.restoring = true;
+        }
+        log.push((frame, index, "handoff"));
+      }
+      let preparation =
+        parts.motion.as_ref().and_then(MotionOwner::preparation);
+      let retaining =
+        preparation.is_some_and(|motion| motion.retains_source(frame));
+      if !retaining && preparation.is_some() && parts.source.is_none() {
+        parts.source = Some(SourceLease::default());
+        log.push((frame, index, "leased"));
+      }
+      let suppressing = parts
+        .source
+        .as_ref()
+        .is_some_and(|source| !source.restoring);
+      if retaining {
+        parts.frame.observe(&observed, now);
+      } else {
+        parts.frame.retarget(desired(if suppressing {
+          PARKED
+        } else {
+          TILE
+        }));
+        let mut landing = None;
+        if let Some(request) = parts.frame.next(&observed, now) {
+          let delay = window.delay;
+          parts
+            .frame
+            .apply(&request, now, |mutation| {
+              if let NativeMutation::Frame(rect) = mutation {
+                landing = Some((frame + delay, rect.clone()));
+              }
+              Ok(())
+            })
+            .expect("Write.");
+          window.landing = landing;
+          // The read after a write shows the frame from before it.
+          parts.frame.observe(&observed, now);
+        }
+      }
+      let converged = parts.frame.phase == ReconcilePhase::Converged
+        && parts.frame.converged(&observed);
+      if let Some(MotionOwner::Overlay(motion)) = &mut parts.motion {
+        motion.observe(
+          parts.frame.generation,
+          suppressing && converged,
+          frame,
+        );
+      }
+      let restoring =
+        parts.source.as_ref().is_some_and(|source| source.restoring);
+      if restoring && converged {
+        parts.source = None;
+        parts.retire_after = Some(RetireFence::new(frame, now));
+        log.push((frame, index, "restored"));
+      }
+      if let Some(fence) = parts.retire_after.as_mut() {
+        if fence.due(frame, now, || true) {
+          parts.retire_after = None;
+          log.push((frame, index, "retired"));
+        } else if let Some(at) = fence.recheck_at(frame, now) {
+          parts.retry_at = Some(at);
+        }
+      }
+      if parts.source.as_ref().is_some_and(|source| source.restoring) {
+        parts.retry_at = Some(now + Duration::from_millis(250));
+      }
+    }
+
+    /// Drives ticks until the clock stops, syncing on each tick when
+    /// `only_when_due` is not set and on due ticks otherwise.
+    ///
+    /// Returns the syncs between the slide's release and its completion,
+    /// where the cover runs alone.
+    fn run(&mut self, only_when_due: bool) -> u64 {
+      let mut mid_slide = 0;
+      while self.clock_runs() {
+        self.presented += 1;
+        assert!(self.presented < 200, "The slide never ends.");
+        if !only_when_due || self.due() {
+          let sliding = self.windows.iter().all(|window| {
+            window.parts.running
+              && window.completes_at.is_some_and(|at| at > self.presented)
+          });
+          self.sync();
+          if sliding {
+            mid_slide += 1;
+          }
+        }
+      }
+      mid_slide
+    }
+  }
+
+  /// Syncing only on due ticks moves every state at the frame syncing on
+  /// every tick does, in a fraction of the syncs.
+  #[test]
+  fn due_ticks_transition_at_the_same_frames_as_every_tick() {
+    for delays in [
+      vec![1],
+      vec![1, 2, 3],
+      vec![3, 3, 1, 2],
+      vec![5, 1],
+      vec![2, 2, 2, 2, 2],
+    ] {
+      let mut every = Slide::start(&delays);
+      let mut sparse = Slide::start(&delays);
+      let every_mid = every.run(false);
+      let sparse_mid = sparse.run(true);
+      assert_eq!(every.log, sparse.log, "delays {delays:?}");
+      assert!(
+        every.log.iter().any(|(_, _, what)| *what == "retired"),
+        "The slide retires its covers."
+      );
+      assert!(sparse.syncs < every.syncs, "delays {delays:?}");
+      assert_eq!(
+        sparse_mid, 0,
+        "A converged slide needs no mid-slide sync."
+      );
+      assert!(
+        every_mid >= SLIDE_FRAMES - 2,
+        "Every tick syncs through the slide: {every_mid}.",
+      );
+    }
+  }
+
+  /// Syncs a simulated 20-frame slide of three windows takes.
+  #[test]
+  fn sparse_ticks_cut_the_syncs_of_a_slide() {
+    let delays = [1, 2, 3];
+    let mut every = Slide::start(&delays);
+    let mut sparse = Slide::start(&delays);
+    let every_mid = every.run(false);
+    let sparse_mid = sparse.run(true);
+    eprintln!(
+      "20-frame slide, 3 windows: every tick = {} syncs ({every_mid} while \
+       the covers run), due ticks = {} syncs ({sparse_mid} while the \
+       covers run)",
+      every.syncs, sparse.syncs
+    );
+    assert!(sparse.syncs * 2 < every.syncs);
   }
 }

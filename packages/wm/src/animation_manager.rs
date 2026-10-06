@@ -677,6 +677,14 @@ impl AnimationManager {
     })
   }
 
+  /// Whether any released motion has reached its target.
+  ///
+  /// Reads each motion's completion state itself, so a `FrameSignal::Wake`
+  /// lost to a full tick channel does not hide a completion.
+  pub fn has_completed_motion(&self) -> bool {
+    self.running.keys().any(|id| self.is_complete(id))
+  }
+
   /// Whether a workspace slide, running or complete, owns the window.
   pub fn owns_slide(&self, id: &Uuid) -> bool {
     self.animations.get(id).is_some_and(|spec| spec.is_slide)
@@ -696,8 +704,13 @@ impl AnimationManager {
       .then_some(&move_config.effect)
   }
 
-  /// Whether the frame clock runs for this window's presentation, so
-  /// every tick already commits it.
+  /// Whether the frame clock runs for this window's presentation, so a
+  /// tick already commits it.
+  ///
+  /// Where the platform animates for itself, a tick commits only when
+  /// `PlacementCoordinator::tick_due` finds work. The window's own echoes
+  /// are then not marked, and an unconfirmed write is what keeps ticks
+  /// due.
   pub fn drives_frames(&self, id: &Uuid) -> bool {
     self.windows.contains_key(id)
       || self.decorations.contains_key(id)

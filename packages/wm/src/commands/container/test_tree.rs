@@ -3,6 +3,7 @@
 use wm_common::{GapsConfig, TilingDirection, WorkspaceConfig};
 use wm_platform::{NativeWindow, Rect, RectDelta};
 
+use super::attach_container;
 use crate::{
   models::{Container, NativeWindowProperties, TilingWindow, Workspace},
   traits::{CommonGetters, TilingSizeGetters},
@@ -44,6 +45,26 @@ pub fn window() -> TilingWindow {
     Vec::new(),
     None,
   )
+}
+
+/// A workspace holding `sizes.len()` windows with those tiling sizes.
+pub fn row(sizes: &[f32]) -> (Container, Vec<Container>) {
+  let workspace: Container = workspace().into();
+  let windows = sizes
+    .iter()
+    .map(|_| {
+      let window: Container = window().into();
+      attach_container(&window, &workspace, None).unwrap();
+      window
+    })
+    .collect::<Vec<_>>();
+
+  // Sized after every attach, since each attach re-divides the row.
+  for (window, &size) in windows.iter().zip(sizes) {
+    window.as_tiling_container().unwrap().set_tiling_size(size);
+  }
+
+  (workspace, windows)
 }
 
 /// Asserts the tiling sizes of `parent`'s tiling children, in order.

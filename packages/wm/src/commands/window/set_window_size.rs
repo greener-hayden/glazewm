@@ -82,6 +82,11 @@ fn set_tiling_window_length(
         - vertical_gap * window.tiling_siblings().count() as i32
     };
 
+    // Without room to resize into, a pixel length has no percentage.
+    if parent_length <= 0 {
+      return Ok(());
+    }
+
     // A sibling pinned to its floor cannot give the space up, and the
     // window cannot take less than its own; asking would only be undone.
     let siblings_floor = container_to_resize

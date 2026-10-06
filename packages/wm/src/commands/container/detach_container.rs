@@ -1,9 +1,9 @@
 use anyhow::Context;
 
-use super::flatten_split_container;
+use super::{flatten_split_container, share_out_tiling_size};
 use crate::{
   models::Container,
-  traits::{CommonGetters, TilingSizeGetters, MIN_TILING_SIZE},
+  traits::{CommonGetters, TilingSizeGetters},
 };
 
 /// Removes a container from the tree.
@@ -39,21 +39,69 @@ pub fn detach_container(child_to_remove: Container) -> anyhow::Result<()> {
   if let Ok(child_to_remove) = child_to_remove.as_tiling_container() {
     let tiling_siblings = parent.tiling_children().collect::<Vec<_>>();
 
-    // TODO: Share logic with `resize_tiling_container`.
-    let available_size =
-      tiling_siblings.iter().fold(0.0, |sum, container| {
-        sum + container.tiling_size() - MIN_TILING_SIZE
-      });
-
     // Adjust size of the siblings based on the freed up space.
-    for sibling in &tiling_siblings {
-      let resize_factor =
-        (sibling.tiling_size() - MIN_TILING_SIZE) / available_size;
-
-      let size_delta = resize_factor * child_to_remove.tiling_size();
-      sibling.set_tiling_size(sibling.tiling_size() + size_delta);
-    }
+    share_out_tiling_size(
+      &tiling_siblings,
+      child_to_remove.tiling_size(),
+      1.,
+    );
   }
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    super::{
+      detach_tile,
+      test_tree::{self, row},
+    },
+    *,
+  };
+
+  /// Every sibling sits at the minimum, so there is no room to weigh
+  /// the share-out by.
+  #[test]
+  fn closing_a_tile_beside_a_minimum_tile_gives_it_the_space() {
+    let (workspace, windows) = row(&[0.99, 0.01]);
+
+    detach_tile(windows[0].clone()).unwrap();
+
+    test_tree::assert_sizes(&workspace, &[1.0]);
+  }
+
+  #[test]
+  fn closing_a_tile_beside_minimum_tiles_shares_out_equally() {
+    let (workspace, windows) = row(&[0.98, 0.01, 0.01]);
+
+    detach_container(windows[0].clone()).unwrap();
+
+    test_tree::assert_sizes(&workspace, &[0.5, 0.5]);
+  }
+
+  /// A size already corrupted must not spread to the siblings, which
+  /// still have to fill the row.
+  #[test]
+  fn closing_a_tile_with_a_non_finite_size_keeps_the_row_whole() {
+    let (workspace, windows) = row(&[0.5, 0.25, 0.25]);
+    windows[0]
+      .as_tiling_container()
+      .unwrap()
+      .set_tiling_size(f32::NAN);
+
+    detach_container(windows[0].clone()).unwrap();
+
+    test_tree::assert_sizes(&workspace, &[0.5, 0.5]);
+  }
+
+  /// A corrupt sibling must not be left as a minimum tile.
+  #[test]
+  fn closing_a_tile_repairs_a_non_finite_sibling() {
+    let (workspace, windows) = row(&[f32::NAN, 0.5, 0.5]);
+
+    detach_container(windows[2].clone()).unwrap();
+
+    test_tree::assert_sizes(&workspace, &[0.5, 0.5]);
+  }
 }

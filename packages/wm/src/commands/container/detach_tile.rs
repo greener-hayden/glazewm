@@ -73,29 +73,9 @@ fn split_partner(container: &Container) -> Option<TilingContainer> {
 #[cfg(test)]
 mod tests {
   use super::{
-    super::{attach_container, test_tree},
+    super::test_tree::{self, row},
     *,
   };
-
-  /// A workspace holding `sizes.len()` windows with those tiling sizes.
-  fn row(sizes: &[f32]) -> (Container, Vec<Container>) {
-    let workspace: Container = test_tree::workspace().into();
-    let windows = sizes
-      .iter()
-      .map(|_| {
-        let window: Container = test_tree::window().into();
-        attach_container(&window, &workspace, None).unwrap();
-        window
-      })
-      .collect::<Vec<_>>();
-
-    // Sized after every attach, since each attach re-divides the row.
-    for (window, &size) in windows.iter().zip(sizes) {
-      window.as_tiling_container().unwrap().set_tiling_size(size);
-    }
-
-    (workspace, windows)
-  }
 
   #[test]
   fn closing_a_half_restores_its_partner() {

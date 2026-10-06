@@ -82,6 +82,20 @@ pub trait TilingSizeGetters: CommonGetters {
   }
 }
 
+/// Logs a tiling size that can never be laid out, with where it came from.
+///
+/// Such a size gives its tile no space, so the backtrace names the code
+/// path that wrote it. Logged at error level to reach `errors.log`.
+pub fn report_invalid_tiling_size(tiling_size: f32) {
+  if !tiling_size.is_finite() || tiling_size <= 0. {
+    tracing::error!(
+      size = tiling_size,
+      backtrace = %std::backtrace::Backtrace::force_capture(),
+      "Non-finite or non-positive tiling size."
+    );
+  }
+}
+
 /// Implements the `TilingSizeGetters` trait for a given struct.
 ///
 /// Expects that the struct has a wrapping `RefCell` containing a struct
@@ -95,6 +109,7 @@ macro_rules! impl_tiling_size_getters {
       }
 
       fn set_tiling_size(&self, tiling_size: f32) {
+        $crate::traits::report_invalid_tiling_size(tiling_size);
         self.0.borrow_mut().tiling_size = tiling_size;
       }
 

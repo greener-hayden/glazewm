@@ -6,6 +6,37 @@ pub trait PositionGetters {
   fn to_rect(&self) -> anyhow::Result<Rect>;
 }
 
+/// Whether a tiling size can be laid out: finite and above zero.
+#[must_use]
+pub fn is_usable_tiling_size(size: f32) -> bool {
+  size.is_finite() && size > 0.
+}
+
+/// Replaces every size that cannot be laid out with a usable one.
+///
+/// A non-finite or non-positive size has no meaning as a share, and left
+/// as a zero weight it gives its tile no space at all. Such a size takes
+/// the average of the valid sizes, or an equal share when none are valid.
+/// Valid sizes are returned as they are.
+#[must_use]
+pub fn usable_tiling_sizes(sizes: &[f32]) -> Vec<f32> {
+  let is_valid = |size: &f32| is_usable_tiling_size(*size);
+  let valid = sizes.iter().copied().filter(is_valid);
+  let count = valid.clone().count();
+
+  #[allow(clippy::cast_precision_loss)]
+  let fallback = if count == 0 {
+    1. / sizes.len() as f32
+  } else {
+    valid.sum::<f32>() / count as f32
+  };
+
+  sizes
+    .iter()
+    .map(|size| if is_valid(size) { *size } else { fallback })
+    .collect()
+}
+
 /// Splits `total` between children that each insist on a floor.
 ///
 /// A tiling size is a fraction of the parent, so a busy workspace can
@@ -18,6 +49,9 @@ pub trait PositionGetters {
 /// left over the rest, and repeat, since pinning one can push the next
 /// under. Each pass pins at least one child, so it ends in at most
 /// `mins.len()` passes.
+///
+/// A size that cannot be laid out (see `usable_tiling_sizes`) counts as
+/// an average one, so a corrupt size never collapses its tile.
 ///
 /// Returns a length per child, in the order given. When the floors alone
 /// exceed `total` every child gets its floor and the overflow is
@@ -37,15 +71,9 @@ pub fn resolve_lengths(
   if mins.iter().map(|value| i64::from(*value)).sum::<i64>() >= total {
     return mins;
   }
-  let weights = sizes
-    .iter()
-    .map(|size| {
-      if size.is_finite() && *size > 0.0 {
-        f64::from(*size)
-      } else {
-        0.0
-      }
-    })
+  let weights = usable_tiling_sizes(sizes)
+    .into_iter()
+    .map(f64::from)
     .collect::<Vec<_>>();
   let mut pinned = vec![false; sizes.len()];
   let mut exact = vec![0.0; sizes.len()];
@@ -174,6 +202,23 @@ mod tests {
     assert_eq!(resolve_lengths(&[1.0; 3], &[0; 3], 100), vec![34, 33, 33]);
     assert_eq!(resolve_lengths(&[0.0; 3], &[0; 3], 100), vec![34, 33, 33]);
     assert_eq!(resolve_lengths(&[f32::NAN, 0.0], &[0; 2], 3), vec![2, 1]);
+  }
+
+  /// A corrupt weight takes an average share rather than none.
+  #[test]
+  fn gives_a_non_finite_weight_an_average_share() {
+    assert_eq!(
+      resolve_lengths(&[f32::NAN, 0.5], &[0, 0], 100),
+      vec![50, 50]
+    );
+    assert_eq!(
+      resolve_lengths(&[f32::INFINITY, 0.25, 0.75], &[0; 3], 100),
+      vec![33, 17, 50]
+    );
+    assert_eq!(
+      resolve_lengths(&[-1.0, 0.0, f32::NAN, 0.0], &[0; 4], 100),
+      vec![25, 25, 25, 25]
+    );
   }
 
   /// Conserves available pixels across many layouts.

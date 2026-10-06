@@ -792,7 +792,13 @@ pub fn platform_sync(
 ) -> anyhow::Result<()> {
   let span = PerfSpan::start("platform_sync");
   let key_queued = origin.key_received_at.map(|at| at.elapsed());
-  let layout_changed = std::mem::take(&mut state.native_sync.layout_dirty);
+  // A tiling size that cannot be laid out would collapse its tile, so a
+  // corrupt one is repaired before anything reads the layout.
+  let repaired = crate::commands::container::repair_tiling_sizes(
+    &state.root_container.clone().into(),
+  );
+  let layout_changed =
+    std::mem::take(&mut state.native_sync.layout_dirty) || repaired;
   // Every commit solves the layout again. A queued redraw is not the only
   // thing that moves a rect: a dropped floating window writes its own
   // placement and asks for no redraw, and reconciling that window against
@@ -2017,6 +2023,13 @@ fn reconcile_managed(
             (minimum.1 - (target.height() - tile.height())).max(0);
         }
         if window.native_properties().min_size != Some(minimum) {
+          tracing::warn!(
+            window = %id,
+            ?minimum,
+            observed = ?observed.rect,
+            desired = ?entry.frame.desired.rect,
+            "Learned size floor."
+          );
           window.update_native_properties(|properties| {
             properties.min_size = Some(minimum);
           });

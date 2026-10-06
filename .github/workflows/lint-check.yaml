@@ -41,6 +41,11 @@ jobs:
       - name: Check linting (clippy)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # The default members leave `wm-platform`'s benches and test targets
+      # out, so they are linted explicitly.
+      - name: Check linting of wm-platform targets (clippy)
+        run: cargo clippy -p wm-platform --all-targets --all-features -- -D warnings
+
   # Both platforms are first-class here, so both run the suite. This is the
   # only gate that exercises the platform the author is not sitting at.
   test:

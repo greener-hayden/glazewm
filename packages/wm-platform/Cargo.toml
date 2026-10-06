@@ -113,3 +113,10 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSUserDefaults",
   "objc2-core-foundation",
 ] }
+
+# Standalone macOS micro-benchmark: `cargo bench -p wm-platform --bench
+# macos_native`. Needs Accessibility permission for the calling terminal.
+# An empty `main` on other platforms.
+[[bench]]
+name = "macos_native"
+harness = false

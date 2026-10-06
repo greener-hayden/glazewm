@@ -404,19 +404,24 @@ async fn wait_until(deadline: Option<std::time::Instant>) {
 
 /// Initialize logging with the specified verbosity level.
 ///
-/// Error logs are saved to `~/.glzr/glazewm/errors.log`.
+/// Error logs are saved to `~/.glzr/glazewm/errors.log`. Timing lines of
+/// the `perf` target are saved to `~/.glzr/glazewm/perf.<date>.log`; see
+/// the `perf` module for how to read them.
 fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
-  let error_log_dir = home::home_dir()
+  let log_dir = home::home_dir()
     .context("Unable to get home directory.")?
     .join(".glzr/glazewm/");
 
   let error_writer =
-    tracing_appender::rolling::never(error_log_dir, "errors.log");
+    tracing_appender::rolling::never(&log_dir, "errors.log");
 
-  // Timing lines are logged under `perf::PERF_TARGET`, so they reach the
-  // stdout layer below at their own level. A dedicated file layer for them
-  // would be added here, filtered on that target.
-  //
+  // The perf log is a diagnostic aid, so a failure to open it must not
+  // keep the WM from starting. It is reported once logging is set up.
+  let (perf_writer, perf_error) = match perf::perf_log_appender(&log_dir) {
+    Ok(writer) => (Some(writer), None),
+    Err(err) => (None, Some(err)),
+  };
+
   // Filter per layer rather than per writer. A writer filter formats
   // every event before discarding it, so each disabled `debug!` still
   // paid for its `Debug` output, including LaunchServices round trips
@@ -434,9 +439,22 @@ fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
       fmt::Layer::new()
         .with_writer(error_writer)
         .with_filter(LevelFilter::ERROR),
+    )
+    .with(
+      // Output timing lines to the perf log file, at the verbosity level.
+      perf_writer.map(|writer| {
+        fmt::Layer::new()
+          .with_ansi(false)
+          .with_writer(writer)
+          .with_filter(perf::perf_log_filter(verbosity.level()))
+      }),
     );
 
   tracing::subscriber::set_global_default(subscriber)?;
+
+  if let Some(err) = perf_error {
+    tracing::warn!("Unable to open the perf log: {err}");
+  }
 
   tracing::info!(
     "Starting WM with log level {:?}.",

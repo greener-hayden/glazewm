@@ -7,17 +7,39 @@
 //! it made. Read them by searching for a span name (e.g. `platform_sync`)
 //! or a field such as `key_ms=` or `hops=`.
 //!
-//! The target is the one hook for routing these lines elsewhere, e.g. to a
-//! dedicated file layer filtered on [`PERF_TARGET`] in `setup_logging`.
+//! # Reading the log
+//!
+//! `setup_logging` also writes these lines, and only these, to
+//! `~/.glzr/glazewm/perf.<date>.log`. The file layer logs at the
+//! verbosity level of the run: slow spans (`INFO`) by default, every span
+//! (`DEBUG`) under `-v`, and nothing under `-q`. A new file starts
+//! each UTC day, so the date in the name may differ from the local date.
+//! Old files are deleted only when a running WM rolls over to a new day,
+//! so a WM restarted within a day never trims them. Each file is a
+//! day's output and is not capped in bytes.
+//!
+//! Each line is one span with `key=value` fields. To find a slow key
+//! press, grep for `trigger=key` and sort on `key_ms=`; `hops=` and
+//! `ax_reads=` count the main-thread hops and accessibility reads the span
+//! made. For example: `grep 'trigger=key' perf.*.log | grep key_ms=`.
 use std::{
   fmt,
+  path::Path,
   time::{Duration, Instant},
 };
 
+use tracing::Level;
+use tracing_appender::rolling::{
+  InitError, RollingFileAppender, Rotation,
+};
+use tracing_subscriber::filter::Targets;
 use wm_platform::{NativeCallSnapshot, NativeCallStats};
 
 /// Log target of every line written by this module.
 pub const PERF_TARGET: &str = "perf";
+
+/// How many daily perf log files are kept, the current one included.
+pub const PERF_LOG_FILES: usize = 3;
 
 /// A whole span (e.g. a sync) slower than this is logged at `INFO`.
 pub const SLOW_SPAN: Duration = Duration::from_millis(16);
@@ -172,6 +194,34 @@ impl PerfSpan {
 
     total
   }
+}
+
+/// Creates the writer of the perf log in `directory`.
+///
+/// Rolls over each UTC day to `perf.<date>.log`. When it rolls over, it
+/// deletes all but the newest [`PERF_LOG_FILES`] files. Nothing is deleted
+/// at creation, and a day's file is not capped in bytes.
+///
+/// Fails if the directory or file cannot be created.
+pub fn perf_log_appender(
+  directory: impl AsRef<Path>,
+) -> Result<RollingFileAppender, InitError> {
+  RollingFileAppender::builder()
+    .rotation(Rotation::DAILY)
+    .filename_prefix("perf")
+    .filename_suffix("log")
+    .max_log_files(PERF_LOG_FILES)
+    .build(directory)
+}
+
+/// Creates the filter for the perf log layer.
+///
+/// Passes only events under [`PERF_TARGET`], up to `level`. Being a
+/// target filter, it reports `level` as its max level hint, so it does
+/// not raise the global max level above `level`.
+#[must_use]
+pub fn perf_log_filter(level: Level) -> Targets {
+  Targets::new().with_target(PERF_TARGET, level)
 }
 
 /// Logs one line under [`PERF_TARGET`], at `INFO` if `slow`.
@@ -330,5 +380,119 @@ mod tests {
     let total = span.finish(Duration::MAX, format_args!("detail=1"));
 
     assert!(total >= Duration::from_millis(2));
+  }
+
+  /// Collects what a `fmt` layer writes.
+  #[derive(Clone, Default)]
+  struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+  impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self
+        .0
+        .lock()
+        .map_err(|_| std::io::Error::other("poisoned"))?
+        .extend_from_slice(buf);
+      Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  impl Capture {
+    fn text(&self) -> String {
+      String::from_utf8_lossy(&self.0.lock().expect("lock").clone())
+        .into_owned()
+    }
+  }
+
+  /// Logs one event per target and level, returning what the perf layer
+  /// at `level` wrote.
+  fn capture_at(level: Level) -> String {
+    use tracing_subscriber::{fmt, layer::SubscriberExt, Layer};
+
+    let capture = Capture::default();
+    let writer = capture.clone();
+    let subscriber = tracing_subscriber::registry().with(
+      fmt::Layer::new()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .with_filter(perf_log_filter(level)),
+    );
+
+    tracing::subscriber::with_default(subscriber, || {
+      tracing::info!(target: PERF_TARGET, "perf_info");
+      tracing::debug!(target: PERF_TARGET, "perf_debug");
+      tracing::info!("other_info");
+      tracing::error!(target: "wm", "other_error");
+      emit(true, format_args!("emit_slow"));
+      emit(false, format_args!("emit_fast"));
+    });
+
+    capture.text()
+  }
+
+  #[test]
+  fn perf_filter_passes_only_the_perf_target() {
+    let text = capture_at(Level::DEBUG);
+
+    assert!(text.contains("perf_info"), "{text}");
+    assert!(text.contains("perf_debug"), "{text}");
+    assert!(!text.contains("other_info"), "{text}");
+    assert!(!text.contains("other_error"), "{text}");
+  }
+
+  #[test]
+  fn perf_filter_keeps_debug_spans_for_verbose_runs_only() {
+    let text = capture_at(Level::INFO);
+
+    assert!(text.contains("perf_info"), "{text}");
+    assert!(text.contains("emit_slow"), "{text}");
+    assert!(!text.contains("perf_debug"), "{text}");
+    assert!(!text.contains("emit_fast"), "{text}");
+  }
+
+  #[test]
+  fn perf_filter_reports_its_level_as_max_level_hint() {
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::Layer;
+
+    let filter = perf_log_filter(Level::INFO);
+    let hint =
+      Layer::<tracing_subscriber::Registry>::max_level_hint(&filter);
+
+    assert_eq!(hint, Some(LevelFilter::INFO));
+  }
+
+  #[test]
+  fn perf_log_appender_writes_a_dated_file_in_the_directory() {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir()
+      .join(format!("glazewm-perf-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    {
+      let mut appender = perf_log_appender(&dir).expect("appender");
+      writeln!(appender, "line").expect("write");
+      appender.flush().expect("flush");
+    }
+
+    let names = std::fs::read_dir(&dir)
+      .expect("read dir")
+      .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+      .collect::<Vec<_>>();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(
+      names[0].starts_with("perf.")
+        && Path::new(&names[0])
+          .extension()
+          .is_some_and(|ext| ext == "log"),
+      "{names:?}"
+    );
   }
 }

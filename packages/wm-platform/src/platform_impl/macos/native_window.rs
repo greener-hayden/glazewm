@@ -6,7 +6,7 @@ use objc2_app_kit::{
 };
 use objc2_application_services::{AXError, AXValue};
 use objc2_core_foundation::{
-  CFBoolean, CFRetained, CFString, CGPoint, CGSize,
+  CFBoolean, CFNumber, CFRetained, CFString, CGPoint, CGSize,
 };
 #[allow(deprecated)]
 use objc2_core_graphics::{
@@ -246,6 +246,47 @@ impl NativeWindow {
     self.with_element(|el| {
       el.get_attribute::<CFBoolean>("AXFullScreen")
         .map(|cf_bool| cf_bool.value())
+    })?
+  }
+
+  /// Reads whether the window is minimized and whether it is maximized,
+  /// in one request.
+  ///
+  /// Asking for both costs the application a single round trip, where
+  /// [`Self::is_minimized`] and [`Self::is_maximized`] cost one each. A
+  /// minimized window is reported as not maximized, and its full-screen
+  /// attribute is not required to be readable.
+  pub(crate) fn window_state(&self) -> crate::Result<(bool, bool)> {
+    self.with_element(|el| {
+      let mut values = el
+        .get_attributes(&["AXMinimized", "AXFullScreen"])?
+        .into_iter();
+      let mut flag = |attribute: &str| -> crate::Result<bool> {
+        let value = values.next().ok_or_else(|| {
+          crate::Error::InvalidPointer(format!(
+            "No value returned for {attribute}."
+          ))
+        })??;
+        // Some applications answer a flag with a number, which the
+        // single-attribute reads always took as its truth value.
+        value
+          .downcast_ref::<CFBoolean>()
+          .map(CFBoolean::value)
+          .or_else(|| {
+            value
+              .downcast_ref::<CFNumber>()
+              .and_then(CFNumber::as_i64)
+              .map(|number| number != 0)
+          })
+          .ok_or_else(|| {
+            crate::Error::Platform(format!(
+              "{attribute} is not a boolean."
+            ))
+          })
+      };
+
+      let minimized = flag("AXMinimized")?;
+      Ok((minimized, !minimized && flag("AXFullScreen")?))
     })?
   }
 

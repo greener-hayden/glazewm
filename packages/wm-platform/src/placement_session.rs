@@ -84,6 +84,19 @@ impl PlacementSession {
   /// - macOS: `false`; the platform exposes no z-order.
   pub const HAS_NATIVE_Z_ORDER: bool = cfg!(target_os = "windows");
 
+  /// Whether reading the minimized/maximized state asks the window's
+  /// application.
+  ///
+  /// When `true`, such a read waits behind whatever the application is
+  /// doing (a relayout after a frame write, say), while
+  /// [`Self::observed_frame`] and [`Self::dpi`] are answered without it.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: `false`; the state is a flag the shell keeps.
+  /// - macOS: `true`; the state is an accessibility attribute.
+  pub const STATE_READS_ASK_APP: bool = cfg!(target_os = "macos");
+
   /// Whether the event listener already concealed this source.
   #[must_use]
   pub fn opening_concealed(&self) -> bool {
@@ -205,24 +218,29 @@ impl PlacementSession {
   /// - Windows: validates ownership once up front, and the frame and DPI
   ///   reads each validate again.
   /// - macOS: makes no validation read of its own: the window server
-  ///   lookup and each state read already fail for a dead window, and
+  ///   lookup and the state read already fail for a dead window, and
   ///   callers validate once per pass. This is one window server lookup
-  ///   and two accessibility reads, one while minimized.
+  ///   and one accessibility request (one hop) for both state flags.
   pub fn observe(&self) -> crate::Result<NativeObservation> {
     #[cfg(target_os = "windows")]
     let window = self.window()?;
-    #[cfg(target_os = "macos")]
-    let window = &self.native;
 
     let rect = self.observed_frame()?;
     let dpi = self.dpi()?;
-    let minimized = window.is_minimized()?;
+
+    #[cfg(target_os = "windows")]
+    let (minimized, maximized) = {
+      let minimized = window.is_minimized()?;
+      (minimized, !minimized && window.is_maximized()?)
+    };
+    #[cfg(target_os = "macos")]
+    let (minimized, maximized) = self.native.inner.window_state()?;
 
     Ok(NativeObservation {
       rect,
       dpi,
       minimized,
-      maximized: !minimized && window.is_maximized()?,
+      maximized,
     })
   }
 
@@ -880,14 +898,11 @@ mod tests {
     let (result, spent) = counted(|| session.observe());
 
     // The element has no window attributes, so the observation stops at
-    // its first state read. Up to there it is one window server lookup
-    // and that read; each validation would add an `AXRole` read, and
-    // there were three before the observation stopped making them.
-    assert!(matches!(
-      &result,
-      Err(crate::Error::Accessibility(attribute, _))
-        if attribute == "AXMinimized"
-    ));
+    // its state read. Up to there it is one window server lookup and that
+    // one request for both flags; each validation would add an `AXRole`
+    // read, and there were three before the observation stopped making
+    // them.
+    assert!(matches!(&result, Err(crate::Error::Accessibility(..))));
     assert_eq!(spent.ax_reads, 1);
     assert_eq!(spent.window_list_single, 1);
   }

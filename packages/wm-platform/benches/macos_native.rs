@@ -20,6 +20,10 @@
 //! them on: reads run on the event loop thread (the same as
 //! `ThreadBound`), the hop is measured from a second thread.
 //!
+//! The pass section runs the window manager's own `PlacementSession`
+//! against the helpers' windows. To find them it lists the accessibility
+//! windows of every application, which only reads.
+//!
 //! An empty `main` on other platforms.
 #![warn(clippy::all, clippy::pedantic)]
 
@@ -60,7 +64,7 @@ mod macos {
   };
   use wm_platform::{
     Dispatcher, DispatcherExtMacOs, EventLoop, NativeCallStats,
-    ThreadBound,
+    NativeWindow, PlacementSession, Rect, ThreadBound, WindowId,
   };
 
   use crate::helper::{self, Helper};
@@ -624,7 +628,8 @@ mod macos {
     }
 
     reads(dispatcher, &window)?;
-    read_after_write(&window, helper.window_id)
+    read_after_write(&window, helper.window_id)?;
+    passes(dispatcher, helper)
   }
 
   /// Single reads against `AXUIElementCopyMultipleAttributeValues`.
@@ -821,6 +826,228 @@ mod macos {
     report("AXSize write, 2 ms timeout, with hop", &write);
     report("AXRole read right after the write", &after);
     report("window server read right after the write", &after_server);
+
+    Ok(())
+  }
+
+  /// How many windows a pass writes to.
+  const PASS_WINDOWS: usize = 3;
+
+  /// How much wider each write makes a window, and back.
+  const PASS_GROWTH: i32 = 20;
+
+  /// A helper window under the window manager's own placement session.
+  struct PassWindow {
+    session: PlacementSession,
+    /// The same window, for the reads a session no longer makes in one.
+    window: NativeWindow,
+  }
+
+  /// Wraps the helper window `window_id` in the window manager's own
+  /// placement session.
+  fn placement_session(
+    dispatcher: &Dispatcher,
+    window_id: u32,
+  ) -> BenchResult<PassWindow> {
+    // The window server lists the window a moment before accessibility
+    // exposes it.
+    for _ in 0..50 {
+      let window = dispatcher
+        .visible_windows()?
+        .into_iter()
+        .find(|window| window.id() == WindowId(window_id));
+
+      if let Some(window) = window {
+        return Ok(PassWindow {
+          session: PlacementSession::new(window.clone(), 1)?,
+          window,
+        });
+      }
+
+      std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Err("the helper window is not listed by accessibility".into())
+  }
+
+  /// Refuses to go on if the running window manager could manage the
+  /// helper window, since the passes resize it.
+  fn ensure_unmanaged(
+    dispatcher: &Dispatcher,
+    pid: i32,
+  ) -> BenchResult<()> {
+    let window = bind_helper_window(dispatcher, pid)?;
+    let subrole = window.with(|el| {
+      read(el, "AXSubrole")
+        .and_then(|value| {
+          value.downcast_ref::<CFString>().map(ToString::to_string)
+        })
+        .unwrap_or_default()
+    })?;
+
+    if subrole.is_empty() || subrole == "AXStandardWindow" {
+      return Err(
+        "a helper window could be managed by the window manager".into(),
+      );
+    }
+
+    Ok(())
+  }
+
+  /// What a window's observation read before the state read became one
+  /// request: the window server lookup, then `AXMinimized` and
+  /// `AXFullScreen` as a request each, with no validation read.
+  fn observe_separately(target: &PassWindow) -> bool {
+    target.session.observed_frame().is_ok()
+      && target.window.is_minimized().is_ok_and(|minimized| {
+        minimized || target.window.is_maximized().is_ok()
+      })
+  }
+
+  /// Which reads a pass makes.
+  #[derive(Clone, Copy)]
+  enum Reads {
+    /// A request per state flag, and the same reads after a frame write.
+    Before,
+    /// One request for both flags, and the window server alone after a
+    /// frame write.
+    After,
+  }
+
+  impl Reads {
+    /// The observation that precedes a write, and that a pass without
+    /// one makes.
+    fn observe(self, target: &PassWindow) -> bool {
+      match self {
+        Self::Before => observe_separately(target),
+        Self::After => target.session.observe().is_ok(),
+      }
+    }
+
+    /// The observation straight after a frame write.
+    fn observe_after_write(self, target: &PassWindow) -> bool {
+      match self {
+        Self::Before => observe_separately(target),
+        Self::After => target.session.observed_frame().is_ok(),
+      }
+    }
+  }
+
+  /// A write pass over several windows, then the next pass `gap` later.
+  ///
+  /// The first pass observes each window, writes it, then observes it
+  /// again, as a reconcile pass does. The second pass only observes. The
+  /// helpers relayout in parallel, so a pass that does not wait for the
+  /// first window's relayout before writing the next one overlaps them.
+  ///
+  /// Returns the time of the first and of the second pass for each round.
+  fn run_passes(
+    sessions: &[PassWindow],
+    sizes: &[Rect],
+    display: &Rect,
+    gap: Duration,
+    reads: Reads,
+  ) -> (Vec<Duration>, Vec<Duration>) {
+    let settle = SLOW_RELAYOUT + Duration::from_millis(50);
+    let mut write_pass = Vec::new();
+    let mut next_pass = Vec::new();
+
+    for round in 0..10 {
+      std::thread::sleep(settle);
+
+      let grow = if round % 2 == 0 { PASS_GROWTH } else { 0 };
+
+      let first = Instant::now();
+      for (window, size) in sessions.iter().zip(sizes) {
+        let target = Rect::from_xy(
+          size.left,
+          size.top,
+          size.width() + grow,
+          size.height(),
+        );
+
+        let observed = reads.observe(window);
+        let written =
+          window.session.set_frame_on_display(&target, display);
+        let read = reads.observe_after_write(window);
+
+        // A failed step would make the timing meaningless.
+        assert!(observed && written.is_ok() && read, "a pass step failed");
+      }
+      write_pass.push(first.elapsed());
+
+      std::thread::sleep(gap);
+
+      let second = Instant::now();
+      for window in sessions {
+        assert!(reads.observe(window), "a pass step failed");
+      }
+      next_pass.push(second.elapsed());
+    }
+
+    (write_pass, next_pass)
+  }
+
+  /// A write pass over several windows and the pass after it, with the
+  /// reads after a frame write as they were and as they are now.
+  ///
+  /// Before: the window server lookup and one request per state flag,
+  /// right after the write. After: the window server lookup alone after a
+  /// frame write, and one request for both flags before it. Each helper's
+  /// relayout takes `SLOW_RELAYOUT`, and the passes use the production
+  /// `PlacementSession` against them.
+  fn passes(dispatcher: &Dispatcher, first: &Helper) -> BenchResult<()> {
+    let extra = (1..PASS_WINDOWS)
+      .map(|_| Helper::spawn(SLOW_RELAYOUT))
+      .collect::<Result<Vec<_>, _>>()?;
+    let helpers = std::iter::once(first).chain(&extra).collect::<Vec<_>>();
+
+    for helper in &helpers {
+      ensure_unmanaged(dispatcher, helper.pid)?;
+    }
+
+    let sessions = helpers
+      .iter()
+      .map(|helper| placement_session(dispatcher, helper.window_id))
+      .collect::<BenchResult<Vec<_>>>()?;
+    let sizes = sessions
+      .iter()
+      .map(|window| window.session.observed_frame())
+      .collect::<Result<Vec<_>, _>>()?;
+    // Large enough that no write is pulled back onto a smaller display.
+    let display = Rect::from_xy(-20_000, -20_000, 40_000, 40_000);
+
+    println!(
+      "  {PASS_WINDOWS} helper windows, each relayout {} ms, written \
+       {PASS_GROWTH} px wider and back; time spent by the caller per \
+       pass, with the next pass a gap after the write pass:",
+      SLOW_RELAYOUT.as_millis()
+    );
+
+    for gap in [Duration::from_millis(16), Duration::from_millis(60)] {
+      for (name, reads) in
+        [("before", Reads::Before), ("after ", Reads::After)]
+      {
+        println!("  {name}, gap {} ms", gap.as_millis());
+        let (write_pass, next_pass) =
+          counted(|| run_passes(&sessions, &sizes, &display, gap, reads));
+        let total = write_pass
+          .iter()
+          .zip(&next_pass)
+          .map(|(write, next)| *write + *next)
+          .collect::<Vec<_>>();
+
+        report("write pass", &write_pass);
+        report("next pass", &next_pass);
+        report("both", &total);
+      }
+    }
+
+    // Put the helper windows back where they began.
+    std::thread::sleep(SLOW_RELAYOUT + Duration::from_millis(50));
+    for (window, size) in sessions.iter().zip(&sizes) {
+      let _ = window.session.set_frame_on_display(size, &display);
+    }
 
     Ok(())
   }

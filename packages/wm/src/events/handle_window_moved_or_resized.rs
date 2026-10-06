@@ -38,7 +38,9 @@ pub fn handle_window_moved_or_resized(
   if let Some(window) = found_window {
     // Every frame tick reconciles a window whose presentation the clock
     // drives. Native motion echoes each of its own writes, and queueing a
-    // commit for each echo doubled the commits per frame.
+    // commit for each echo doubled the commits per frame. That tick is
+    // also what confirms such a window's frame write, which the write's
+    // own observation no longer does (see `reconcile_frame`).
     if !state.animation_manager.drives_frames(&window.id()) {
       state.native_sync.observe(window.id());
     }

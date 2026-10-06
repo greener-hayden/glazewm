@@ -22,7 +22,7 @@ use crate::{
   models::{Monitor, NativeMonitorProperties, WindowContainer},
   native_reconciler::{
     DesiredFrame, FrameReconciler, NativeMutation, NativeState,
-    ObservedFrame, ReconcilePhase,
+    ObservePlan, ObservedFrame, ReconcilePhase,
   },
   perf::{self, PerfSpan, SyncDetail, SyncOrigin, SLOW_CALL, SLOW_SPAN},
   presentation::{MotionPreparation, SourceLease},
@@ -485,6 +485,10 @@ struct ManagedWindow {
 
 impl ManagedWindow {
   /// Whether reconciliation still owes this window work.
+  ///
+  /// An in-flight frame counts: a frame write is confirmed by a later
+  /// pass, which this keeps scheduled for a window whose echo is not
+  /// marked (see `reconcile_frame`).
   fn settling(&self) -> bool {
     self.motion.is_some()
       || self.source.is_some()
@@ -1333,6 +1337,25 @@ fn observe(native: &PlacementSession) -> anyhow::Result<ObservedFrame> {
   })
 }
 
+/// Reads a window back after a native write, as `plan` allows.
+///
+/// A plan that keeps the state from before the write skips the reads that
+/// ask the application, so a write whose relayout is still running does
+/// not hold up the pass: geometry comes from the window server alone.
+fn observe_planned(
+  native: &PlacementSession,
+  plan: ObservePlan,
+) -> anyhow::Result<ObservedFrame> {
+  match plan {
+    ObservePlan::Full => observe(native),
+    ObservePlan::Geometry { state } => Ok(ObservedFrame {
+      rect: native.observed_frame()?,
+      dpi: native.dpi()?,
+      state,
+    }),
+  }
+}
+
 /// Resolves the requested native state before its dependent geometry.
 fn desired_state(window: &WindowContainer, minimize: bool) -> NativeState {
   if minimize || window.state() == WindowState::Minimized {
@@ -1385,6 +1408,18 @@ fn parking_rect(
 /// Applies one generation-checked request, then immediately observes its
 /// result.
 ///
+/// After a frame write the observation is geometry only (see
+/// `ObservePlan`), so it usually still shows the old frame: the write is
+/// confirmed by the application's move event, or by the next frame tick
+/// for a window the clock drives, rather than in this pass.
+///
+/// A window the clock drives gets no echo-marked sync (see
+/// `handle_window_moved_or_resized`), so the per-tick sync of a window
+/// with `frame.in_flight()` is what confirms its write. Any change that
+/// stops syncing on frame ticks (such as syncing only when a tick is due)
+/// must keep a tick due for such a window, or its write waits out the
+/// 250 ms retry.
+///
 /// `placed` runs straight after a frame request is issued, with the
 /// requested rect, so work that must reach the compositor with the move
 /// follows it without a native query in between.
@@ -1395,6 +1430,11 @@ fn reconcile_frame(
 ) -> anyhow::Result<ObservedFrame> {
   let observed = observe(&entry.native)?;
   if let Some(request) = entry.frame.next(&observed, now) {
+    let plan = ObservePlan::after_write(
+      &request.mutation,
+      &observed,
+      PlacementSession::STATE_READS_ASK_APP,
+    );
     // The display the request belongs to, so macOS need not enumerate
     // screens to find it.
     let monitor = entry.frame.desired.monitor.clone();
@@ -1410,7 +1450,7 @@ fn reconcile_frame(
       }
       Ok(())
     })?;
-    let observed = observe(&entry.native)?;
+    let observed = observe_planned(&entry.native, plan)?;
     // Observation may acknowledge the write, but never issues a second
     // request.
     entry.frame.observe(&observed, now);

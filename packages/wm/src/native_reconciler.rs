@@ -75,6 +75,44 @@ pub enum NativeMutation {
   Maximize,
 }
 
+/// What to read back from a window straight after a native write.
+///
+/// Reading a window's state can ask its application, and an application
+/// handles requests in order: a state read queued behind a frame write
+/// waits for the relayout that write started, one window after another.
+/// A frame write cannot change the state, so that read is skipped and the
+/// state seen before the write stands. A real change raises its own event
+/// and is read by the next pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservePlan {
+  /// Read geometry and state.
+  Full,
+  /// Read geometry alone, keeping `state` from before the write.
+  Geometry { state: NativeState },
+}
+
+impl ObservePlan {
+  /// Plans the read after `mutation`, issued against `before`.
+  ///
+  /// `state_reads_ask_app` is whether reading the state reaches the
+  /// window's application (`PlacementSession::STATE_READS_ASK_APP`); when
+  /// it does not, there is nothing to save. A state mutation changes the
+  /// state it writes, and acknowledging it enables the geometry that
+  /// follows, so it is always read back in full.
+  pub fn after_write(
+    mutation: &NativeMutation,
+    before: &ObservedFrame,
+    state_reads_ask_app: bool,
+  ) -> Self {
+    match mutation {
+      NativeMutation::Frame(_) if state_reads_ask_app => Self::Geometry {
+        state: before.state,
+      },
+      _ => Self::Full,
+    }
+  }
+}
+
 /// Identifies requests within a managed session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeRequest {
@@ -664,6 +702,72 @@ mod tests {
     assert!(sync.next(&observed, now).is_none());
     observed.rect = sync.desired.rect.clone();
     sync.observe(&observed, now);
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+    assert_eq!(sync.deadline(), None);
+  }
+
+  /// A frame write is read back from geometry alone, keeping the state
+  /// seen before it; every state write is read back in full.
+  #[test]
+  fn plans_the_read_after_a_write() {
+    let (_, mut before) = fixture();
+    before.state = NativeState::Maximized;
+    let rect = Rect::from_xy(0, 0, 10, 10);
+
+    let frame = ObservePlan::after_write(
+      &NativeMutation::Frame(rect.clone()),
+      &before,
+      true,
+    );
+    assert_eq!(
+      frame,
+      ObservePlan::Geometry {
+        state: NativeState::Maximized
+      }
+    );
+
+    for mutation in [
+      NativeMutation::Restore(rect.clone()),
+      NativeMutation::Minimize,
+      NativeMutation::Maximize,
+    ] {
+      let plan = ObservePlan::after_write(&mutation, &before, true);
+      assert_eq!(plan, ObservePlan::Full, "{mutation:?}");
+    }
+
+    // Where a state read is cheap there is nothing to skip.
+    assert_eq!(
+      ObservePlan::after_write(
+        &NativeMutation::Frame(rect),
+        &before,
+        false
+      ),
+      ObservePlan::Full
+    );
+  }
+
+  /// A read taken before the application applied a frame write leaves the
+  /// request in flight; the applied frame converges it.
+  #[test]
+  fn stale_read_after_a_frame_write_stays_accepted() {
+    let (mut sync, observed) = fixture();
+    let now = Instant::now();
+    advance(&mut sync);
+    let request = sync.next(&observed, now).expect("Frame write.");
+    sync.accepted(&request, now);
+
+    // The window server still shows the old frame, with the state carried
+    // over from before the write.
+    sync.observe(&observed, now);
+    assert_eq!(sync.phase, ReconcilePhase::Accepted);
+    assert!(sync.in_flight());
+    assert_eq!(sync.deadline(), Some(now + RETRY_WAIT));
+
+    let applied = ObservedFrame {
+      rect: sync.desired.rect.clone(),
+      ..observed
+    };
+    sync.observe(&applied, now + Duration::from_millis(20));
     assert_eq!(sync.phase, ReconcilePhase::Converged);
     assert_eq!(sync.deadline(), None);
   }

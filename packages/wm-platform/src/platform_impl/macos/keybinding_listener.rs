@@ -177,7 +177,8 @@ impl MacKeybindingListener {
           return false;
         }
 
-        let _ = event_tx.send(KeybindingEvent(longest_keybinding.clone()));
+        let _ =
+          event_tx.send(KeybindingEvent::new(longest_keybinding.clone()));
 
         true
       },

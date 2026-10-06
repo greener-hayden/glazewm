@@ -10,8 +10,9 @@ use wm_common::{
   WindowEffectConfig, WindowState, WmEvent,
 };
 use wm_platform::{
-  Color, ConcealMethod, CornerStyle, Delta, OpacityValue,
-  PlacementSession, Rect, WindowId, WindowZOrder,
+  Color, ConcealMethod, CornerStyle, Delta, NativeCallSnapshot,
+  NativeCallStats, OpacityValue, PlacementSession, Rect, WindowId,
+  WindowZOrder,
 };
 
 use crate::{
@@ -23,6 +24,7 @@ use crate::{
     DesiredFrame, FrameReconciler, NativeMutation, NativeState,
     ObservedFrame, ReconcilePhase,
   },
+  perf::{self, PerfSpan, SyncDetail, SyncOrigin, SLOW_CALL, SLOW_SPAN},
   presentation::{MotionPreparation, SourceLease},
   traits::{
     effective_opacity, CommonGetters, PositionGetters, WindowGetters,
@@ -673,9 +675,10 @@ impl PlacementCoordinator {
 pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
+  origin: SyncOrigin,
 ) -> anyhow::Result<()> {
-  let timing = tracing::enabled!(tracing::Level::DEBUG);
-  let sync_started = timing.then(Instant::now);
+  let span = PerfSpan::start("platform_sync");
+  let key_queued = origin.key_received_at.map(|at| at.elapsed());
   let layout_changed = std::mem::take(&mut state.native_sync.layout_dirty);
   // Every commit solves the layout again. A queued redraw is not the only
   // thing that moves a rect: a dropped floating window writes its own
@@ -684,7 +687,7 @@ pub fn platform_sync(
   state.layout_snapshot = crate::layout_snapshot::LayoutSnapshot::capture(
     &state.root_container,
   )?;
-  let t_snapshot = sync_started.map(|at| at.elapsed());
+  let t_snapshot = span.elapsed();
   let focused =
     state.focused_container().context("No focused container.")?;
   let redraw = if layout_changed {
@@ -721,7 +724,7 @@ pub fn platform_sync(
       order.get(&window.id()).copied().unwrap_or(usize::MAX),
     )
   });
-  let t_order = sync_started.map(|at| at.elapsed());
+  let t_order = span.elapsed();
   let dirty = std::mem::take(&mut state.native_sync.dirty);
   let now = Instant::now();
   // Once per commit; see `ReconcilePass::sampled_frame`.
@@ -740,6 +743,7 @@ pub fn platform_sync(
   );
 
   let hide_corners = state.monitors_by_hide_corner();
+  let mut reconciled = 0;
   for window in &windows {
     let id = window.id();
     let pending = state
@@ -781,6 +785,7 @@ pub fn platform_sync(
         .copied()
         .unwrap_or(HideCorner::BottomRight),
     };
+    reconciled += 1;
     if let Err(err) =
       reconcile_window(window, pass, plans.get(&id), state, config)
     {
@@ -812,6 +817,7 @@ pub fn platform_sync(
           .as_ref()
           .is_some_and(|(visible, _)| *visible)
       {
+        let focus_span = PerfSpan::start("native_focus");
         if let Err(err) = entry
           .native
           .window()
@@ -819,6 +825,7 @@ pub fn platform_sync(
         {
           tracing::warn!("Window focus failed: {err}");
         }
+        focus_span.finish(SLOW_CALL, format_args!("window={id}"));
         state.native_sync.focus = None;
       }
     }
@@ -854,26 +861,28 @@ pub fn platform_sync(
   release_ready(state);
   state.animation_manager.begin_pending();
   state.pending_sync.clear();
-  if let (Some(started), Some(snapshot), Some(order)) =
-    (sync_started, t_snapshot, t_order)
-  {
-    let total = started.elapsed();
-    tracing::debug!(
-      "platform_sync {}us snapshot={}us order={}us reconcile={}us \
-       windows={} settling={}",
-      total.as_micros(),
-      snapshot.as_micros(),
-      order.saturating_sub(snapshot).as_micros(),
-      total.saturating_sub(order).as_micros(),
-      windows.len(),
-      state
-        .native_sync
-        .windows
-        .values()
-        .filter(|entry| entry.settling())
-        .count(),
-    );
-  }
+  let t_total = span.elapsed();
+  span.finish(
+    SLOW_SPAN,
+    format_args!(
+      "{}",
+      SyncDetail {
+        origin,
+        key_queued,
+        windows: windows.len(),
+        reconciled,
+        settling: state
+          .native_sync
+          .windows
+          .values()
+          .filter(|entry| entry.settling())
+          .count(),
+        snapshot: t_snapshot,
+        order: t_order.saturating_sub(t_snapshot),
+        reconcile: t_total.saturating_sub(t_order),
+      }
+    ),
+  );
   Ok(())
 }
 
@@ -918,9 +927,13 @@ fn plan_animations<'a>(
       })
       .map(|window| (window.id(), window.native().id()))
       .collect::<Vec<_>>();
-    state
+    let capture_span = PerfSpan::start("pre_capture");
+    let result = state
       .animation_manager
-      .pre_capture(&captures, &state.dispatcher)?;
+      .pre_capture(&captures, &state.dispatcher);
+    capture_span
+      .finish(SLOW_SPAN, format_args!("windows={}", captures.len()));
+    result?;
   }
   Ok(plans)
 }
@@ -1102,53 +1115,76 @@ struct ReconcilePass<'a> {
 
 /// Records where one window's reconciliation spends its time.
 ///
-/// Inert unless debug logging is enabled. A pass that takes longer than
-/// `REPORT_AFTER` logs every span, so a slow commit names its native
-/// calls.
+/// Always on, so a slow pass is caught without debug logging. A pass that
+/// takes longer than `REPORT_AFTER` logs every span, so a slow commit
+/// names its native calls: at `INFO` from `perf::SLOW_CALL` on, otherwise
+/// at `DEBUG`.
 struct PassTimer {
-  started: Option<Instant>,
+  started: Instant,
+  calls: NativeCallSnapshot,
   last: Duration,
-  spans: Vec<(&'static str, Duration)>,
+  marks: [(&'static str, Duration); Self::MAX_MARKS],
+  len: usize,
 }
 
 impl PassTimer {
   /// A pass shorter than this is not reported.
   const REPORT_AFTER: Duration = Duration::from_millis(1);
 
-  /// Starts timing when debug logging is enabled.
+  /// Most marks a pass records; a pass makes fewer, and extra marks are
+  /// dropped. Fixed so that timing a pass never allocates.
+  const MAX_MARKS: usize = 32;
+
+  /// Starts timing a pass.
   fn start() -> Self {
     Self {
-      started: tracing::enabled!(tracing::Level::DEBUG).then(Instant::now),
+      started: Instant::now(),
+      calls: NativeCallStats::snapshot(),
       last: Duration::ZERO,
-      spans: Vec::new(),
+      marks: [("", Duration::ZERO); Self::MAX_MARKS],
+      len: 0,
     }
   }
 
   /// Ends the span since the previous mark, naming it `label`.
   fn mark(&mut self, label: &'static str) {
-    if let Some(started) = self.started {
-      let elapsed = started.elapsed();
-      self.spans.push((label, elapsed.saturating_sub(self.last)));
-      self.last = elapsed;
+    let elapsed = self.started.elapsed();
+    if let Some(slot) = self.marks.get_mut(self.len) {
+      *slot = (label, elapsed.saturating_sub(self.last));
+      self.len += 1;
     }
+    self.last = elapsed;
   }
 
   /// Logs the spans of a slow pass.
-  fn report(&self, id: &Uuid) {
-    if self.last < Self::REPORT_AFTER {
+  ///
+  /// `app` names the window's process. It is read only for a pass that is
+  /// reported, and from cached properties, so it never reaches the app.
+  fn report(&self, id: &Uuid, app: impl FnOnce() -> String) {
+    let slow = self.last >= SLOW_CALL;
+    if self.last < Self::REPORT_AFTER
+      || (!slow
+        && !tracing::enabled!(
+          target: perf::PERF_TARGET,
+          tracing::Level::DEBUG
+        ))
+    {
       return;
     }
-    let spans = self
-      .spans
+    let calls = NativeCallStats::snapshot().since(&self.calls);
+    let spans = self.marks[..self.len]
       .iter()
       .filter(|(_, span)| !span.is_zero())
       .map(|(label, span)| format!("{label}={}us", span.as_micros()))
       .collect::<Vec<_>>()
       .join(" ");
-    tracing::debug!(
-      window = %id,
-      "reconcile_slow total={}us {spans}",
-      self.last.as_micros()
+    perf::emit(
+      slow,
+      format_args!(
+        "reconcile_slow window={id} app={} total_ms={:.2} {spans} {calls}",
+        app(),
+        perf::millis(self.last),
+      ),
     );
   }
 }
@@ -2052,7 +2088,7 @@ fn reconcile_managed(
     entry.fullscreen = Some(fullscreen);
   }
   timer.mark("fullscreen");
-  timer.report(&id);
+  timer.report(&id, || window.native_properties().process_name);
   Ok(())
 }
 

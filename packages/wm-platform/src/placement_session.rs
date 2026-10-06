@@ -17,6 +17,8 @@ use crate::{
   Color, CornerStyle, NativeWindow, OpacityValue, Rect, WindowId,
   WindowZOrder,
 };
+#[cfg(target_os = "macos")]
+use crate::{NativeCall, NativeCallStats};
 #[cfg(target_os = "windows")]
 use crate::{NativeSession, NativeWindowWindowsExt};
 
@@ -125,6 +127,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let window_id = self.window()?.id();
+      NativeCallStats::record(NativeCall::WindowListSingle);
       let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionIncludingWindow,
         window_id.0,

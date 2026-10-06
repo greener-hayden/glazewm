@@ -28,6 +28,7 @@ use crate::{
     WindowContainer, Workspace, WorkspaceTarget,
   },
   pending_sync::PendingSync,
+  perf::{SyncOrigin, SyncTrigger},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
 };
@@ -214,7 +215,7 @@ impl WmState {
       self.pending_sync.queue_workspace_to_reorder(workspace);
     }
 
-    platform_sync(self, config)?;
+    platform_sync(self, config, SyncOrigin::new(SyncTrigger::Startup))?;
     self.has_initialized = true;
 
     Ok(())

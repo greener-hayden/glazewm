@@ -19,7 +19,8 @@ use crate::{
     self, ffi, is_stall, AXUIElement, AXUIElementExt, AXValueExt,
     Application,
   },
-  Dispatcher, Point, Rect, ThreadBound, WindowId,
+  Dispatcher, NativeCall, NativeCallStats, Point, Rect, ThreadBound,
+  WindowId,
 };
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -218,6 +219,7 @@ impl NativeWindow {
   /// application is busy or after it has exited. Trails the application's
   /// own destroy notification by a moment.
   fn exists_on_window_server(&self) -> bool {
+    NativeCallStats::record(NativeCall::WindowListSingle);
     CGWindowListCopyWindowInfo(
       CGWindowListOption::OptionIncludingWindow,
       self.id.0,
@@ -366,6 +368,7 @@ impl NativeWindow {
         el.get_attribute::<AXUIElement>("AXCloseButton")?;
 
       // Simulate pressing the window's close button.
+      NativeCallStats::record(NativeCall::AxAction);
       let result = unsafe {
         close_button.perform_action(&CFString::from_str("AXPress"))
       };
@@ -454,6 +457,7 @@ impl NativeWindow {
       // API. It's also the reason why the GlazeWM feature of bringing all
       // tiling/floating windows to the front on focus change is not
       // implemented for macOS.
+      NativeCallStats::record(NativeCall::AxAction);
       let result =
         unsafe { el.perform_action(&CFString::from_str("AXRaise")) };
 

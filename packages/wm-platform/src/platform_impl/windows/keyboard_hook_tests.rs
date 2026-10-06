@@ -32,7 +32,7 @@ fn probe(control: &InputControl, key: u32) {
 fn local_input(
   bindings: &[Keybinding],
   capacity: usize,
-) -> (InputState, Consumer<Arc<Keybinding>>) {
+) -> (InputState, Consumer<QueuedBinding>) {
   let (producer, consumer) = RingBuffer::new(capacity);
   (
     InputState {
@@ -55,8 +55,8 @@ fn input_matcher_transitions() {
   assert!(input.handle(0x87, true, &keys));
   assert!(input.handle(0x87, true, &keys));
   assert!(!input.handle(0x87, false, &keys));
-  assert_eq!(*output.pop().expect("First keydown."), first);
-  assert_eq!(*output.pop().expect("Repeated keydown."), first);
+  assert_eq!(*output.pop().expect("First keydown.").binding, first);
+  assert_eq!(*output.pop().expect("Repeated keydown.").binding, first);
   assert!(output.pop().is_err());
   input.control.enabled.store(false, Ordering::Release);
   assert!(!input.handle(0x87, true, &keys));
@@ -73,8 +73,14 @@ fn input_matcher_transitions() {
   assert!(!input.handle(0x87, true, &keys));
   assert!(input.handle(0x86, true, &keys));
   assert!(!input.handle(0x86, false, &keys));
-  assert_eq!(*output.pop().expect("Previous binding survives."), first);
-  assert_eq!(*output.pop().expect("Replacement binding fires."), second);
+  assert_eq!(
+    *output.pop().expect("Previous binding survives.").binding,
+    first
+  );
+  assert_eq!(
+    *output.pop().expect("Replacement binding fires.").binding,
+    second
+  );
 }
 
 /// Preserves accepted commands under bounded saturation.
@@ -104,11 +110,17 @@ fn input_transport_saturation() {
   assert_eq!(releases, [false, false]);
   assert_eq!(counts, (0, 0));
   assert_eq!(input.control.overflow.load(Ordering::Relaxed), 2);
-  assert_eq!(*output.pop().expect("First accepted command."), first);
-  assert_eq!(*output.pop().expect("Second accepted command."), second);
+  assert_eq!(
+    *output.pop().expect("First accepted command.").binding,
+    first
+  );
+  assert_eq!(
+    *output.pop().expect("Second accepted command.").binding,
+    second
+  );
   assert!(output.pop().is_err());
   assert!(input.handle(0x87, true, &keys));
-  assert_eq!(*output.pop().expect("Capacity recovers."), first);
+  assert_eq!(*output.pop().expect("Capacity recovers.").binding, first);
 }
 
 /// Bounds buffering even when Tokio stops consuming.
@@ -167,11 +179,14 @@ fn input_publication_coalesces() {
     .publish(Box::new(CompiledBindings::new(&[])))
     .expect("Retirement is reclaimed.");
   let queued = output.pop().expect("Old command remains queued.");
-  assert_eq!(*queued, first);
+  assert_eq!(*queued.binding, first);
   assert!(original.upgrade().is_some());
   drop(queued);
   assert!(original.upgrade().is_none());
-  assert_eq!(*output.pop().expect("New command remains queued."), last);
+  assert_eq!(
+    *output.pop().expect("New command remains queued.").binding,
+    last
+  );
 }
 
 /// Adopts complete tables during concurrent reload floods.

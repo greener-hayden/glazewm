@@ -30,7 +30,10 @@ use wm_platform::{
 };
 
 use crate::{
-  ipc_server::IpcServer, sys_tray::SystemTray, user_config::UserConfig,
+  ipc_server::IpcServer,
+  perf::{SyncOrigin, SyncTrigger},
+  sys_tray::SystemTray,
+  user_config::UserConfig,
   wm::WindowManager,
 };
 
@@ -43,6 +46,7 @@ mod layout_snapshot;
 mod models;
 mod native_reconciler;
 mod pending_sync;
+mod perf;
 mod placement;
 mod presentation;
 mod sys_tray;
@@ -177,6 +181,7 @@ async fn start_wm(
     &config.value.general.startup_commands.clone(),
     None,
     &mut config,
+    SyncOrigin::new(SyncTrigger::Startup),
   ) {
     tracing::error!("{:?}", err);
     dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
@@ -238,7 +243,7 @@ async fn start_wm(
         wm.process_event(PlatformEvent::Keybinding(event), &mut config)
       }
       () = wait_until(placement_deadline) => {
-        wm.recover_placement(&config)
+        wm.recover_placement(&config, SyncTrigger::Deadline)
       },
       _ = cleanup_interval.tick() => {
         let dropped = keybinding_listener.take_dropped();
@@ -328,6 +333,7 @@ async fn start_wm(
           &vec![InvokeCommand::WmReloadConfig],
           None,
           &mut config,
+          SyncOrigin::new(SyncTrigger::Other),
         ).map(|_| ())
       },
     };
@@ -407,6 +413,10 @@ fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
   let error_writer =
     tracing_appender::rolling::never(error_log_dir, "errors.log");
 
+  // Timing lines are logged under `perf::PERF_TARGET`, so they reach the
+  // stdout layer below at their own level. A dedicated file layer for them
+  // would be added here, filtered on that target.
+  //
   // Filter per layer rather than per writer. A writer filter formats
   // every event before discarding it, so each disabled `debug!` still
   // paid for its `Debug` output, including LaunchServices round trips

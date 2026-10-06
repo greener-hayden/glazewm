@@ -12,7 +12,8 @@ use objc2_foundation::{ns_string, NSNumber};
 
 use crate::{
   platform_impl::ffi, ConnectionState, Dispatcher, DisplayDeviceId,
-  DisplayId, MirroringState, Point, Rect, ThreadBound,
+  DisplayId, MirroringState, NativeCall, NativeCallStats, Point, Rect,
+  ThreadBound,
 };
 
 /// Platform-specific implementation of [`Display`].
@@ -360,6 +361,7 @@ pub(crate) fn all_displays(
 
     let mut displays = Vec::new();
 
+    NativeCallStats::record(NativeCall::ScreenEnumeration);
     for screen in NSScreen::screens(mtm) {
       let ns_screen = ThreadBound::new(screen, dispatcher.clone());
       displays.push(Display::new(ns_screen)?.into());
@@ -430,6 +432,7 @@ pub(crate) fn primary_display(
     // NOTE: `NSScreen::mainScreen` cannot be used as it returns the screen
     // with keyboard focus. The first screen in `NSScreen::screens` is
     // always the primary (i.e. the display containing the menu bar).
+    NativeCallStats::record(NativeCall::ScreenEnumeration);
     let ns_screen = ThreadBound::new(
       NSScreen::screens(mtm)
         .into_iter()

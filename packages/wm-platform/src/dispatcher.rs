@@ -5,6 +5,7 @@ use std::{
     Arc,
   },
   thread::ThreadId,
+  time::Instant,
 };
 
 #[cfg(target_os = "macos")]
@@ -49,7 +50,8 @@ use windows::{
 #[cfg(target_os = "macos")]
 use crate::platform_impl::Application;
 use crate::{
-  platform_impl, Display, DisplayDevice, MouseButton, NativeWindow, Point,
+  platform_impl, Display, DisplayDevice, MouseButton, NativeCallStats,
+  NativeWindow, Point,
 };
 
 /// Type alias for a closure to be executed by the event loop.
@@ -497,6 +499,7 @@ impl Dispatcher {
     }
 
     let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let hop_started = Instant::now();
 
     // TODO: Block until event loop source is set.
     self.source.as_ref().unwrap().send_dispatch_sync(move || {
@@ -507,9 +510,10 @@ impl Dispatcher {
       }
     })?;
 
-    result_rx
-      .recv_timeout(std::time::Duration::from_secs(5))
-      .map_err(crate::Error::ChannelRecv)
+    let result = result_rx.recv_timeout(std::time::Duration::from_secs(5));
+    NativeCallStats::record_hop(hop_started.elapsed());
+
+    result.map_err(crate::Error::ChannelRecv)
   }
 
   /// Gets the thread ID of the event loop thread.
@@ -786,7 +790,7 @@ impl std::fmt::Debug for Dispatcher {
 mod tests {
   use std::sync::{Arc, Mutex};
 
-  use crate::EventLoop;
+  use crate::{EventLoop, NativeCallStats};
 
   #[test]
   fn dispatch_after_stop_fails() {
@@ -871,6 +875,29 @@ mod tests {
     event_loop.run().unwrap();
 
     assert_eq!(*counter.lock().unwrap(), NUM_THREADS * ITERATIONS);
+  }
+
+  #[test]
+  fn dispatch_sync_counts_hops() {
+    let (event_loop, dispatcher) = EventLoop::new().unwrap();
+    let hops = Arc::new(Mutex::new((0, 0)));
+
+    let hops_clone = hops.clone();
+    std::thread::spawn(move || {
+      let before = NativeCallStats::snapshot();
+      dispatcher.dispatch_sync(|| {}).unwrap();
+      let spent = NativeCallStats::snapshot().since(&before);
+
+      *hops_clone.lock().unwrap() = (spent.hops, spent.hop_blocked_ns);
+      dispatcher.stop_event_loop().unwrap();
+    });
+
+    event_loop.run().unwrap();
+
+    // Other tests may hop meanwhile, so only a lower bound holds.
+    let (hops, blocked_ns) = *hops.lock().unwrap();
+    assert!(hops >= 1);
+    assert!(blocked_ns > 0);
   }
 
   #[test]

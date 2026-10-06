@@ -40,6 +40,7 @@ use crate::{
   },
   ipc_server::IpcServer,
   models::{Container, WorkspaceTarget},
+  perf::{SyncOrigin, SyncTrigger},
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
@@ -80,8 +81,25 @@ impl WindowManager {
       PlatformEvent::Window(event) => Some(event.notification().clone()),
       _ => None,
     };
-    self.apply_event(event, config)?;
-    Self::flush_pending_sync(&mut self.state, config)
+    let origin = Self::sync_origin(&event);
+    self.apply_event(event, config, origin)?;
+    Self::flush_pending_sync(&mut self.state, config, origin)
+  }
+
+  /// Gets what a sync caused by `event` is attributed to.
+  fn sync_origin(event: &PlatformEvent) -> SyncOrigin {
+    match event {
+      PlatformEvent::Window(_) => {
+        SyncOrigin::new(SyncTrigger::WindowEvent)
+      }
+      PlatformEvent::Keybinding(event) => {
+        SyncOrigin::key(event.received_at)
+      }
+      PlatformEvent::Mouse(_) => SyncOrigin::new(SyncTrigger::Mouse),
+      PlatformEvent::DisplaySettingsChanged => {
+        SyncOrigin::new(SyncTrigger::Topology)
+      }
+    }
   }
 
   /// Commits one bounded, ordered window-event batch.
@@ -90,16 +108,17 @@ impl WindowManager {
     batch: crate::event_batch::WindowBatch,
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
+    let origin = SyncOrigin::new(SyncTrigger::WindowEvent);
     let mut notifications = Vec::new();
     for event in batch.finish() {
       notifications.push(event.notification().clone());
       if let Err(err) =
-        self.apply_event(PlatformEvent::Window(event), config)
+        self.apply_event(PlatformEvent::Window(event), config, origin)
       {
         tracing::warn!("Window event failed: {err}");
       }
     }
-    let result = Self::flush_pending_sync(&mut self.state, config);
+    let result = Self::flush_pending_sync(&mut self.state, config, origin);
     // Placement has adopted managed sources. Dropping the remaining
     // notifications restores ignored windows and failed management.
     drop(notifications);
@@ -111,6 +130,7 @@ impl WindowManager {
     &mut self,
     event: PlatformEvent,
     config: &mut UserConfig,
+    origin: SyncOrigin,
   ) -> anyhow::Result<()> {
     let state = &mut self.state;
 
@@ -127,7 +147,7 @@ impl WindowManager {
         );
 
         if let Some(commands) = commands {
-          self.process_commands(&commands, None, config)?;
+          self.process_commands(&commands, None, config, origin)?;
         }
 
         // Return early since we don't want to redraw twice.
@@ -185,12 +205,13 @@ impl WindowManager {
   fn flush_pending_sync(
     state: &mut WmState,
     config: &UserConfig,
+    origin: SyncOrigin,
   ) -> anyhow::Result<()> {
     if !state.is_paused
       && (state.pending_sync.has_changes()
         || state.native_sync.has_pending())
     {
-      platform_sync(state, config)?;
+      platform_sync(state, config, origin.flushed())?;
     }
 
     Ok(())
@@ -200,13 +221,14 @@ impl WindowManager {
   pub fn recover_placement(
     &mut self,
     config: &UserConfig,
+    trigger: SyncTrigger,
   ) -> anyhow::Result<()> {
     self
       .state
       .native_sync
       .cleanup(&mut self.state.animation_manager);
     if !self.state.is_paused {
-      platform_sync(&mut self.state, config)?;
+      platform_sync(&mut self.state, config, SyncOrigin::new(trigger))?;
     }
     Ok(())
   }
@@ -241,7 +263,7 @@ impl WindowManager {
     for id in self.state.animation_manager.take_failures() {
       self.state.native_sync.cancel_presentation(id);
     }
-    self.recover_placement(config)
+    self.recover_placement(config, SyncTrigger::Tick)
   }
 
   pub fn process_commands(
@@ -249,6 +271,7 @@ impl WindowManager {
     commands: &Vec<InvokeCommand>,
     subject_container_id: Option<Uuid>,
     config: &mut UserConfig,
+    origin: SyncOrigin,
   ) -> anyhow::Result<Uuid> {
     let state = &mut self.state;
 
@@ -270,7 +293,7 @@ impl WindowManager {
     )?;
 
     if state.pending_sync.has_changes() {
-      platform_sync(state, config)?;
+      platform_sync(state, config, origin)?;
     }
 
     Ok(new_subject_container_id)
@@ -882,7 +905,11 @@ impl WindowManager {
 
     state.commit_pending_follow(config)?;
 
-    Self::flush_pending_sync(state, config)
+    Self::flush_pending_sync(
+      state,
+      config,
+      SyncOrigin::new(SyncTrigger::Follow),
+    )
   }
 
   /// Runs cleanup tasks when the WM is exiting.
@@ -902,6 +929,7 @@ impl WindowManager {
       &config.value.general.shutdown_commands.clone(),
       None,
       config,
+      SyncOrigin::new(SyncTrigger::Other),
     ) {
       tracing::warn!("Failed to run shutdown commands: {:?}", err);
     }

@@ -20,6 +20,7 @@ use wm_common::{
 };
 
 use crate::{
+  perf::{SyncOrigin, SyncTrigger},
   traits::{CommonGetters, TilingDirectionGetters},
   user_config::UserConfig,
   wm::WindowManager,
@@ -251,6 +252,7 @@ impl IpcServer {
           &vec![command],
           subject_container_id,
           config,
+          SyncOrigin::new(SyncTrigger::Ipc),
         )?;
 
         ClientResponseData::Command(CommandData {

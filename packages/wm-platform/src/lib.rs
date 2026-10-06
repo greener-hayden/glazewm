@@ -18,6 +18,7 @@ mod input_test_allocator;
 mod keybinding_listener;
 mod models;
 mod mouse_listener;
+mod native_call_stats;
 mod native_window;
 #[cfg(target_os = "windows")]
 mod opening_windows;
@@ -51,6 +52,7 @@ pub use frame_clock::*;
 pub use keybinding_listener::*;
 pub use models::*;
 pub use mouse_listener::*;
+pub use native_call_stats::*;
 pub use native_window::*;
 pub use placement_session::*;
 pub use platform_event::*;

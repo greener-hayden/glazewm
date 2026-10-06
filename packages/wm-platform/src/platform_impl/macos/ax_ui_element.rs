@@ -3,7 +3,7 @@ use std::ptr::{self, NonNull};
 pub use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::{CFRetained, CFString, CFType};
 
-use crate::Error;
+use crate::{Error, NativeCall, NativeCallStats};
 
 /// Extension trait for [`AXUIElement`].
 pub trait AXUIElementExt {
@@ -36,6 +36,7 @@ impl AXUIElementExt for AXUIElement {
     &self,
     attribute: &str,
   ) -> crate::Result<CFRetained<T>> {
+    NativeCallStats::record(NativeCall::AxRead);
     let mut value: *const CFType = ptr::null();
 
     let result = unsafe {
@@ -66,6 +67,7 @@ impl AXUIElementExt for AXUIElement {
     attribute: &str,
     value: &CFRetained<T>,
   ) -> crate::Result<()> {
+    NativeCallStats::record(NativeCall::AxWrite);
     let cf_attribute = CFString::from_str(attribute);
     let result =
       unsafe { self.set_attribute_value(&cf_attribute, value.as_ref()) };
@@ -104,5 +106,23 @@ mod tests {
     let result = el.set_attribute("AXDefinitelyNotARealAttribute", &value);
 
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn attribute_access_is_counted() {
+    let pid = i32::try_from(std::process::id()).expect("pid overflow");
+    let el = unsafe { AXUIElement::new_application(pid) };
+    let before = NativeCallStats::snapshot();
+
+    // Failures count too: the call was still attempted.
+    let _ = el.get_attribute::<CFString>("AXDefinitelyNotARealAttribute");
+    let _ = el.set_attribute(
+      "AXDefinitelyNotARealAttribute",
+      &CFString::from_str("dummy"),
+    );
+
+    let spent = NativeCallStats::snapshot().since(&before);
+    assert!(spent.ax_reads >= 1);
+    assert!(spent.ax_writes >= 1);
   }
 }

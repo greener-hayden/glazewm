@@ -5,6 +5,7 @@ use std::{
     Arc, Mutex, TryLockError,
   },
   thread::{self, JoinHandle},
+  time::Instant,
 };
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -219,10 +220,17 @@ impl InputControl {
   }
 }
 
+/// A matched binding on its way from the hook to Tokio.
+struct QueuedBinding {
+  binding: Arc<Keybinding>,
+  /// When the hook matched the key press.
+  received_at: Instant,
+}
+
 /// Mutable state accessed only between native callbacks.
 struct InputState {
   table: Box<CompiledBindings>,
-  producer: Producer<Arc<Keybinding>>,
+  producer: Producer<QueuedBinding>,
   control: Arc<InputControl>,
 }
 
@@ -263,7 +271,13 @@ impl InputState {
     self.control.suppressed.fetch_add(1, Ordering::Relaxed);
     if self.producer.is_full() {
       self.control.overflow.fetch_add(1, Ordering::Relaxed);
-    } else if self.producer.push(Arc::clone(binding)).is_err()
+    } else if self
+      .producer
+      .push(QueuedBinding {
+        binding: Arc::clone(binding),
+        received_at: Instant::now(),
+      })
+      .is_err()
       || !self.control.output.set()
     {
       self.control.fail(FAILED);
@@ -446,7 +460,7 @@ fn run_input(
 
 /// Bridges into Tokio away from input delivery.
 fn relay_input(
-  mut consumer: Consumer<Arc<Keybinding>>,
+  mut consumer: Consumer<QueuedBinding>,
   sender: &mpsc::Sender<KeybindingEvent>,
   control: &InputControl,
 ) {
@@ -454,9 +468,12 @@ fn relay_input(
     if control.stopping.load(Ordering::Acquire) {
       break;
     }
-    if let Ok(binding) = consumer.pop() {
+    if let Ok(queued) = consumer.pop() {
       if sender
-        .blocking_send(KeybindingEvent((*binding).clone()))
+        .blocking_send(KeybindingEvent::received_at(
+          (*queued.binding).clone(),
+          queued.received_at,
+        ))
         .is_err()
       {
         if !control.stopping.load(Ordering::Acquire) {

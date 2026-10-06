@@ -410,7 +410,7 @@ impl UserConfig {
   ) -> Option<Vec<InvokeCommand>> {
     self
       .active_keybinding_configs(modes, paused)
-      .find(|config| config.bindings.contains(&event.0))
+      .find(|config| config.bindings.contains(&event.binding))
       .map(|config| config.commands)
   }
 

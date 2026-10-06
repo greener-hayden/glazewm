@@ -7,12 +7,38 @@ use crate::{
     sort_monitors, update_monitor,
   },
   models::{Monitor, NativeMonitorProperties},
+  perf::{PerfSpan, SLOW_SPAN},
   traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
 };
 
+/// Reconciles WM monitors with the displays the OS now reports.
+///
+/// Logs how long the topology change took, and the native calls it made,
+/// under the `perf` target.
 pub fn handle_display_settings_changed(
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let span = PerfSpan::start("handle_display_settings_changed");
+  let result = apply_display_settings_changed(state, config);
+
+  span.finish(
+    SLOW_SPAN,
+    format_args!(
+      "monitors={} ok={}",
+      state.monitors().len(),
+      result.is_ok()
+    ),
+  );
+
+  result
+}
+
+/// Applies a display settings change, unless nothing monitor-related
+/// changed.
+fn apply_display_settings_changed(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {

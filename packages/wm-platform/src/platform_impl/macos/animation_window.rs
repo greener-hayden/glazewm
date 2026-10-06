@@ -26,8 +26,8 @@ use objc2_quartz_core::{
 };
 
 use crate::{
-  companion, Dispatcher, EasingFunction, NativeWindow, OpacityValue, Rect,
-  ThreadBound, WindowId,
+  companion, Dispatcher, EasingFunction, NativeCall, NativeCallStats,
+  NativeWindow, OpacityValue, Rect, ThreadBound, WindowId,
 };
 
 /// Process whose on-screen windows decorate managed windows.
@@ -647,6 +647,7 @@ impl CapturedFrame {
     // NOTE: `CGWindowListCreateImage` is deprecated, but functional.
     // ScreenCaptureKit is recommended instead, see:
     // https://developer.apple.com/documentation/screencapturekit/scwindow
+    NativeCallStats::record(NativeCall::ScreenCapture);
     let image = CGWindowListCreateImage(
       cg_rect_null,
       CGWindowListOption::OptionIncludingWindow,
@@ -714,6 +715,7 @@ impl CapturedFrame {
 
     // SAFETY: The array holds window IDs, as the function requires.
     // Nominal resolution for the reason given in `alone`.
+    NativeCallStats::record(NativeCall::ScreenCapture);
     let image = unsafe {
       CGWindowListCreateImageFromArray(
         bounds.clone().into(),
@@ -743,6 +745,7 @@ struct ListedWindow {
 /// Windows the server describes incompletely are skipped. Returns `None`
 /// when the list itself is unavailable.
 fn on_screen_windows() -> Option<Vec<ListedWindow>> {
+  NativeCallStats::record(NativeCall::WindowListFull);
   let windows =
     CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, 0)?;
   // SAFETY: Window services returns dictionaries with string keys and

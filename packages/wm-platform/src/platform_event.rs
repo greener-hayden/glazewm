@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::NativeWindow;
 use crate::{
   platform_impl::WindowEventNotificationInner, Keybinding, MouseEventKind,
@@ -123,8 +125,34 @@ pub struct WindowEventNotification(
   pub Option<WindowEventNotificationInner>,
 );
 
+/// A keybinding that the platform keyboard hook matched.
 #[derive(Clone, Debug)]
-pub struct KeybindingEvent(pub Keybinding);
+pub struct KeybindingEvent {
+  /// The keybinding that was pressed.
+  pub binding: Keybinding,
+  /// When the keyboard hook matched the key press.
+  ///
+  /// Marks the start of key-to-redraw latency, so it is stamped in the
+  /// hook rather than when the event is received.
+  pub received_at: Instant,
+}
+
+impl KeybindingEvent {
+  /// Creates an event for a binding matched right now.
+  #[must_use]
+  pub fn new(binding: Keybinding) -> Self {
+    Self::received_at(binding, Instant::now())
+  }
+
+  /// Creates an event for a binding matched at `received_at`.
+  #[must_use]
+  pub fn received_at(binding: Keybinding, received_at: Instant) -> Self {
+    Self {
+      binding,
+      received_at,
+    }
+  }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MouseButton {

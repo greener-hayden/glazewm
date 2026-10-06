@@ -29,9 +29,9 @@ fn shortcut(command: InvokeCommand) -> KeybindingConfig {
 fn input_compatibility_paused() {
   let mut config = config();
   let shortcut = shortcut(InvokeCommand::WmExit);
-  let event = KeybindingEvent(shortcut.bindings[0].clone());
+  let event = KeybindingEvent::new(shortcut.bindings[0].clone());
   config.value.keybindings = vec![shortcut];
-  assert!(config.listener_bindings(&[]).contains(&event.0));
+  assert!(config.listener_bindings(&[]).contains(&event.binding));
   assert!(config.keybinding_commands(&event, &[], true).is_none());
   config.value.keybindings[0].commands =
     vec![InvokeCommand::WmTogglePause];
@@ -46,7 +46,7 @@ fn input_compatibility_paused() {
 fn input_compatibility_consumption() {
   let mut config = config();
   let shortcut = shortcut(InvokeCommand::WmExit);
-  let queued = KeybindingEvent(shortcut.bindings[0].clone());
+  let queued = KeybindingEvent::new(shortcut.bindings[0].clone());
   config.value.keybindings = vec![shortcut];
   config.value.keybindings[0].commands =
     vec![InvokeCommand::WmReloadConfig];

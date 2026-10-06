@@ -662,6 +662,20 @@ fn tick_due<'a>(
   lowest_gate.is_some_and(|gate| presented > gate)
 }
 
+/// Whether an event starts a sync.
+///
+/// An event syncs only when it changed something: `changed` is whether
+/// the window manager's state has queued changes, and `queued` whether
+/// the coordinator has been asked for a commit (see
+/// `PlacementCoordinator::has_queued_work`). Work that is merely settling
+/// does not start a sync here, so an unrelated event never pays for a
+/// pass over every window. Whatever settling state a window can be in
+/// must wake itself (see `PlacementCoordinator::deadline` and
+/// `tick_due`), or it waits for the next change.
+pub fn should_flush(paused: bool, changed: bool, queued: bool) -> bool {
+  !paused && (changed || queued)
+}
+
 /// Serializes application-window mutation decisions.
 #[derive(Default)]
 pub struct PlacementCoordinator {
@@ -854,16 +868,18 @@ impl PlacementCoordinator {
     }
   }
 
-  /// Returns outstanding verification and command work.
-  pub fn has_pending(&self) -> bool {
-    self.layout_dirty
-      || !self.dirty.is_empty()
-      || !self.cleanup_overlays.is_empty()
-      || self.focus.is_some()
-      || self
-        .windows
-        .values()
-        .any(|window| window.retired || window.settling())
+  /// Whether a commit has been asked for since the last sync.
+  ///
+  /// Only requests count: a layout redraw or a window queued for fresh
+  /// observation. State that is still settling does not: a frame write,
+  /// a cover, a fence, a retired window and an overlay cleanup each wake
+  /// themselves by a deadline (`deadline`) or a frame tick (`tick_due`).
+  /// Native focus has no wake of its own: it applies in whichever pass
+  /// runs once its blockers clear, so a new focus blocker must wake
+  /// itself the same way. Counting settling state here would start a
+  /// sync on every unrelated event while anything settles.
+  pub fn has_queued_work(&self) -> bool {
+    self.layout_dirty || !self.dirty.is_empty()
   }
 
   /// Cancels operations and restores surviving windows.
@@ -2808,7 +2824,7 @@ mod tests {
 
     coordinator.overlay_retired(id);
 
-    assert!(coordinator.has_pending());
+    assert!(coordinator.has_queued_work());
     assert!(coordinator.deadline(false).unwrap() <= Instant::now());
     assert!(coordinator.deadline(true).is_none());
     assert!(coordinator.deferred_moves.contains(&id));
@@ -2833,8 +2849,55 @@ mod tests {
   fn retiring_cover_without_deferred_move_needs_no_followup() {
     let mut coordinator = PlacementCoordinator::default();
     coordinator.overlay_retired(Uuid::new_v4());
-    assert!(!coordinator.has_pending());
+    assert!(!coordinator.has_queued_work());
     assert!(coordinator.deadline(false).is_none());
+  }
+
+  /// An event syncs for a change or a queued commit, never while paused,
+  /// and never for work that is merely settling.
+  #[test]
+  fn an_event_syncs_only_for_a_change() {
+    // (paused, changed, queued, syncs)
+    for (paused, changed, queued, syncs) in [
+      (false, false, false, false),
+      (false, true, false, true),
+      (false, false, true, true),
+      (false, true, true, true),
+      (true, true, true, false),
+      (true, false, false, false),
+    ] {
+      assert_eq!(
+        should_flush(paused, changed, queued),
+        syncs,
+        "paused {paused}, changed {changed}, queued {queued}"
+      );
+    }
+  }
+
+  /// Work that waits on a deadline starts no sync from an event, and a
+  /// request for a commit does.
+  #[test]
+  fn queued_work_is_requests_not_settling() {
+    let mut coordinator = PlacementCoordinator::default();
+    let id = Uuid::new_v4();
+    assert!(!coordinator.has_queued_work());
+
+    // A pending focus waits for its blockers, which wake themselves.
+    coordinator.focus = Some(id);
+    assert!(!coordinator.has_queued_work());
+
+    // A released window's overlay is retired by `cleanup_at`.
+    coordinator.release(id, false);
+    assert!(!coordinator.has_queued_work());
+    assert!(coordinator.cleanup_overlays.contains(&id));
+    assert!(coordinator.deadline(false).is_some());
+    assert!(coordinator.deadline(true).is_some());
+
+    coordinator.layout_dirty = true;
+    assert!(coordinator.has_queued_work());
+    coordinator.layout_dirty = false;
+    coordinator.dirty.insert(id);
+    assert!(coordinator.has_queued_work());
   }
 
   /// Native ownership never requests source concealment.
@@ -3536,6 +3599,59 @@ mod tick_due_tests {
       }
       mid_slide
     }
+
+    /// Drives due ticks, with one event after each.
+    ///
+    /// Every `CHANGE_EVERY`th event changes something; the others change
+    /// nothing, as a title change or a clock-driven echo does. `rule`
+    /// decides whether an event syncs, given whether it changed something
+    /// and whether any window settles. Returns the syncs events started.
+    fn run_with_events(&mut self, rule: EventRule) -> u64 {
+      let mut from_events = 0;
+      let mut events = 0;
+      while self.clock_runs() {
+        self.presented += 1;
+        assert!(self.presented < 200, "The slide never ends.");
+        if self.due() {
+          self.sync();
+        }
+        events += 1;
+        let changed = events % CHANGE_EVERY == 0;
+        let settling = self
+          .windows
+          .iter()
+          .any(|window| window.parts.view().settling());
+        if rule.syncs(changed, settling) {
+          from_events += 1;
+          self.sync();
+        }
+      }
+      from_events
+    }
+  }
+
+  /// How often a simulated event changes something.
+  const CHANGE_EVERY: u64 = 5;
+
+  /// Which events start a sync in a simulation.
+  #[derive(Clone, Copy)]
+  enum EventRule {
+    /// The rule before `should_flush`, as far as the simulation can
+    /// tell: a change, or any window settling. It has no focus, retired
+    /// window or overlay cleanup to count.
+    ChangedOrSettling,
+    /// `should_flush`, the rule the window manager uses.
+    Changed,
+  }
+
+  impl EventRule {
+    /// Whether an event syncs.
+    fn syncs(self, changed: bool, settling: bool) -> bool {
+      match self {
+        Self::ChangedOrSettling => changed || settling,
+        Self::Changed => should_flush(false, changed, false),
+      }
+    }
   }
 
   /// Syncing only on due ticks moves every state at the frame syncing on
@@ -3585,5 +3701,43 @@ mod tick_due_tests {
       every.syncs, sparse.syncs
     );
     assert!(sparse.syncs * 2 < every.syncs);
+  }
+
+  /// Events sync only for a change, yet every state moves at the frame
+  /// it does when each event syncs while a window settles.
+  #[test]
+  fn events_that_change_nothing_do_not_move_the_slide() {
+    for delays in [vec![1], vec![1, 2, 3], vec![3, 3, 1, 2], vec![5, 1]] {
+      let mut settling = Slide::start(&delays);
+      let mut changed = Slide::start(&delays);
+      let mut baseline = Slide::start(&delays);
+      let settling_events =
+        settling.run_with_events(EventRule::ChangedOrSettling);
+      let changed_events = changed.run_with_events(EventRule::Changed);
+      baseline.run(false);
+      assert!(changed_events < settling_events, "delays {delays:?}");
+      assert_eq!(settling.log, changed.log, "delays {delays:?}");
+      assert_eq!(baseline.log, changed.log, "delays {delays:?}");
+    }
+  }
+
+  /// Syncs a simulated slide takes when an event follows every tick and
+  /// one in five changes something.
+  #[test]
+  fn events_that_change_nothing_cut_the_syncs_of_a_slide() {
+    let delays = [1, 2, 3];
+    let mut before = Slide::start(&delays);
+    let mut after = Slide::start(&delays);
+    let before_events =
+      before.run_with_events(EventRule::ChangedOrSettling);
+    let after_events = after.run_with_events(EventRule::Changed);
+    eprintln!(
+      "20-frame slide, 3 windows, one event per tick, one in \
+       {CHANGE_EVERY} changing something: before = {} syncs \
+       ({before_events} from events), after = {} syncs ({after_events} \
+       from events)",
+      before.syncs, after.syncs
+    );
+    assert!(after.syncs < before.syncs);
   }
 }

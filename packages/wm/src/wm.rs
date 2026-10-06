@@ -202,15 +202,19 @@ impl WindowManager {
   }
 
   /// Flushes queued state changes to the OS, unless the WM is paused.
+  ///
+  /// Settling work does not start a flush; see
+  /// `placement::should_flush`.
   fn flush_pending_sync(
     state: &mut WmState,
     config: &UserConfig,
     origin: SyncOrigin,
   ) -> anyhow::Result<()> {
-    if !state.is_paused
-      && (state.pending_sync.has_changes()
-        || state.native_sync.has_pending())
-    {
+    if crate::placement::should_flush(
+      state.is_paused,
+      state.pending_sync.has_changes(),
+      state.native_sync.has_queued_work(),
+    ) {
       platform_sync(state, config, origin.flushed())?;
     }
 

@@ -42,6 +42,22 @@ pub enum ConcealMethod {
   Park,
 }
 
+/// One reading of a window's native geometry and state.
+///
+/// Returned by [`PlacementSession::observe`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeObservation {
+  /// Native rectangle in placement coordinates.
+  pub rect: Rect,
+  /// Placement coordinate scale of the window.
+  pub dpi: u32,
+  /// Whether the window is minimized.
+  pub minimized: bool,
+  /// Whether the window is maximized. `false` while minimized, which is
+  /// then not read.
+  pub maximized: bool,
+}
+
 /// Owns recoverable native placement and source visibility mutations.
 ///
 /// Overlay lifetime and animation clocks belong to the presentation
@@ -126,7 +142,10 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      let window_id = self.window()?.id();
+      // The window server answers for a window that no longer exists with
+      // an empty list, so a dead window still fails here without an
+      // accessibility round trip to validate it first.
+      let window_id = self.native.id();
       NativeCallStats::record(NativeCall::WindowListSingle);
       let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionIncludingWindow,
@@ -165,6 +184,36 @@ impl PlacementSession {
     }
   }
 
+  /// Reads the window's current geometry and minimized/maximized state.
+  ///
+  /// Fails if the window is gone, as every read it makes would.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: validates ownership once up front, and the frame and DPI
+  ///   reads each validate again.
+  /// - macOS: makes no validation read of its own: the window server
+  ///   lookup and each state read already fail for a dead window, and
+  ///   callers validate once per pass. This is one window server lookup
+  ///   and two accessibility reads, one while minimized.
+  pub fn observe(&self) -> crate::Result<NativeObservation> {
+    #[cfg(target_os = "windows")]
+    let window = self.window()?;
+    #[cfg(target_os = "macos")]
+    let window = &self.native;
+
+    let rect = self.observed_frame()?;
+    let dpi = self.dpi()?;
+    let minimized = window.is_minimized()?;
+
+    Ok(NativeObservation {
+      rect,
+      dpi,
+      minimized,
+      maximized: !minimized && window.is_maximized()?,
+    })
+  }
+
   /// Observes native visibility, including Windows compositor cloaking.
   pub fn is_visible(&self) -> crate::Result<bool> {
     self.window()?.is_visible()
@@ -178,7 +227,6 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
       Ok(1)
     }
   }
@@ -286,7 +334,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = value;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -299,7 +347,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = visible;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -318,7 +366,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = (border, corner);
-      self.validate()
+      Ok(())
     }
   }
 
@@ -334,7 +382,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = visible;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -347,7 +395,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = fullscreen;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -360,7 +408,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = order;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -385,7 +433,6 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = (order, in_front);
-      self.validate()?;
       Ok(true)
     }
   }
@@ -399,7 +446,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = visible;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -417,7 +464,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = presenting;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -436,7 +483,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = decorated;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -454,7 +501,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = focused;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -466,7 +513,6 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
       Ok(false)
     }
   }
@@ -480,7 +526,7 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = hidden;
-      self.validate()
+      Ok(())
     }
   }
 
@@ -492,7 +538,6 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
       *self.recovery_frame.borrow_mut() = Some(target.clone());
       Ok(())
     }
@@ -519,7 +564,6 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
       self.recovery_frame.borrow_mut().take();
       Ok(())
     }
@@ -559,7 +603,6 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
       Ok(None)
     }
   }
@@ -611,5 +654,216 @@ impl PlacementSession {
         &CFBoolean::new(value).into(),
       )
     })?
+  }
+}
+
+/// Call-count tests: each asserts how many native calls a method makes,
+/// read off [`NativeCallStats`].
+///
+/// They use a real event loop, so the closures behind each element run in
+/// place on the harness's main thread and count their attempts. The
+/// counters record attempts, not successes, so an element that answers
+/// nothing still shows what a method tries. The counters are
+/// process-wide, so these hold only under `--test-threads=1`.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+  use std::sync::{Arc, OnceLock};
+
+  use objc2_app_kit::NSRunningApplication;
+  use objc2_application_services::AXUIElement;
+  use objc2_core_foundation::{CFNumber, CFRetained};
+  use objc2_core_graphics::kCGWindowNumber;
+
+  use super::*;
+  use crate::{
+    platform_impl, CornerStyle, Dispatcher, EventLoop, NativeCallSnapshot,
+    ThreadBound,
+  };
+
+  /// Builds a session over `element` for the window server's `window_id`.
+  fn session(
+    dispatcher: &Dispatcher,
+    window_id: WindowId,
+    element: impl Fn() -> CFRetained<AXUIElement>,
+  ) -> PlacementSession {
+    let application = platform_impl::Application {
+      pid: 0,
+      dispatcher: dispatcher.clone(),
+      ns_app: NSRunningApplication::currentApplication(),
+      ax_element: Arc::new(ThreadBound::new(
+        element(),
+        dispatcher.clone(),
+      )),
+      enhanced_ui: Arc::new(OnceLock::new()),
+    };
+
+    let window = platform_impl::NativeWindow::new(
+      window_id,
+      ThreadBound::new(RefCell::new(element()), dispatcher.clone()),
+      application,
+    );
+
+    PlacementSession {
+      native: window.into(),
+      recovery_frame: RefCell::new(None),
+    }
+  }
+
+  /// A session method call that reports whether it succeeded.
+  type Call<'a> = Box<dyn Fn() -> bool + 'a>;
+
+  /// An element for a pid that owns nothing, which fails every call at
+  /// once with `InvalidUIElement`.
+  fn dead_element() -> CFRetained<AXUIElement> {
+    // SAFETY: Creating an element for an invalid pid always succeeds;
+    // only operations on it fail.
+    unsafe { AXUIElement::new_application(0) }
+  }
+
+  /// The system-wide element, which has no window attributes.
+  ///
+  /// Every window attribute read on it fails without reaching an
+  /// application, and not with `InvalidUIElement`, so the window server
+  /// decides whether a window is valid.
+  fn system_wide_element() -> CFRetained<AXUIElement> {
+    // SAFETY: Creating the system-wide element always succeeds.
+    unsafe { AXUIElement::new_system_wide() }
+  }
+
+  /// Gets the ID of some window the window server lists, or `None` on a
+  /// desktop with none.
+  ///
+  /// Only its existence matters: it is never read or written beyond the
+  /// window server's single-window lookup.
+  fn listed_window_id() -> Option<WindowId> {
+    let windows = CGWindowListCopyWindowInfo(
+      CGWindowListOption::OptionOnScreenOnly,
+      0,
+    )?;
+    // SAFETY: Window services returns dictionaries with string keys and
+    // Core Foundation values, retaining all of those objects.
+    let windows = unsafe {
+      windows.cast_unchecked::<CFDictionary<CFString, CFType>>()
+    };
+
+    (0..windows.len()).find_map(|index| {
+      let info = windows.get(index)?;
+      // SAFETY: The framework provides this immutable dictionary key.
+      let number = info
+        .get(unsafe { kCGWindowNumber })?
+        .downcast_ref::<CFNumber>()?
+        .as_i32()?;
+      u32::try_from(number).ok().map(WindowId)
+    })
+  }
+
+  /// Runs `call` and returns what it counted.
+  fn counted<T>(call: impl FnOnce() -> T) -> (T, NativeCallSnapshot) {
+    let before = NativeCallStats::snapshot();
+    let result = call();
+    (result, NativeCallStats::snapshot().since(&before))
+  }
+
+  #[test]
+  fn validate_attempts_an_ax_read() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), dead_element);
+
+    let (result, spent) = counted(|| session.validate());
+
+    // The control for the tests below: this is what a validation costs.
+    assert!(result.is_err());
+    assert_eq!(spent.ax_reads, 1);
+  }
+
+  #[test]
+  fn no_op_methods_make_no_native_calls() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), dead_element);
+    let rect = Rect::from_xy(0, 0, 10, 10);
+
+    let calls: Vec<(&str, Call)> = vec![
+      ("dpi", Box::new(|| session.dpi().is_ok())),
+      ("expected_dpi", Box::new(|| session.expected_dpi(1).is_ok())),
+      ("opacity", Box::new(|| session.opacity(None).is_ok())),
+      ("title_bar", Box::new(|| session.title_bar(None).is_ok())),
+      (
+        "set_decorations",
+        Box::new(|| {
+          session.set_decorations(None, &CornerStyle::Default).is_ok()
+        }),
+      ),
+      (
+        "set_taskbar_visibility",
+        Box::new(|| session.set_taskbar_visibility(true).is_ok()),
+      ),
+      (
+        "mark_fullscreen",
+        Box::new(|| session.mark_fullscreen(false).is_ok()),
+      ),
+      (
+        "set_z_order",
+        Box::new(|| session.set_z_order(&WindowZOrder::Normal).is_ok()),
+      ),
+      (
+        "has_z_order",
+        Box::new(|| {
+          session.has_z_order(&WindowZOrder::Normal, &[]).is_ok()
+        }),
+      ),
+      ("show", Box::new(|| session.show(true).is_ok())),
+      ("present", Box::new(|| session.present(true).is_ok())),
+      (
+        "mark_decorated",
+        Box::new(|| session.mark_decorated(true).is_ok()),
+      ),
+      (
+        "mark_focused",
+        Box::new(|| session.mark_focused(true).is_ok()),
+      ),
+      ("is_cloaked", Box::new(|| session.is_cloaked().is_ok())),
+      ("cloak", Box::new(|| session.cloak(true).is_ok())),
+      (
+        "remember_restore",
+        Box::new(|| session.remember_restore(&rect).is_ok()),
+      ),
+      ("unpark", Box::new(|| session.unpark().is_ok())),
+      ("minimum_size", Box::new(|| session.minimum_size().is_ok())),
+    ];
+
+    for (name, call) in calls {
+      let (succeeded, spent) = counted(&call);
+
+      assert!(succeeded, "`{name}` failed.");
+      assert_eq!(
+        spent,
+        NativeCallSnapshot::default(),
+        "`{name}` made native calls."
+      );
+    }
+  }
+
+  #[test]
+  fn observing_a_listed_window_makes_no_validation_calls() {
+    let Some(window_id) = listed_window_id() else {
+      eprintln!("No listed window to observe; skipping.");
+      return;
+    };
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, window_id, system_wide_element);
+
+    let (result, spent) = counted(|| session.observe());
+
+    // The element has no window attributes, so the observation stops at
+    // its first state read. Up to there it is one window server lookup
+    // and that read; each validation would add an `AXRole` read, and
+    // there were three before the observation stopped making them.
+    assert!(matches!(
+      &result,
+      Err(crate::Error::Accessibility(attribute, _))
+        if attribute == "AXMinimized"
+    ));
+    assert_eq!(spent.ax_reads, 1);
+    assert_eq!(spent.window_list_single, 1);
   }
 }

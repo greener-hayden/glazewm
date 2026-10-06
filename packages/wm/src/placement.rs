@@ -1192,13 +1192,13 @@ impl PassTimer {
 /// Reads current geometry rather than treating a successful write as
 /// completion.
 fn observe(native: &PlacementSession) -> anyhow::Result<ObservedFrame> {
-  let window = native.window()?;
+  let observation = native.observe()?;
   Ok(ObservedFrame {
-    rect: native.observed_frame()?,
-    dpi: native.dpi()?,
-    state: if window.is_minimized()? {
+    rect: observation.rect,
+    dpi: observation.dpi,
+    state: if observation.minimized {
       NativeState::Minimized
-    } else if window.is_maximized()? {
+    } else if observation.maximized {
       NativeState::Maximized
     } else {
       NativeState::Normal

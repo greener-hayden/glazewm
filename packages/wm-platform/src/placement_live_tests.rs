@@ -347,8 +347,9 @@ fn check_decorations(opening: bool) {
   assert!(baseline[1].contains(&0), "Fixture lacks rounded corners.");
   let context =
     AnimationContext::new(&dispatcher).expect("Context creation failed.");
-  let capture =
-    context.capture_frame(native.id()).expect("Capture failed.");
+  let capture = context
+    .capture_frame(native.id(), &crate::OnScreenWindows::new())
+    .expect("Capture failed.");
   if opening {
     session
       .opacity(Some(OpacityValue(0.0)))
@@ -614,8 +615,9 @@ fn live_slide_overlay_pixels() {
     .expect("Source claim failed.");
   let context =
     AnimationContext::new(&dispatcher).expect("Context creation failed.");
-  let capture =
-    context.capture_frame(native.id()).expect("Capture failed.");
+  let capture = context
+    .capture_frame(native.id(), &crate::OnScreenWindows::new())
+    .expect("Capture failed.");
   let (sender, receiver) = mpsc::channel();
   let _clock =
     FrameClock::start(60, move |signal| sender.send(signal).is_ok());
@@ -888,7 +890,7 @@ fn live_source_overlay_handoff(pixels: bool, opening: bool) {
   let context =
     AnimationContext::new(&dispatcher).expect("Context creation failed.");
   let capture = context
-    .capture_frame(native.id())
+    .capture_frame(native.id(), &crate::OnScreenWindows::new())
     .expect("Capture preparation failed.");
   let (sender, receiver) = mpsc::channel();
   let _clock =

@@ -45,6 +45,13 @@ const MAX_COMPANIONS: usize = 8;
 /// overlay; failures in between are logged at debug level.
 const WARN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Platform-specific implementation of [`OnScreenWindows`].
+///
+/// Holds nothing on Windows; companions are found through their own
+/// handles, not through a window list.
+#[derive(Default)]
+pub(crate) struct OnScreenWindows;
+
 /// Platform-specific implementation of [`AnimationContext`].
 ///
 /// Holds nothing on Windows. DWM paints the overlay from the source
@@ -67,6 +74,7 @@ impl AnimationContext {
   pub(crate) fn capture_frame(
     &self,
     _window_id: WindowId,
+    _windows: &OnScreenWindows,
   ) -> crate::Result<AnimationCapture> {
     Ok(AnimationCapture)
   }
@@ -729,8 +737,11 @@ impl AnimationWindow {
   /// Implements [`AnimationWindow::companions_revealed`].
   ///
   /// Reads each companion's cloak state from the compositor; callable
-  /// from any thread.
-  pub(crate) fn companions_revealed(&self) -> bool {
+  /// from any thread. Needs no window list.
+  pub(crate) fn companions_revealed(
+    &self,
+    _windows: &OnScreenWindows,
+  ) -> bool {
     self
       .companions
       .lock()

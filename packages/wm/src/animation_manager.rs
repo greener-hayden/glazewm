@@ -19,7 +19,8 @@ use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
   AnimationCapture, AnimationContext, AnimationWindow, CompanionOverlay,
   Dispatcher, EasingFunction, FrameClock, FrameSignal, NativeWindow,
-  OpacityValue, Rect, Spring, SpringState, WindowId, COMPANION_MARGIN_PX,
+  OnScreenWindows, OpacityValue, Rect, Spring, SpringState, WindowId,
+  COMPANION_MARGIN_PX,
 };
 
 use crate::{
@@ -990,11 +991,18 @@ impl AnimationManager {
 
   /// Whether every companion drawn by a window's overlay shows itself
   /// again. `true` without an overlay or companions.
-  pub fn companions_revealed(&self, id: &Uuid) -> bool {
+  ///
+  /// `windows` is listed at most once however many overlays are checked,
+  /// and only if one of them has companions. Share one across a pass.
+  pub fn companions_revealed(
+    &self,
+    id: &Uuid,
+    windows: &OnScreenWindows,
+  ) -> bool {
     self
       .windows
       .get(id)
-      .is_none_or(|overlay| overlay.window.companions_revealed())
+      .is_none_or(|overlay| overlay.window.companions_revealed(windows))
   }
 
   /// Takes failed launches or updates for native recovery.
@@ -1337,29 +1345,12 @@ impl AnimationManager {
     };
 
     let capture_t0 = Instant::now();
-    // A capture that returns at once gains nothing from a thread.
-    let results = if AnimationContext::CAPTURE_BLOCKS {
-      std::thread::scope(|scope| {
-        // Spawn every capture before joining any, or they run one at a
-        // time.
-        let handles = windows
-          .iter()
-          .map(|(id, window_id)| {
-            (id, scope.spawn(move || context.capture_frame(*window_id)))
-          })
-          .collect::<Vec<_>>();
-
-        handles
-          .into_iter()
-          .map(|(id, handle)| (id, handle.join()))
-          .collect::<Vec<_>>()
-      })
-    } else {
-      windows
+    let results = context.capture_frames(
+      &windows
         .iter()
-        .map(|(id, window_id)| (id, Ok(context.capture_frame(*window_id))))
-        .collect::<Vec<_>>()
-    };
+        .map(|(_, window_id)| *window_id)
+        .collect::<Vec<_>>(),
+    );
 
     tracing::debug!(
       "Captured {} window frames in {:?}.",
@@ -1367,7 +1358,7 @@ impl AnimationManager {
       capture_t0.elapsed()
     );
 
-    for (id, result) in results {
+    for ((id, _), result) in windows.iter().zip(results) {
       match result {
         Ok(Ok(capture)) => {
           self.pending_captures.insert(*id, capture);
@@ -1506,7 +1497,8 @@ impl AnimationManager {
     } else {
       let capture = match capture {
         Some(capture) => capture,
-        None => context.capture_frame(window.native().id())?,
+        None => context
+          .capture_frame(window.native().id(), &OnScreenWindows::new())?,
       };
 
       let anim_window = AnimationWindow::new(

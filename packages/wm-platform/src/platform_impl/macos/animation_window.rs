@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 
 use block2::RcBlock;
 use objc2::{
@@ -91,6 +91,27 @@ const fn control_points(easing: &EasingFunction) -> (f32, f32, f32, f32) {
   }
 }
 
+/// Platform-specific implementation of [`OnScreenWindows`].
+///
+/// Lists the windows on first use. The `OnceLock` makes concurrent
+/// captures share that one listing: the first to ask takes it and the
+/// rest wait for it.
+#[derive(Default)]
+pub(crate) struct OnScreenWindows {
+  listed: OnceLock<Option<Vec<ListedWindow>>>,
+}
+
+impl OnScreenWindows {
+  /// The listed windows, front to back, taking the list if this is the
+  /// first use.
+  ///
+  /// `None` when the window server could not provide the list; that
+  /// outcome is kept too, so a failure is not retried per window.
+  fn listed(&self) -> Option<&[ListedWindow]> {
+    self.listed.get_or_init(on_screen_windows).as_deref()
+  }
+}
+
 /// Platform-specific implementation of [`AnimationContext`].
 pub(crate) struct AnimationContext;
 
@@ -106,9 +127,10 @@ impl AnimationContext {
   pub(crate) fn capture_frame(
     &self,
     window_id: WindowId,
+    windows: &OnScreenWindows,
   ) -> crate::Result<AnimationCapture> {
     Ok(AnimationCapture {
-      frame: CapturedFrame::new(window_id)?,
+      frame: CapturedFrame::new(window_id, windows)?,
     })
   }
 
@@ -535,21 +557,18 @@ impl AnimationWindow {
   /// back. Otherwise `true` once a companion decorates the source where
   /// it now stands, or when the source or the window list is gone, so a
   /// failure never holds the overlay.
-  pub(crate) fn companions_revealed(&self) -> bool {
+  ///
+  /// Lists the windows through `windows` only when this image has
+  /// companions to wait for.
+  pub(crate) fn companions_revealed(
+    &self,
+    windows: &OnScreenWindows,
+  ) -> bool {
     if self.extent.is_none() {
       return true;
     }
-    let Some(windows) = on_screen_windows() else {
-      return true;
-    };
-    let Some(source) =
-      windows.iter().find(|window| window.id == self.source_id.0)
-    else {
-      return true;
-    };
-    windows.iter().any(|window| {
-      window.owner == COMPANION_OWNER
-        && companion::decorates(&window.bounds, &source.bounds)
+    windows.listed().is_none_or(|windows| {
+      companions_revealed_in(windows, self.source_id)
     })
   }
 
@@ -624,8 +643,11 @@ impl CapturedFrame {
   /// A window with companions on screen is captured together with them,
   /// so a border ring travels with the window's image. Anything else is
   /// captured alone, as is every window when the companion search fails.
-  fn new(window_id: WindowId) -> crate::Result<Self> {
-    if let Some(captured) = Self::with_companions(window_id) {
+  fn new(
+    window_id: WindowId,
+    windows: &OnScreenWindows,
+  ) -> crate::Result<Self> {
+    if let Some(captured) = Self::with_companions(window_id, windows) {
       return Ok(captured);
     }
     Self::alone(window_id)
@@ -676,8 +698,11 @@ impl CapturedFrame {
   /// Returns `None` when the window has no companions on screen or any
   /// step fails; the caller then captures the window alone.
   #[allow(deprecated)]
-  fn with_companions(window_id: WindowId) -> Option<Self> {
-    let windows = on_screen_windows()?;
+  fn with_companions(
+    window_id: WindowId,
+    windows: &OnScreenWindows,
+  ) -> Option<Self> {
+    let windows = windows.listed()?;
     let frame = windows
       .iter()
       .find(|window| window.id == window_id.0)?
@@ -738,6 +763,24 @@ struct ListedWindow {
   owner: String,
   /// Bounds in screen coordinates.
   bounds: Rect,
+}
+
+/// Whether a companion decorates `source` where it stands in `windows`.
+///
+/// `true` when `source` is not listed, so a source that is gone never
+/// holds its overlay.
+fn companions_revealed_in(
+  windows: &[ListedWindow],
+  source: WindowId,
+) -> bool {
+  let Some(source) = windows.iter().find(|window| window.id == source.0)
+  else {
+    return true;
+  };
+  windows.iter().any(|window| {
+    window.owner == COMPANION_OWNER
+      && companion::decorates(&window.bounds, &source.bounds)
+  })
 }
 
 /// Lists every on-screen window, front to back.
@@ -817,5 +860,96 @@ mod tests {
       extent.image_rect(&scaled),
       Rect::from_ltrb(-2, -2, 402, 302)
     );
+  }
+
+  /// A window that no captured source shares an id with, so a capture
+  /// stops at the window search and takes no screenshot.
+  const ABSENT: WindowId = WindowId(u32::MAX);
+
+  /// The full-list calls made while `work` runs.
+  ///
+  /// Reads a process-wide counter, so these tests hold only under
+  /// `--test-threads=1`.
+  fn full_lists_during(work: impl FnOnce()) -> u64 {
+    let before = NativeCallStats::snapshot();
+    work();
+    NativeCallStats::snapshot().since(&before).window_list_full
+  }
+
+  /// A batch of captures sharing one snapshot lists the windows once,
+  /// not once per capture.
+  #[test]
+  fn concurrent_captures_share_one_listing() {
+    const WINDOWS: u64 = 8;
+
+    let shared = full_lists_during(|| {
+      let snapshot = OnScreenWindows::default();
+      std::thread::scope(|scope| {
+        for _ in 0..WINDOWS {
+          scope.spawn(|| {
+            assert!(
+              CapturedFrame::with_companions(ABSENT, &snapshot).is_none()
+            );
+          });
+        }
+      });
+    });
+    assert_eq!(shared, 1);
+
+    // Without sharing, each capture lists the windows for itself.
+    let separate = full_lists_during(|| {
+      for _ in 0..WINDOWS {
+        let snapshot = OnScreenWindows::default();
+        assert!(
+          CapturedFrame::with_companions(ABSENT, &snapshot).is_none()
+        );
+      }
+    });
+    assert_eq!(separate, WINDOWS);
+  }
+
+  /// Checks that share a snapshot list once however many run, and a
+  /// snapshot nobody queries lists nothing.
+  #[test]
+  fn snapshot_lists_once_for_many_checks_and_not_at_all_unused() {
+    assert_eq!(full_lists_during(|| drop(OnScreenWindows::default())), 0);
+
+    let snapshot = OnScreenWindows::default();
+    let listed = full_lists_during(|| {
+      for _ in 0..16 {
+        let _ = snapshot.listed();
+      }
+    });
+    assert_eq!(listed, 1);
+  }
+
+  /// A companion that decorates the source reveals it; its absence holds
+  /// the overlay; a source that is gone never does.
+  #[test]
+  fn companions_revealed_in_follows_the_decorating_window() {
+    let listed = |id, owner: &str, bounds| ListedWindow {
+      id,
+      owner: owner.to_string(),
+      bounds,
+    };
+    let source = Rect::from_xy(100, 100, 800, 600);
+    let band = Rect::from_ltrb(96, 96, 116, 704);
+
+    let with_ring = [
+      listed(1, "mover-borders", band.clone()),
+      listed(2, "Terminal", source.clone()),
+    ];
+    assert!(companions_revealed_in(&with_ring, WindowId(2)));
+
+    // A band of another owner is not a companion.
+    let other_owner = [
+      listed(1, "Other", band),
+      listed(2, "Terminal", source.clone()),
+    ];
+    assert!(!companions_revealed_in(&other_owner, WindowId(2)));
+
+    let bare = [listed(2, "Terminal", source)];
+    assert!(!companions_revealed_in(&bare, WindowId(2)));
+    assert!(companions_revealed_in(&bare, WindowId(3)));
   }
 }

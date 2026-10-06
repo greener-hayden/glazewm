@@ -2,6 +2,33 @@ use crate::{
   platform_impl, Dispatcher, NativeWindow, OpacityValue, Rect, WindowId,
 };
 
+/// The on-screen windows, listed at most once and shared.
+///
+/// Nothing is fetched on creation; the first query that needs the list
+/// takes it, and every later query reuses it. Share one across the
+/// captures of a batch, or the overlay checks of one placement pass, so
+/// each pays for a single window-server round trip rather than one per
+/// window. The list is a snapshot: it does not follow windows that move
+/// after it was taken, so make a fresh one for each batch or pass.
+///
+/// # Platform-specific
+///
+/// - macOS: the list of every on-screen window, which companions are found
+///   in.
+/// - Windows: holds nothing; no query needs a window list.
+#[derive(Default)]
+pub struct OnScreenWindows {
+  inner: platform_impl::OnScreenWindows,
+}
+
+impl OnScreenWindows {
+  /// Creates a snapshot that has not yet listed any window.
+  #[must_use]
+  pub fn new() -> Self {
+    Self::default()
+  }
+}
+
 /// Shared context used by [`AnimationWindow`] instances. Holds GPU
 /// resources that can be shared between animations.
 ///
@@ -35,6 +62,9 @@ impl AnimationContext {
   /// can be positioned anywhere on screen independently of where the
   /// window currently sits.
   ///
+  /// Captures that run together should share one `windows` snapshot,
+  /// which is safe to use from several threads.
+  ///
   /// # Platform-specific
   ///
   /// - macOS: A screenshot of the window as it is right now, together with
@@ -44,9 +74,52 @@ impl AnimationContext {
   pub fn capture_frame(
     &self,
     window_id: WindowId,
+    windows: &OnScreenWindows,
   ) -> crate::Result<AnimationCapture> {
     Ok(AnimationCapture {
-      inner: self.inner.capture_frame(window_id)?,
+      inner: self.inner.capture_frame(window_id, &windows.inner)?,
+    })
+  }
+
+  /// Captures a frame of each of `windows` as one batch.
+  ///
+  /// Where a capture blocks, the captures run concurrently, so every
+  /// animation started afterwards begins from an equally fresh frame.
+  /// The batch lists the on-screen windows once and shares that listing
+  /// among its captures.
+  ///
+  /// Returns one entry per window, in order. An entry is `Err` when its
+  /// capture thread panicked.
+  #[must_use]
+  pub fn capture_frames(
+    &self,
+    windows: &[WindowId],
+  ) -> Vec<std::thread::Result<crate::Result<AnimationCapture>>> {
+    let on_screen = OnScreenWindows::new();
+    let on_screen = &on_screen;
+
+    // A capture that returns at once gains nothing from a thread.
+    if !Self::CAPTURE_BLOCKS {
+      return windows
+        .iter()
+        .map(|window_id| Ok(self.capture_frame(*window_id, on_screen)))
+        .collect();
+    }
+
+    std::thread::scope(|scope| {
+      // Spawn every capture before joining any, or they run one at a
+      // time.
+      let handles = windows
+        .iter()
+        .map(|window_id| {
+          scope.spawn(move || self.capture_frame(*window_id, on_screen))
+        })
+        .collect::<Vec<_>>();
+
+      handles
+        .into_iter()
+        .map(std::thread::ScopedJoinHandle::join)
+        .collect()
     })
   }
 
@@ -308,15 +381,17 @@ impl AnimationWindow {
   /// until this is `true`, so the decoration is never missing for a
   /// frame. Also `true` when there are no companions.
   ///
+  /// Checks that run together should share one `windows` snapshot.
+  ///
   /// # Platform-specific
   ///
   /// - macOS: companions are captured into the source's image. `true` once
   ///   one decorates the source where it now stands.
   /// - Windows: `true` once every companion reports `DWMWA_CLOAKED` as 0
-  ///   or is gone.
+  ///   or is gone. `windows` is ignored.
   #[must_use]
-  pub fn companions_revealed(&self) -> bool {
-    self.inner.companions_revealed()
+  pub fn companions_revealed(&self, windows: &OnScreenWindows) -> bool {
+    self.inner.companions_revealed(&windows.inner)
   }
 
   /// Destroys the window and releases GPU resources.
@@ -441,5 +516,34 @@ impl CompanionOverlay {
     {
       Ok(())
     }
+  }
+}
+
+/// Call counts here read process-wide counters, so they hold only under
+/// `--test-threads=1`.
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+  use super::*;
+  use crate::{NativeCallStats, WindowId};
+
+  /// A batch of captures lists the on-screen windows once, however many
+  /// windows it holds.
+  #[test]
+  fn capture_batch_lists_windows_once() {
+    const WINDOWS: usize = 8;
+
+    let context = AnimationContext {
+      inner: platform_impl::AnimationContext,
+    };
+    // Ids no window has: each capture fails after its companion search,
+    // which is the part under test.
+    let absent = [WindowId(u32::MAX); WINDOWS];
+
+    let before = NativeCallStats::snapshot();
+    let results = context.capture_frames(&absent);
+    let spent = NativeCallStats::snapshot().since(&before);
+
+    assert_eq!(results.len(), WINDOWS);
+    assert_eq!(spent.window_list_full, 1);
   }
 }

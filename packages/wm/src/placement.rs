@@ -875,6 +875,9 @@ pub fn platform_sync(
   );
 
   let hide_corners = state.monitors_by_hide_corner();
+  // Listed on the first retire check that needs it, then shared by the
+  // rest of the pass.
+  let on_screen = wm_platform::OnScreenWindows::new();
   let mut reconciled = 0;
   for window in &windows {
     let id = window.id();
@@ -887,6 +890,7 @@ pub fn platform_sync(
       now,
       compositor_frame,
       sampled_frame,
+      on_screen: &on_screen,
       reorder: needs_reorder,
       hide_corner: hide_corners
         .get(&monitor.id())
@@ -1217,6 +1221,15 @@ struct ReconcilePass<'a> {
   /// per window paid that round-trip once per settling window per frame
   /// for the same number.
   sampled_frame: u64,
+  /// The on-screen windows, listed at most once for the whole commit.
+  ///
+  /// Each retire check needs them to find companions, and every window
+  /// listing is a round-trip to the window server, so the checks of one
+  /// commit share a single listing instead of paying for one each. It is
+  /// a snapshot from the first check of the commit; a companion that
+  /// shows itself later in the commit is seen by the next one, which the
+  /// fence's recheck deadline guarantees.
+  on_screen: &'a wm_platform::OnScreenWindows,
   reorder: bool,
   hide_corner: HideCorner,
 }
@@ -1682,6 +1695,7 @@ fn reconcile_managed(
     now,
     compositor_frame,
     sampled_frame,
+    on_screen,
     reorder,
     hide_corner,
   } = pass;
@@ -2131,7 +2145,7 @@ fn reconcile_managed(
   if let Some(fence) = entry.retire_after.as_mut() {
     if state.native_sync.clock_failed
       || fence.due(compositor_frame, now, || {
-        state.animation_manager.companions_revealed(&id)
+        state.animation_manager.companions_revealed(&id, on_screen)
       })
     {
       state.animation_manager.retire_overlay(&id)?;

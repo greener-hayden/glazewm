@@ -38,6 +38,7 @@ use crate::{
 };
 
 mod animation_manager;
+mod cleanup_schedule;
 mod commands;
 mod event_batch;
 mod events;

@@ -1,4 +1,4 @@
-use std::{cell::RefCell, sync::Arc};
+use std::{cell::RefCell, collections::HashSet, sync::Arc};
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
@@ -11,7 +11,7 @@ use objc2_core_foundation::{
 #[allow(deprecated)]
 use objc2_core_graphics::{
   CGDisplayIsAsleep, CGError, CGWindowListCopyWindowInfo,
-  CGWindowListOption,
+  CGWindowListCreate, CGWindowListOption,
 };
 
 use crate::{
@@ -613,6 +613,35 @@ impl From<NativeWindow> for crate::NativeWindow {
   fn from(window: NativeWindow) -> Self {
     crate::NativeWindow { inner: window }
   }
+}
+
+/// Implements [`WindowLiveness::from_window_server`].
+///
+/// Lists every window the window server has, whether on-screen or not, so
+/// windows that are minimized, hidden or on another space are included.
+/// Returns `None` when the list is unavailable.
+///
+/// Perf: `CGWindowListCreate` returns the IDs alone, ~0.2ms p50 for 170
+/// windows. `CGWindowListCopyWindowInfo` builds a dictionary for each
+/// window, ~3ms p50 for the same list.
+///
+/// [`WindowLiveness::from_window_server`]: crate::WindowLiveness::from_window_server
+pub(crate) fn listed_window_ids() -> Option<HashSet<WindowId>> {
+  NativeCallStats::record(NativeCall::WindowListFull);
+  let windows = CGWindowListCreate(CGWindowListOption::OptionAll, 0)?;
+
+  Some(
+    (0..windows.count())
+      .filter_map(|index| {
+        // SAFETY: The array is retained and `index` is within its count.
+        let value = unsafe { windows.value_at_index(index) };
+
+        // The array holds each `CGWindowID` as the pointer-sized value
+        // itself, not as an object, and is never dereferenced.
+        u32::try_from(value.addr()).ok().map(WindowId)
+      })
+      .collect(),
+  )
 }
 
 /// Implements [`Dispatcher::visible_windows`].

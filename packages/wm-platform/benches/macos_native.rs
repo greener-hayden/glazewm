@@ -65,6 +65,7 @@ mod macos {
   use wm_platform::{
     Dispatcher, DispatcherExtMacOs, EventLoop, NativeCallStats,
     NativeWindow, PlacementSession, Rect, ThreadBound, WindowId,
+    WindowLiveness,
   };
 
   use crate::helper::{self, Helper};
@@ -184,6 +185,7 @@ mod macos {
 
     if trusted {
       section("accessibility", || accessibility(dispatcher, &helper));
+      section("window cleanup", || cleanup(dispatcher));
     } else {
       println!(
         "accessibility: skipped, the terminal running cargo lacks \
@@ -946,6 +948,76 @@ mod macos {
     println!(
       "  2 ms raises that timed out: {stalled} of {}; refused: {refused}",
       deferred.len()
+    );
+
+    Ok(())
+  }
+
+  /// How many times each cleanup round is repeated for timing.
+  const CLEANUP_ROUNDS: usize = 20;
+
+  /// Checks every window the window manager would keep, the way its
+  /// periodic cleanup does, as it did and as it does now.
+  ///
+  /// Before: `NativeWindow::is_valid` on every window, one hop and one
+  /// `AXRole` read each. After: one window server listing, and the check
+  /// on the windows it lacks. Sweep: `WindowLiveness::per_window`, which
+  /// the cleanup runs once a minute and which costs what before did.
+  ///
+  /// Reads `AXRole` of every window accessibility lists, as the window
+  /// manager's own cleanup does every few seconds. Nothing is written, so
+  /// no window is moved, resized or focused.
+  fn cleanup(dispatcher: &Dispatcher) -> BenchResult<()> {
+    let windows = dispatcher.visible_windows()?;
+    println!("  windows checked: {}", windows.len());
+
+    // Counts what one round of the check spends, taking its listing, if
+    // any, inside the measured span.
+    let round =
+      |label: &str, liveness: &dyn Fn() -> Option<WindowLiveness>| {
+        let before = NativeCallStats::snapshot();
+        let liveness = liveness();
+        let valid = windows
+          .iter()
+          .filter(|window| {
+            liveness.as_ref().map_or_else(
+              || window.is_valid(),
+              |liveness| liveness.is_valid(window),
+            )
+          })
+          .count();
+        let spent = NativeCallStats::snapshot().since(&before);
+        println!("  {label}: {valid} valid, one round: {spent}");
+      };
+
+    round("before, is_valid per window", &|| None);
+    round("after, one listing", &|| {
+      Some(WindowLiveness::from_window_server())
+    });
+    round("sweep, per_window", &|| Some(WindowLiveness::per_window()));
+
+    report(
+      "before, is_valid per window",
+      &sample(2, CLEANUP_ROUNDS, || {
+        for window in &windows {
+          let _ = window.is_valid();
+        }
+      }),
+    );
+    report(
+      "after, listing and the windows it lacks",
+      &sample(2, CLEANUP_ROUNDS, || {
+        let liveness = WindowLiveness::from_window_server();
+        for window in &windows {
+          let _ = liveness.is_valid(window);
+        }
+      }),
+    );
+    report(
+      "the listing alone",
+      &sample(2, CLEANUP_ROUNDS, || {
+        drop(WindowLiveness::from_window_server());
+      }),
     );
 
     Ok(())

@@ -34,6 +34,7 @@ mod thread_bound;
 mod thumbnail_layout;
 pub use thumbnail_layout::thumbnail_rects;
 mod window_listener;
+mod window_liveness;
 #[cfg(target_os = "windows")]
 mod windows_session;
 
@@ -54,6 +55,7 @@ pub use platform_event::*;
 pub use single_instance::*;
 pub use thread_bound::*;
 pub use window_listener::*;
+pub use window_liveness::*;
 #[cfg(target_os = "windows")]
 pub use windows_session::*;
 

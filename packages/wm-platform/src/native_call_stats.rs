@@ -15,7 +15,8 @@ pub enum NativeCall {
   AxAction,
   /// A window server lookup of a single window.
   WindowListSingle,
-  /// A window server listing of every on-screen window.
+  /// A window server listing of many windows at once, such as every
+  /// on-screen window or the IDs of every window.
   WindowListFull,
   /// A walk over every screen.
   ScreenEnumeration,
@@ -161,7 +162,7 @@ pub struct NativeCallSnapshot {
   pub ax_actions: u64,
   /// Window server lookups of a single window.
   pub window_list_single: u64,
-  /// Window server listings of every on-screen window.
+  /// Window server listings of many windows at once.
   pub window_list_full: u64,
   /// Walks over every screen.
   pub screen_enumerations: u64,

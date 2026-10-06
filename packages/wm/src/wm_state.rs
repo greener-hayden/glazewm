@@ -12,10 +12,12 @@ use wm_common::{
 };
 use wm_platform::{
   Direction, Dispatcher, Display, NativeWindow, Point, Rect,
+  WindowLiveness,
 };
 
 use crate::{
   animation_manager::AnimationManager,
+  cleanup_schedule::{CleanupCheck, CleanupSchedule},
   commands::{
     container::set_focused_descendant,
     general::platform_sync,
@@ -95,6 +97,10 @@ pub struct WmState {
   /// application did not answer. Their next window event checks again.
   pub unresolved_windows: Vec<NativeWindow>,
 
+  /// When cleanup next asks every window whether it is alive, rather
+  /// than checking against the window server's listing.
+  cleanup_schedule: CleanupSchedule,
+
   /// Whether the WM is paused.
   pub is_paused: bool,
 
@@ -137,6 +143,7 @@ impl WmState {
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
       unresolved_windows: Vec::new(),
+      cleanup_schedule: CleanupSchedule::new(Instant::now()),
       is_paused: false,
       is_focus_synced: false,
       has_initialized: false,
@@ -802,12 +809,26 @@ impl WmState {
   /// terminate without sending window destroy events, leaving invalid
   /// windows in WM state.
   ///
+  /// Most rounds check against one window server listing and only ask
+  /// the windows it lacks, so they cost no request to the applications.
+  /// Every [`CleanupSchedule::SWEEP_INTERVAL`] a round asks every window
+  /// instead, which also finds a window the application has dropped but
+  /// the window server still lists.
+  ///
   /// See: <https://github.com/glzr-io/glazewm/issues/1219>
   pub fn cleanup_invalid_windows(&mut self) -> anyhow::Result<()> {
+    let liveness = match self.cleanup_schedule.next_check(Instant::now()) {
+      CleanupCheck::Listing => WindowLiveness::from_window_server(),
+      CleanupCheck::Sweep => {
+        tracing::debug!("Checking every window for cleanup.");
+        WindowLiveness::per_window()
+      }
+    };
+
     let invalid_windows = self
       .windows()
       .into_iter()
-      .filter(|window| !window.native().is_valid());
+      .filter(|window| !liveness.is_valid(&window.native()));
 
     for window in invalid_windows {
       tracing::info!("Removing invalid window: {}", window);
@@ -815,8 +836,12 @@ impl WmState {
     }
 
     // Prune ignored windows that are no longer valid.
-    self.ignored_windows.retain(NativeWindow::is_valid);
-    self.unresolved_windows.retain(NativeWindow::is_valid);
+    self
+      .ignored_windows
+      .retain(|window| liveness.is_valid(window));
+    self
+      .unresolved_windows
+      .retain(|window| liveness.is_valid(window));
 
     Ok(())
   }

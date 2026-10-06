@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use tracing::warn;
 use windows::{
   core::PWSTR,
@@ -818,6 +820,16 @@ impl From<NativeWindow> for crate::NativeWindow {
   fn from(window: NativeWindow) -> Self {
     crate::NativeWindow { inner: window }
   }
+}
+
+/// Implements [`WindowLiveness::from_window_server`].
+///
+/// Always `None` on Windows. `IsWindow` answers without the owning
+/// process, so there is no list to take.
+///
+/// [`WindowLiveness::from_window_server`]: crate::WindowLiveness::from_window_server
+pub(crate) fn listed_window_ids() -> Option<HashSet<WindowId>> {
+  None
 }
 
 /// Implements [`Dispatcher::visible_windows`].

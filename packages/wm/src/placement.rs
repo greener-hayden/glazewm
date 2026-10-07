@@ -243,9 +243,10 @@ struct ReconcileCandidate {
   planned: bool,
   /// Native focus is still waiting to be applied to this window.
   ///
-  /// Applying it needs a settled frame, so the window has to be
-  /// reconciled even when nothing else asks for it. A frame suspended by
-  /// a finished drag, for one, only restarts in a pass.
+  /// Applying it needs a frame that is settled or has an accepted write
+  /// (see `focus_ready`), so the window has to be reconciled even when
+  /// nothing else asks for it. A frame suspended by a finished drag, for
+  /// one, only restarts in a pass.
   focus_pending: bool,
   /// The applied effects differ from what the new focus asks for.
   ///
@@ -920,9 +921,14 @@ impl PlacementCoordinator {
   /// a cover, a fence, a retired window and an overlay cleanup each wake
   /// themselves by a deadline (`deadline`) or a frame tick (`tick_due`).
   /// Native focus has no wake of its own: it applies in whichever pass
-  /// runs once its blockers clear, so a new focus blocker must wake
-  /// itself the same way. Counting settling state here would start a
-  /// sync on every unrelated event while anything settles.
+  /// runs once its blockers clear, so each blocker must either wake
+  /// itself the same way or be cleared by a request. A suspended frame
+  /// (a window being dragged) has no wake: the end of the drag requests
+  /// a pass (`observe`) on macOS, and on Windows the final
+  /// `MovedOrResized` event marks the window, or the frame clock ticks it
+  /// when the animation manager drives its frames. Counting settling
+  /// state here would start a sync on every unrelated event while
+  /// anything settles.
   pub fn has_queued_work(&self) -> bool {
     self.layout_dirty || !self.dirty.is_empty()
   }
@@ -3186,6 +3192,40 @@ mod tick_due_tests {
     frame.observe(&observed(at), now);
     assert!(!frame.in_flight());
     frame
+  }
+
+  /// A suspended frame, held for a drag, has no wake of its own: it is not
+  /// settling, has no deadline and does not block a tick. Only a request
+  /// ends the wait, so the end of a drag must queue one, and a queued
+  /// request must start a sync.
+  #[test]
+  fn a_suspended_frame_waits_for_a_request() {
+    let now = Instant::now();
+    let mut parts = Parts::idle(now);
+    parts.frame.suspend();
+    assert_eq!(parts.frame.phase, ReconcilePhase::Suspended);
+    assert!(!parts.frame.in_flight());
+    assert!(parts.frame.deadline().is_none());
+    assert!(!parts.view().settling());
+    assert!(!parts.view().wake(0).covered());
+
+    // Native focus cannot go to the window while it is suspended.
+    assert!(!focus_ready(FocusGate {
+      has_source: false,
+      phase: ReconcilePhase::Suspended,
+      frame_write_accepted: false,
+      desired_state: NativeState::Normal,
+      observed_state: Some(NativeState::Normal),
+      shown: true,
+    }));
+
+    // Without a request, no event syncs for the window. A dragged
+    // window's end requests one, which does.
+    let mut coordinator = PlacementCoordinator::default();
+    let id = Uuid::new_v4();
+    assert!(!should_flush(false, false, coordinator.has_queued_work()));
+    coordinator.dirty.insert(id);
+    assert!(should_flush(false, false, coordinator.has_queued_work()));
   }
 
   /// A window's settling state, owned so a view can borrow it.

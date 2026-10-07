@@ -49,6 +49,13 @@ pub fn handle_mouse_move(
         });
 
         handle_window_moved_or_resized_end(&window, state, config)?;
+
+        // A frame suspended for the drag restarts only in a pass, and
+        // some drops (e.g. a floating window dropped on the same
+        // monitor) queue no change. Request one so the frame, and any
+        // native focus waiting on it, is not left until the next
+        // unrelated change.
+        state.native_sync.observe(window.id());
       }
     }
 

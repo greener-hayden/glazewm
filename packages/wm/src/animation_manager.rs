@@ -18,13 +18,14 @@ use wm_common::{
 use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
   AnimationCapture, AnimationContext, AnimationWindow, CompanionOverlay,
-  Dispatcher, EasingFunction, FrameClock, FrameSignal, NativeWindow,
-  OnScreenWindows, OpacityValue, Rect, Spring, SpringState, WindowId,
-  COMPANION_MARGIN_PX,
+  CompanionStatus, Dispatcher, EasingFunction, FrameClock, FrameSignal,
+  NativeWindow, OnScreenWindows, OpacityValue, Rect, Spring, SpringState,
+  WindowId, COMPANION_MARGIN_PX,
 };
 
 use crate::{
   models::{NativeMonitorProperties, WindowContainer},
+  presentation::CoverSync,
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
 };
@@ -563,6 +564,10 @@ struct Overlay {
   frame_rate: u32,
   /// Last successfully submitted frame on tick-driven backends.
   frame: Rect,
+  /// Where `place_overlay` last put the cover, until something moves it
+  /// again. A repeat call for the same rect queues nothing, so a reveal
+  /// waiting on the cover is not restarted by each pass.
+  placed: Option<Rect>,
 }
 
 /// Draws a window's companions during its native motion and holds them
@@ -772,10 +777,26 @@ impl AnimationManager {
   /// Creates a completion wake without inventing compositor progress.
   #[cfg(target_os = "windows")]
   pub fn native_completion_wake(&self) -> impl Fn() + Send + 'static {
-    let sender = self.tick_tx.clone();
-    move || {
-      let _ = sender.try_send(FrameSignal::Wake);
+    completion_wake(&self.tick_tx)
+  }
+
+  /// Gets the animation context, creating it on first use.
+  ///
+  /// A free function of the fields it needs, so the context it returns
+  /// can be held while other fields are used. Its overlays wake the frame
+  /// loop when they finish being created.
+  fn context_in<'a>(
+    slot: &'a mut Option<AnimationContext>,
+    tick_tx: &mpsc::Sender<FrameSignal>,
+    dispatcher: &Dispatcher,
+  ) -> anyhow::Result<&'a AnimationContext> {
+    if slot.is_none() {
+      *slot = Some(AnimationContext::with_wake(
+        dispatcher,
+        completion_wake(tick_tx),
+      )?);
     }
+    slot.as_ref().context("Animation context not initialized.")
   }
 
   /// Whether any overlay or motion still depends on the frame clock.
@@ -936,10 +957,11 @@ impl AnimationManager {
   /// it was created, so the decoration does not jump; the overlay only
   /// grows.
   ///
-  /// Returns whether the window is decorated. A window without companions
-  /// costs one shared companion search and gets no overlay. Failures are
-  /// logged and leave the window undecorated; they never affect its
-  /// motion.
+  /// Returns whether the window has a companion overlay, which may still
+  /// be being created: see `decoration_status`. A window without
+  /// companions costs one shared companion search, and its overlay then
+  /// reports none. Failures are logged and leave the window undecorated;
+  /// they never affect its motion.
   pub fn decorate_native(
     &mut self,
     id: Uuid,
@@ -971,7 +993,16 @@ impl AnimationManager {
       }
       return false;
     }
-    match CompanionOverlay::new(window, &bounds, dispatcher) {
+    let context =
+      match Self::context_in(&mut self.context, &self.tick_tx, dispatcher)
+      {
+        Ok(context) => context,
+        Err(err) => {
+          tracing::warn!(window = %id, "Companion overlay failed: {err}");
+          return false;
+        }
+      };
+    match CompanionOverlay::new(context, window, &bounds, dispatcher) {
       Ok(Some(overlay)) => {
         self.decorations.insert(
           id,
@@ -1052,17 +1083,80 @@ impl AnimationManager {
   }
 
   /// Takes failed launches or updates for native recovery.
+  ///
+  /// Overlay work is queued to the platform and runs after it was asked
+  /// for, so a failure of it is collected here: a cover that failed is
+  /// recovered like one whose update failed, and a companion overlay that
+  /// failed is retired, as its own update failure retires it.
   pub fn take_failures(&mut self) -> HashSet<Uuid> {
+    for (id, overlay) in &self.windows {
+      if let Some(err) = overlay.window.take_failure() {
+        tracing::warn!(window = %id, "Animation overlay failed: {err}");
+        self.failed_updates.insert(*id);
+      }
+    }
+    let failed_decorations = self
+      .decorations
+      .iter()
+      .filter_map(|(id, decoration)| {
+        decoration.overlay.take_failure().map(|err| (*id, err))
+      })
+      .collect::<Vec<_>>();
+    for (id, err) in failed_decorations {
+      tracing::warn!(window = %id, "Companion overlay failed: {err}");
+      if let Err(err) = self.retire_decoration(&id) {
+        tracing::warn!("Companion overlay cleanup failed: {err}");
+      }
+    }
     std::mem::take(&mut self.failed_updates)
   }
 
-  /// Aligns retained visuals before revealing sources.
+  /// The compositor frame a window's cover was shown at, or `None` while
+  /// it is still being created.
+  ///
+  /// The cover is composed in any later frame, and only then may its
+  /// source be concealed. An error means the cover failed to be created,
+  /// or the window has none.
+  pub fn overlay_shown_frame(
+    &self,
+    id: &Uuid,
+  ) -> anyhow::Result<Option<u64>> {
+    let overlay =
+      self.windows.get(id).context("The window has no overlay.")?;
+    Ok(overlay.window.shown_frame()?)
+  }
+
+  /// How a window's companion overlay stands, or `None` if it has none.
+  /// An error means its creation failed.
+  pub fn decoration_status(
+    &self,
+    id: &Uuid,
+  ) -> anyhow::Result<Option<CompanionStatus>> {
+    self
+      .decorations
+      .get(id)
+      .map(|decoration| decoration.overlay.status())
+      .transpose()
+      .map_err(Into::into)
+  }
+
+  /// Queues the cover to stand at `rect`, where its source is about to be
+  /// revealed.
+  ///
+  /// Does not wait: where overlay work is queued to another thread the
+  /// cover is not there yet when this returns. A caller reveals the
+  /// source only once `overlay_sync` says the cover is drawn and
+  /// composed. Calling again for the same rect queues nothing.
   pub fn place_overlay(
     &mut self,
     id: &Uuid,
     rect: &Rect,
   ) -> anyhow::Result<()> {
-    if let Some(overlay) = self.windows.get_mut(id) {
+    if let Some(overlay) = self
+      .windows
+      .get_mut(id)
+      .filter(|overlay| overlay.placed.as_ref() != Some(rect))
+    {
       // Companions are drawn through the reveal hold, so the overlay keeps
       // the margin they reach into. Its path usually encloses the landing
       // frame already; resizing anyway moves its origin a compositor frame
@@ -1073,9 +1167,25 @@ impl AnimationManager {
       }
       overlay.window.stop_at(rect, Some(&OpacityValue(1.0)))?;
       overlay.frame = rect.clone();
+      overlay.placed = Some(rect.clone());
     }
     self.clear_motion(id);
     Ok(())
+  }
+
+  /// Whether everything asked of a window's cover is drawn, and when.
+  ///
+  /// `Synced` for a window without a cover.
+  pub fn overlay_sync(&self, id: &Uuid) -> CoverSync {
+    match self
+      .windows
+      .get(id)
+      .map(|overlay| overlay.window.applied_frame())
+    {
+      None | Some(Some(0)) => CoverSync::Synced,
+      Some(None) => CoverSync::Queued,
+      Some(Some(frame)) => CoverSync::AppliedAt(frame),
+    }
   }
 
   /// Queues a prepared effect once the source handoff is ready.
@@ -1092,8 +1202,12 @@ impl AnimationManager {
   ///
   /// Also retires the window's companion overlay, which a released
   /// window no longer needs. The overlay is forgotten before its native
-  /// teardown, so a failed teardown is reported once rather than leaving
-  /// an overlay the frame clock redraws, and fails to, every frame.
+  /// teardown, so a failing teardown never leaves an overlay the frame
+  /// clock redraws, and fails to, every frame.
+  ///
+  /// Where teardown is queued to another thread, an error here means only
+  /// that it could not be queued. A teardown that fails on that thread is
+  /// logged there, and cannot be retried.
   pub fn retire_overlay(&mut self, id: &Uuid) -> anyhow::Result<()> {
     let decoration = self.retire_decoration(id);
     let overlay = self.windows.remove(id);
@@ -1114,6 +1228,7 @@ impl AnimationManager {
         // Samples and stops in one step, which on macOS is one hop to
         // the main thread instead of two.
         overlay.frame = overlay.window.stop_in_place(&overlay.frame)?;
+        overlay.placed = None;
       }
     }
     self.clear_motion(id);
@@ -1130,7 +1245,11 @@ impl AnimationManager {
 
   /// Updates all active animations during a single tick.
   ///
-  /// Updates get batched into a single compositor transaction.
+  /// Updates get batched into a single compositor transaction. Where the
+  /// platform queues overlay work to the event loop, the batch is handed
+  /// over without waiting and a batch the loop has not drawn yet is
+  /// replaced by this one, so a loop that falls behind drops stale frames
+  /// instead of building a backlog.
   ///
   /// Does nothing where the platform animates for itself: the compositor
   /// is already producing frames, and the transaction below would put a
@@ -1195,6 +1314,7 @@ impl AnimationManager {
       if !failed.contains(&id) {
         if let Some(overlay) = self.windows.get_mut(&id) {
           overlay.frame = rect;
+          overlay.placed = None;
         }
       }
     }
@@ -1380,12 +1500,8 @@ impl AnimationManager {
       return Ok(());
     }
 
-    let context = match &self.context {
-      Some(ctx) => ctx,
-      None => self
-        .context
-        .get_or_insert(AnimationContext::new(dispatcher)?),
-    };
+    let context =
+      Self::context_in(&mut self.context, &self.tick_tx, dispatcher)?;
 
     let capture_t0 = Instant::now();
     let results = context.capture_frames(
@@ -1506,12 +1622,8 @@ impl AnimationManager {
 
     let capture = self.pending_captures.remove(&window.id());
 
-    let context = match &self.context {
-      Some(ctx) => ctx,
-      None => self
-        .context
-        .get_or_insert(AnimationContext::new(dispatcher)?),
-    };
+    let context =
+      Self::context_in(&mut self.context, &self.tick_tx, dispatcher)?;
 
     // Resize existing overlay to the new bounding box when the target
     // changes mid-flight, preserving the screenshot and z-order. A slide's
@@ -1524,6 +1636,7 @@ impl AnimationManager {
         anim_window.window.resize(&outer_rect)?;
       }
       anim_window.frame_rate = frame_rate;
+      anim_window.placed = None;
 
       // A held replacement freezes the sampled presentation until its
       // batch is released. An immediate one on a tick-driven backend
@@ -1560,6 +1673,7 @@ impl AnimationManager {
           window: anim_window,
           frame_rate,
           frame: animation.start_rect.clone(),
+          placed: None,
         },
       );
     }
@@ -1751,6 +1865,21 @@ impl AnimationManager {
   }
 }
 
+/// Creates a wake that nudges the frame loop without inventing
+/// compositor progress.
+///
+/// Called on the event loop thread when a native overlay finishes being
+/// created, so the pass that was waiting for it runs at once instead of at
+/// the next tick. Never blocks: a full channel already holds a wake.
+fn completion_wake(
+  tick_tx: &mpsc::Sender<FrameSignal>,
+) -> impl Fn() + Send + Sync + 'static {
+  let sender = tick_tx.clone();
+  move || {
+    let _ = sender.try_send(FrameSignal::Wake);
+  }
+}
+
 /// Crops `outer_rect` to the area an animation may be drawn on.
 ///
 /// A slide is cropped to its owning monitor's bounds, so it never needs
@@ -1776,6 +1905,23 @@ fn crop_to_animation_area(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A window without a cover has no creation to wait for, so the gate
+  /// reports an error and the presentation is cancelled rather than held.
+  #[test]
+  fn a_window_without_an_overlay_has_no_shown_frame() {
+    let manager = AnimationManager::mock();
+    let id = Uuid::new_v4();
+    assert!(manager.overlay_shown_frame(&id).is_err());
+    assert!(matches!(manager.decoration_status(&id), Ok(None)));
+  }
+
+  /// With nothing created there is nothing latched to collect.
+  #[test]
+  fn no_overlays_report_no_failures() {
+    let mut manager = AnimationManager::mock();
+    assert!(manager.take_failures().is_empty());
+  }
 
   #[test]
   fn slide_crops_to_the_monitor_without_a_display_lookup() {

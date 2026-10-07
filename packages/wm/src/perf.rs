@@ -22,6 +22,16 @@
 //! press, grep for `trigger=key` and sort on `key_ms=`; `hops=` and
 //! `ax_reads=` count the main-thread hops and accessibility reads the span
 //! made. For example: `grep 'trigger=key' perf.*.log | grep key_ms=`.
+//!
+//! `hop_blocked_ms=` is the time callers waited on those hops. It splits
+//! into `hop_wait_ms=`, the time the closures sat in the event loop's
+//! queue behind other work, and `hop_run_ms=`, the time the loop spent
+//! running them. A large wait means the loop was busy; a large run means
+//! the closure itself is slow.
+//!
+//! Native overlay creation (`overlay_new`) and shell cloak calls
+//! (`cloak_slow`) log under the same target, at `INFO` once they take
+//! [`SLOW_CALL`] or longer, with the cost of each step.
 use std::{
   fmt,
   path::Path,

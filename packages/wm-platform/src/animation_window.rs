@@ -45,6 +45,33 @@ impl AnimationContext {
     Ok(Self { inner })
   }
 
+  /// Creates a new [`AnimationContext`] whose overlays call `wake` once
+  /// they have finished being created.
+  ///
+  /// Where an overlay is created asynchronously, the window manager has
+  /// no other way to learn of its completion without polling.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: overlays are created before `AnimationWindow::new` returns,
+  ///   so `wake` is never called.
+  /// - Windows: runs on the event loop thread, after each overlay's
+  ///   creation, whether it succeeded or failed. It must not block.
+  pub fn with_wake(
+    dispatcher: &Dispatcher,
+    wake: impl Fn() + Send + Sync + 'static,
+  ) -> crate::Result<Self> {
+    #[cfg(target_os = "windows")]
+    let inner =
+      platform_impl::AnimationContext::with_wake(dispatcher, wake)?;
+    #[cfg(target_os = "macos")]
+    let inner = {
+      let _ = wake;
+      platform_impl::AnimationContext::new(dispatcher)?
+    };
+    Ok(Self { inner })
+  }
+
   /// Whether [`AnimationContext::capture_frame`] does real work.
   ///
   /// When `false`, a capture returns at once and callers gain nothing
@@ -127,6 +154,12 @@ impl AnimationContext {
   ///
   /// Used with [`AnimationWindow::update`] to commit all updates together
   /// when `update_fn` returns.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: never waits for the event loop. The updates made inside
+  ///   are held back and handed to it as one batch when `update_fn`
+  ///   returns; a batch not yet drawn is replaced by a later one.
   pub fn transaction<F, R>(
     &self,
     update_fn: F,
@@ -185,6 +218,13 @@ impl AnimationWindow {
   ///
   /// The `outer_rect` should span the bounds of the start and end
   /// rects of the animation.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: returns once creation is queued to the event loop, and
+  ///   never waits for it. Poll [`AnimationWindow::shown_frame`] for the
+  ///   result; the context's wake runs when it is ready. `update`,
+  ///   `stop_at`, `resize` and `destroy` queue behind the creation.
   pub fn new(
     context: &AnimationContext,
     window: &NativeWindow,
@@ -205,6 +245,53 @@ impl AnimationWindow {
     )?;
 
     Ok(Self { inner })
+  }
+
+  /// The compositor frame at which the overlay was shown, once it has
+  /// been created.
+  ///
+  /// The overlay is composed in any frame later than this one, which is
+  /// when its source may be concealed behind it. `None` while the overlay
+  /// is still being created. An error means the creation failed, and the
+  /// overlay will never be shown.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: always `Some(0)`: the overlay is complete when `new`
+  ///   returns, and the caller gates on its own sample of the frame.
+  /// - Windows: the frame sampled on the event loop once everything the
+  ///   overlay shows was submitted.
+  pub fn shown_frame(&self) -> crate::Result<Option<u64>> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.shown_frame()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      Ok(Some(0))
+    }
+  }
+
+  /// Takes the first failure of a queued operation that nobody waited
+  /// for, if there is one.
+  ///
+  /// `update`, `stop_at`, `resize` and `destroy` return before they run,
+  /// so a failure of the work itself is reported here instead. A failure
+  /// is reported once.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: always `None`; those operations complete before they return.
+  #[must_use]
+  pub fn take_failure(&self) -> Option<crate::Error> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.take_failure()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      None
+    }
   }
 
   /// Whether the window's bounds already enclose `rect`.
@@ -233,6 +320,10 @@ impl AnimationWindow {
   /// Resizes the window.
   ///
   /// Called when an animation's target rect changes mid-flight.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: queued, and applied before the next frame drawn.
   pub fn resize(&mut self, outer_rect: &Rect) -> crate::Result<()> {
     self.inner.resize(outer_rect)
   }
@@ -345,6 +436,12 @@ impl AnimationWindow {
   }
 
   /// Cancels compositor motion and retains a stationary overlay.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: queued like [`AnimationWindow::update`]. Unlike a frame of
+  ///   a running animation, it is waited on: see
+  ///   [`AnimationWindow::applied_frame`].
   pub fn stop_at(
     &self,
     rect: &Rect,
@@ -356,7 +453,31 @@ impl AnimationWindow {
     }
     #[cfg(target_os = "windows")]
     {
-      self.inner.update(rect, opacity)
+      self.inner.stop_at(rect, opacity)
+    }
+  }
+
+  /// The compositor frame at which every `stop_at` and `resize` asked of
+  /// the overlay had been applied, or `None` while some are still queued.
+  ///
+  /// The overlay shows them in any later frame, and only then does the
+  /// source behind it have a trustworthy cover: revealing the source, or
+  /// concealing it for a retargeted motion, earlier shows a stale
+  /// position. `Some(0)` when nothing is outstanding.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: always `Some(0)`; those calls complete before they return.
+  /// - Windows: the context's wake runs when queued work is applied.
+  #[must_use]
+  pub fn applied_frame(&self) -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.applied_frame()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      Some(0)
     }
   }
 
@@ -448,19 +569,38 @@ pub struct CompanionOverlay {
   inner: platform_impl::CompanionOverlay,
 }
 
+/// How the creation of a [`CompanionOverlay`] stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompanionStatus {
+  /// The overlay is still being created. Its companions are not yet
+  /// drawn.
+  Pending,
+  /// The overlay is on screen and draws the companions.
+  Shown,
+  /// The window has no companions to draw, so nothing was created.
+  Absent,
+}
+
 impl CompanionOverlay {
   /// Creates an overlay for the companions of `window`, drawn where they
   /// stand, within `outer_rect`.
   ///
-  /// Returns `None` when the window has no companions, so a window
-  /// without them costs only the shared companion search.
+  /// Returns `None` when the window is known to have no overlay, so a
+  /// window without companions costs only the shared companion search.
+  ///
+  /// Creation may finish after this returns: see
+  /// [`CompanionOverlay::status`].
   ///
   /// # Platform-specific
   ///
   /// - macOS: always `None`.
-  /// - Windows: also `None` for a topmost window, whose band the overlay
-  ///   may not join.
+  /// - Windows: queues the creation to the event loop and never waits for
+  ///   it, so a window without companions is only found out by `status`
+  ///   reporting [`CompanionStatus::Absent`]. `None` for a topmost window,
+  ///   whose band the overlay may not join. The context's wake runs once
+  ///   the creation is done.
   pub fn new(
+    context: &AnimationContext,
     window: &NativeWindow,
     outer_rect: &Rect,
     dispatcher: &Dispatcher,
@@ -469,15 +609,49 @@ impl CompanionOverlay {
     {
       Ok(
         platform_impl::CompanionOverlay::new(
-          window, outer_rect, dispatcher,
+          &context.inner,
+          window,
+          outer_rect,
+          dispatcher,
         )?
         .map(|inner| Self { inner }),
       )
     }
     #[cfg(target_os = "macos")]
     {
-      let _ = (window, outer_rect, dispatcher);
+      let _ = (context, window, outer_rect, dispatcher);
       Ok(None)
+    }
+  }
+
+  /// How the overlay's creation stands. An error means the creation
+  /// failed, and the overlay will never be shown.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: never created, so never asked.
+  pub fn status(&self) -> crate::Result<CompanionStatus> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.status()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      Ok(CompanionStatus::Absent)
+    }
+  }
+
+  /// Takes the first failure of a queued operation that nobody waited
+  /// for, if there is one. See [`AnimationWindow::take_failure`].
+  #[must_use]
+  pub fn take_failure(&self) -> Option<crate::Error> {
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.take_failure()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      None
     }
   }
 

@@ -33,6 +33,8 @@ pub enum NativeCall {
 struct Counters {
   hops: AtomicU64,
   hop_blocked_ns: AtomicU64,
+  hop_wait_ns: AtomicU64,
+  hop_run_ns: AtomicU64,
   ax_reads: AtomicU64,
   ax_writes: AtomicU64,
   ax_actions: AtomicU64,
@@ -48,6 +50,8 @@ impl Counters {
     Self {
       hops: AtomicU64::new(0),
       hop_blocked_ns: AtomicU64::new(0),
+      hop_wait_ns: AtomicU64::new(0),
+      hop_run_ns: AtomicU64::new(0),
       ax_reads: AtomicU64::new(0),
       ax_writes: AtomicU64::new(0),
       ax_actions: AtomicU64::new(0),
@@ -72,12 +76,20 @@ impl Counters {
     counter.fetch_add(1, Ordering::Relaxed);
   }
 
-  /// Counts one cross-thread hop and the time its caller waited.
-  fn record_hop(&self, blocked: Duration) {
+  /// Counts one cross-thread hop, the time its caller waited, and how
+  /// that time split between queue wait and run time.
+  fn record_hop(&self, blocked: Duration, wait: Duration, run: Duration) {
+    /// Saturates after about 584 years.
+    fn nanos(duration: Duration) -> u64 {
+      u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+    }
+
     self.hops.fetch_add(1, Ordering::Relaxed);
-    // Saturates after about 584 years of blocking.
-    let blocked_ns = u64::try_from(blocked.as_nanos()).unwrap_or(u64::MAX);
-    self.hop_blocked_ns.fetch_add(blocked_ns, Ordering::Relaxed);
+    self
+      .hop_blocked_ns
+      .fetch_add(nanos(blocked), Ordering::Relaxed);
+    self.hop_wait_ns.fetch_add(nanos(wait), Ordering::Relaxed);
+    self.hop_run_ns.fetch_add(nanos(run), Ordering::Relaxed);
   }
 
   /// Reads every counter.
@@ -88,6 +100,8 @@ impl Counters {
     NativeCallSnapshot {
       hops: self.hops.load(Ordering::Relaxed),
       hop_blocked_ns: self.hop_blocked_ns.load(Ordering::Relaxed),
+      hop_wait_ns: self.hop_wait_ns.load(Ordering::Relaxed),
+      hop_run_ns: self.hop_run_ns.load(Ordering::Relaxed),
       ax_reads: self.ax_reads.load(Ordering::Relaxed),
       ax_writes: self.ax_writes.load(Ordering::Relaxed),
       ax_actions: self.ax_actions.load(Ordering::Relaxed),
@@ -123,7 +137,8 @@ static COUNTERS: Counters = Counters::new();
 /// # Platform-specific
 ///
 /// - **macOS:** every counter is filled.
-/// - **Windows:** only `hops` and `hop_blocked` are; the rest stay zero.
+/// - **Windows:** only `hops`, `hop_blocked`, `hop_wait` and `hop_run`
+///   are; the rest stay zero.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeCallStats;
 
@@ -140,9 +155,14 @@ impl NativeCallStats {
     COUNTERS.record(call);
   }
 
-  /// Counts one cross-thread hop and the time its caller waited.
-  pub(crate) fn record_hop(blocked: Duration) {
-    COUNTERS.record_hop(blocked);
+  /// Counts one cross-thread hop, the time its caller waited, and how
+  /// that time split between queue wait and run time.
+  pub(crate) fn record_hop(
+    blocked: Duration,
+    wait: Duration,
+    run: Duration,
+  ) {
+    COUNTERS.record_hop(blocked, wait, run);
   }
 }
 
@@ -154,6 +174,12 @@ pub struct NativeCallSnapshot {
   pub hops: u64,
   /// Nanoseconds callers spent blocked waiting on those hops.
   pub hop_blocked_ns: u64,
+  /// Nanoseconds those hops' closures sat queued before the event loop
+  /// started them. A hop that never ran counts all its blocked time here.
+  pub hop_wait_ns: u64,
+  /// Nanoseconds the event loop spent running those hops' closures.
+  /// `hop_wait_ns + hop_run_ns` is at most `hop_blocked_ns`.
+  pub hop_run_ns: u64,
   /// Accessibility attribute reads.
   pub ax_reads: u64,
   /// Accessibility attribute writes.
@@ -181,6 +207,8 @@ impl NativeCallSnapshot {
       hop_blocked_ns: self
         .hop_blocked_ns
         .saturating_sub(earlier.hop_blocked_ns),
+      hop_wait_ns: self.hop_wait_ns.saturating_sub(earlier.hop_wait_ns),
+      hop_run_ns: self.hop_run_ns.saturating_sub(earlier.hop_run_ns),
       ax_reads: self.ax_reads.saturating_sub(earlier.ax_reads),
       ax_writes: self.ax_writes.saturating_sub(earlier.ax_writes),
       ax_actions: self.ax_actions.saturating_sub(earlier.ax_actions),
@@ -204,6 +232,18 @@ impl NativeCallSnapshot {
   pub fn hop_blocked(&self) -> Duration {
     Duration::from_nanos(self.hop_blocked_ns)
   }
+
+  /// Gets the time hops sat queued before the event loop started them.
+  #[must_use]
+  pub fn hop_wait(&self) -> Duration {
+    Duration::from_nanos(self.hop_wait_ns)
+  }
+
+  /// Gets the time the event loop spent running hops.
+  #[must_use]
+  pub fn hop_run(&self) -> Duration {
+    Duration::from_nanos(self.hop_run_ns)
+  }
 }
 
 impl fmt::Display for NativeCallSnapshot {
@@ -211,11 +251,13 @@ impl fmt::Display for NativeCallSnapshot {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "hops={} hop_blocked_ms={:.2} ax_reads={} ax_writes={} \
-       ax_actions={} window_list_single={} window_list_full={} \
-       screen_enumerations={} screen_captures={}",
+      "hops={} hop_blocked_ms={:.2} hop_wait_ms={:.2} hop_run_ms={:.2} \
+       ax_reads={} ax_writes={} ax_actions={} window_list_single={} \
+       window_list_full={} screen_enumerations={} screen_captures={}",
       self.hops,
       self.hop_blocked().as_secs_f64() * 1000.0,
+      self.hop_wait().as_secs_f64() * 1000.0,
+      self.hop_run().as_secs_f64() * 1000.0,
       self.ax_reads,
       self.ax_writes,
       self.ax_actions,
@@ -243,13 +285,19 @@ mod tests {
     counters.record(NativeCall::WindowListFull);
     counters.record(NativeCall::ScreenEnumeration);
     counters.record(NativeCall::ScreenCapture);
-    counters.record_hop(Duration::from_micros(1500));
+    counters.record_hop(
+      Duration::from_micros(1500),
+      Duration::from_micros(1000),
+      Duration::from_micros(400),
+    );
 
     assert_eq!(
       counters.snapshot(),
       NativeCallSnapshot {
         hops: 1,
         hop_blocked_ns: 1_500_000,
+        hop_wait_ns: 1_000_000,
+        hop_run_ns: 400_000,
         ax_reads: 2,
         ax_writes: 1,
         ax_actions: 1,
@@ -285,13 +333,19 @@ mod tests {
     let before = NativeCallStats::snapshot();
 
     NativeCallStats::record(NativeCall::AxRead);
-    NativeCallStats::record_hop(Duration::from_nanos(7));
+    NativeCallStats::record_hop(
+      Duration::from_nanos(7),
+      Duration::from_nanos(3),
+      Duration::from_nanos(4),
+    );
 
     // Other tests share the counters, so only a lower bound holds.
     let spent = NativeCallStats::snapshot().since(&before);
     assert!(spent.ax_reads >= 1);
     assert!(spent.hops >= 1);
     assert!(spent.hop_blocked_ns >= 7);
+    assert!(spent.hop_wait_ns >= 3);
+    assert!(spent.hop_run_ns >= 4);
   }
 
   #[test]
@@ -301,6 +355,8 @@ mod tests {
     for key in [
       "hops=",
       "hop_blocked_ms=",
+      "hop_wait_ms=",
+      "hop_run_ms=",
       "ax_reads=",
       "ax_writes=",
       "ax_actions=",

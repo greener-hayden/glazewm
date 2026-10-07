@@ -10,9 +10,9 @@ use wm_common::{
   WindowEffectConfig, WindowState, WmEvent,
 };
 use wm_platform::{
-  Color, ConcealMethod, CornerStyle, Delta, NativeCallSnapshot,
-  NativeCallStats, OpacityValue, PlacementSession, Rect, WindowId,
-  WindowZOrder,
+  Color, CompanionStatus, ConcealMethod, CornerStyle, Delta,
+  NativeCallSnapshot, NativeCallStats, OpacityValue, PlacementSession,
+  Rect, WindowId, WindowZOrder,
 };
 
 use crate::{
@@ -25,7 +25,10 @@ use crate::{
     ObservePlan, ObservedFrame, ReconcilePhase,
   },
   perf::{self, PerfSpan, SyncDetail, SyncOrigin, SLOW_CALL, SLOW_SPAN},
-  presentation::{MotionPreparation, SourceLease},
+  presentation::{
+    CoverSync, MotionPreparation, OverlayGate, SourceLease,
+    PREPARATION_LIMIT,
+  },
   traits::{
     effective_opacity, CommonGetters, PositionGetters, WindowGetters,
   },
@@ -546,6 +549,11 @@ impl RetireFence {
 /// `AnimationManager::decorate_native`.
 #[derive(Clone, Copy, Debug)]
 enum DecorationPhase {
+  /// The companion overlay is still being created, and `DECORATED` is not
+  /// yet published: the companions would hide before the overlay draws
+  /// them. Abandoned if the overlay is not shown by `PREPARATION_LIMIT`
+  /// after this instant.
+  Pending(Instant),
   /// The motion runs and the published `DECORATED` flag is set.
   Drawing,
   /// The motion has ended and the flag is cleared. The overlay is held
@@ -576,6 +584,9 @@ struct ManagedWindow {
   fullscreen: Option<bool>,
   retired: bool,
   recovery_at: Option<Instant>,
+  /// When the reveal of the source began waiting for its cover to show
+  /// where the source now stands. Bounded by `PREPARATION_LIMIT`.
+  cover_hold: Option<Instant>,
 }
 
 impl ManagedWindow {
@@ -705,7 +716,8 @@ impl SettlingView<'_> {
       completion: self.running,
       deadline: preparation.is_some()
         || self.frame.deadline().is_some()
-        || self.retry_at.is_some(),
+        || self.retry_at.is_some()
+        || matches!(self.decoration, Some(DecorationPhase::Pending(_))),
     }
   }
 }
@@ -1032,6 +1044,12 @@ impl PlacementCoordinator {
           if let Err(err) = window.native.mark_decorated(false) {
             tracing::debug!("Decoration flag clear failed: {err}");
           }
+          window.decoration = None;
+        } else if matches!(
+          window.decoration,
+          Some(DecorationPhase::Pending(_))
+        ) {
+          // Nothing was published, so there is nothing to clear.
           window.decoration = None;
         }
         if let Err(err) = window.native.release() {
@@ -1871,22 +1889,21 @@ fn plan_window<'a>(
 /// Releases each ready batch together; failed participants no longer block
 /// it.
 fn release_ready(state: &mut WmState) {
+  let now = Instant::now();
   let blocked = state
     .native_sync
     .windows
     .values()
-    .filter_map(|entry| {
-      entry
-        .motion
-        .as_ref()
-        .and_then(MotionOwner::preparation)
-        .filter(|motion| {
-          !motion.ready(
-            entry.frame.generation,
-            state.native_sync.presented_frame,
-          )
-        })
-        .map(|motion| motion.batch)
+    .filter_map(|entry| match entry.motion.as_ref()? {
+      MotionOwner::Overlay(motion) => (!motion
+        .ready(entry.frame.generation, state.native_sync.presented_frame))
+      .then_some(motion.batch),
+      // A native motion waits for its companion overlay, so the
+      // companions are anchored to the window before it moves.
+      MotionOwner::Native { batch } => {
+        decoration_blocks_batch(entry.decoration.as_ref(), now)
+          .then_some(*batch)
+      }
     })
     .collect::<HashSet<_>>();
   for (id, entry) in &mut state.native_sync.windows {
@@ -2244,40 +2261,51 @@ fn apply_cloak(
   entry: &mut ManagedWindow,
   cloaked: bool,
 ) -> anyhow::Result<()> {
-  let timing = tracing::enabled!(tracing::Level::DEBUG);
-  let started = timing.then(Instant::now);
+  let started = Instant::now();
   let observed = entry.native.is_cloaked()?;
-  let t_read = started.map(|at| at.elapsed());
+  let read = started.elapsed();
   if observed != cloaked {
     entry.native.cloak(cloaked)?;
   }
-  if let (Some(at), Some(read)) = (started, t_read) {
-    let total = at.elapsed();
-    if total >= Duration::from_micros(500) {
-      tracing::debug!(
+  let total = started.elapsed();
+  // A call that crosses to the shell is logged from `SLOW_CALL` on, so a
+  // slow one is found in the perf log without `-v`.
+  let slow = total >= SLOW_CALL;
+  if slow
+    || (total >= Duration::from_micros(500)
+      && tracing::enabled!(
+        target: perf::PERF_TARGET,
+        tracing::Level::DEBUG
+      ))
+  {
+    perf::emit(
+      slow,
+      format_args!(
         "cloak_slow total={}us read={}us write={}us changed={}",
         total.as_micros(),
         read.as_micros(),
         total.saturating_sub(read).as_micros(),
         observed != cloaked,
-      );
-    }
+      ),
+    );
   }
   Ok(())
 }
 
 /// Decorates a window whose native motion was just prepared.
 ///
-/// Draws the window's companions from a companion overlay and publishes
-/// `DECORATED` once they are drawn. A retarget keeps a running decoration,
-/// and resumes one still held for its reveal. Without companions nothing
-/// is published.
+/// Starts drawing the window's companions from a companion overlay. The
+/// overlay is created asynchronously, so `DECORATED` is published only
+/// once it reports shown: see `settle_decoration`. A retarget keeps a
+/// running decoration, and resumes one still held for its reveal. Without
+/// companions nothing is published.
 fn decorate_native(
   entry: &mut ManagedWindow,
   window: &WindowContainer,
   start: &Rect,
   frame_rate: u32,
   state: &mut WmState,
+  now: Instant,
 ) {
   let id = window.id();
   if !state.animation_manager.decorate_native(
@@ -2289,20 +2317,70 @@ fn decorate_native(
   ) {
     return;
   }
-  if matches!(entry.decoration, Some(DecorationPhase::Drawing)) {
+  if matches!(
+    entry.decoration,
+    Some(DecorationPhase::Drawing | DecorationPhase::Pending(_))
+  ) {
     return;
   }
+  entry.decoration = Some(DecorationPhase::Pending(now));
+}
+
+/// Publishes `DECORATED` for a window whose companion overlay is shown.
+///
+/// Unflagged companions keep drawing themselves; drawing them here too
+/// would show two, so a failure retires the overlay.
+fn publish_decoration(
+  entry: &mut ManagedWindow,
+  id: &Uuid,
+  state: &mut WmState,
+) {
   match entry.native.mark_decorated(true) {
     Ok(()) => entry.decoration = Some(DecorationPhase::Drawing),
-    // Unflagged companions keep drawing themselves; drawing them here too
-    // would show two.
     Err(err) => {
       tracing::warn!(window = %id, "Decoration flag failed: {err}");
       entry.decoration = None;
-      if let Err(err) = state.animation_manager.retire_decoration(&id) {
+      if let Err(err) = state.animation_manager.retire_decoration(id) {
         tracing::warn!("Companion overlay cleanup failed: {err}");
       }
     }
+  }
+}
+
+/// What a decoration waiting for its overlay does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingDecoration {
+  /// The overlay is shown while the motion runs: publish `DECORATED`.
+  Publish,
+  /// Check again at this instant, or when the creation completes.
+  Wait(Instant),
+  /// Nothing will be drawn: the overlay has no companions, failed, never
+  /// finished in time, or the motion ended first. `DECORATED` was never
+  /// published, so there is nothing to reveal.
+  Abandon,
+}
+
+/// Decides what a decoration created at `since` does, given how its
+/// overlay stands.
+///
+/// `status` is `None` when the manager holds no overlay, and an error
+/// when its creation failed.
+fn pending_decoration(
+  status: &anyhow::Result<Option<CompanionStatus>>,
+  native_motion: bool,
+  since: Instant,
+  now: Instant,
+) -> PendingDecoration {
+  match status {
+    Ok(Some(CompanionStatus::Shown)) if native_motion => {
+      PendingDecoration::Publish
+    }
+    Ok(Some(CompanionStatus::Pending))
+      if native_motion && now < since + PREPARATION_LIMIT =>
+    {
+      PendingDecoration::Wait(since + PREPARATION_LIMIT)
+    }
+    _ => PendingDecoration::Abandon,
   }
 }
 
@@ -2314,6 +2392,9 @@ fn decorate_native(
 /// themselves again. Motion handed to a cover retires it at once, because
 /// the cover draws the companions itself.
 ///
+/// A decoration whose overlay is still being created publishes
+/// `DECORATED` once it is shown, and is abandoned if it never is.
+///
 /// Returns when a held decoration should be checked again.
 fn settle_decoration(
   entry: &mut ManagedWindow,
@@ -2323,8 +2404,23 @@ fn settle_decoration(
   sampled_frame: u64,
   now: Instant,
 ) -> anyhow::Result<Option<Instant>> {
-  let decorating = state.animation_manager.has_decoration(id);
   let native = matches!(entry.motion, Some(MotionOwner::Native { .. }));
+  if let Some(DecorationPhase::Pending(since)) = entry.decoration {
+    let status = state.animation_manager.decoration_status(id);
+    match pending_decoration(&status, native, since, now) {
+      PendingDecoration::Publish => publish_decoration(entry, id, state),
+      PendingDecoration::Wait(at) => return Ok(Some(at)),
+      PendingDecoration::Abandon => {
+        if let Err(err) = &status {
+          tracing::warn!(window = %id, "Companion overlay failed: {err}");
+        }
+        entry.decoration = None;
+        state.animation_manager.retire_decoration(id)?;
+        return Ok(None);
+      }
+    }
+  }
+  let decorating = state.animation_manager.has_decoration(id);
   if matches!(entry.decoration, Some(DecorationPhase::Drawing))
     && !(native && decorating)
   {
@@ -2374,6 +2470,75 @@ fn begin_handoff(
       .get_or_insert(RetireFence::new(sampled_frame, now));
   }
   Ok(())
+}
+
+/// The gate a preparation starts with, given whether the window already
+/// has an overlay.
+///
+/// A new overlay starts `Creating`. A retained one is already on screen,
+/// unless it is still being created (or failed, which the next refresh
+/// cancels), and unless the preparation it replaces is still waiting for
+/// it to be composed: that gate is carried over, so a retarget never
+/// shortens the wait of the cover it lands on. Carrying it is deliberate,
+/// and the same on every platform; on macOS a created overlay reports a
+/// frame at once, so the carried gate is simply the earlier preparation's.
+///
+/// `shown` reports the retained overlay's creation, and is called only
+/// for one.
+fn initial_gate(
+  covered: bool,
+  shown: impl FnOnce() -> anyhow::Result<Option<u64>>,
+  carried: Option<OverlayGate>,
+) -> OverlayGate {
+  if !covered {
+    return OverlayGate::Creating;
+  }
+  match shown() {
+    Ok(Some(_)) => carried.unwrap_or(OverlayGate::Presented),
+    Ok(None) | Err(_) => OverlayGate::Creating,
+  }
+}
+
+/// Whether the reveal of a source waits for its cover.
+///
+/// The cover is queued to stand where the source now is. Revealing the
+/// source before that is drawn and composed shows it against a cover at
+/// its old place. The wait is bounded, so a cover that never finishes
+/// cannot hold a source concealed.
+fn cover_holds_reveal(
+  sync: CoverSync,
+  compositor_frame: u64,
+  held_since: Instant,
+  now: Instant,
+) -> bool {
+  !sync.ready(compositor_frame) && now < held_since + PREPARATION_LIMIT
+}
+
+/// Whether a decoration whose overlay is still being created holds back
+/// the native batch it belongs to.
+///
+/// The companions' anchors are recorded when the overlay is created. If
+/// the window had begun to move by then, the recorded anchors would carry
+/// that lag into the ring for the whole motion. Bounded, as the decoration
+/// is abandoned after `PREPARATION_LIMIT`.
+fn decoration_blocks_batch(
+  decoration: Option<&DecorationPhase>,
+  now: Instant,
+) -> bool {
+  matches!(
+    decoration,
+    Some(DecorationPhase::Pending(since)) if now < *since + PREPARATION_LIMIT
+  )
+}
+
+/// Whether a source must stay visible at compositor frame `frame`.
+///
+/// Existing content stays until the overlay that replaces it has been
+/// created and composed. Only then may the source be leased and concealed.
+fn source_retained(motion: Option<&MotionOwner>, frame: u64) -> bool {
+  motion
+    .and_then(MotionOwner::preparation)
+    .is_some_and(|motion| motion.retains_source(frame))
 }
 
 /// Owns placement, independent overlay readiness, and source visibility.
@@ -2441,6 +2606,7 @@ fn reconcile_window(
       fullscreen: None,
       retired: false,
       recovery_at: None,
+      cover_hold: None,
     });
   }
   // Keep the session outside the map while borrowing other coordinator
@@ -2527,7 +2693,7 @@ fn reconcile_managed(
         batch: state.native_sync.batch,
       });
       entry.retire_after = None;
-      decorate_native(entry, window, &start, frame_rate, state);
+      decorate_native(entry, window, &start, frame_rate, state, now);
     } else if entry.conceal.is_some()
       && native_state == NativeState::Normal
       && observed.state == NativeState::Normal
@@ -2542,6 +2708,16 @@ fn reconcile_managed(
       // A retained overlay is already presented. Retargeting it needs no
       // new overlay frame, and the source stays covered throughout.
       let covered = state.animation_manager.has_overlay(&id);
+      let carried_gate = entry
+        .motion
+        .as_ref()
+        .and_then(MotionOwner::preparation)
+        .map(MotionPreparation::overlay);
+      let gate = initial_gate(
+        covered,
+        || state.animation_manager.overlay_shown_frame(&id),
+        carried_gate,
+      );
       // A source still concealed behind its cover has nothing to wait for,
       // so a retarget continues the motion at once. One being restored may
       // already show; its cover holds until it is concealed again.
@@ -2596,12 +2772,15 @@ fn reconcile_managed(
           // An immediate motion is already running. It has no readiness,
           // so it neither waits for its batch nor holds the batch back.
           entry.motion = (start == MotionStart::Held).then(|| {
-            MotionOwner::Overlay(MotionPreparation::new(
-              state.native_sync.batch,
-              (!covered).then_some(sampled_frame),
-              now,
-              requires_cover,
-            ))
+            MotionOwner::Overlay(
+              MotionPreparation::new(
+                state.native_sync.batch,
+                gate,
+                now,
+                requires_cover,
+              )
+              .requested_at(sampled_frame),
+            )
           });
           entry.retire_after = None;
           if let Some(source) = &mut entry.source {
@@ -2627,6 +2806,21 @@ fn reconcile_managed(
     }
     timer.mark("prepare");
   }
+  // The cover may be created on another thread. Each pass takes its
+  // report, so a source is concealed only behind a cover that is shown.
+  if let Some(MotionOwner::Overlay(motion)) = &mut entry.motion {
+    match state.animation_manager.overlay_shown_frame(&id) {
+      Ok(shown) => {
+        motion.refresh_overlay(shown);
+        motion.refresh_cover(state.animation_manager.overlay_sync(&id));
+      }
+      Err(err) => {
+        tracing::warn!(window = %id, "Presentation overlay failed: {err}");
+        entry.cancelled = true;
+      }
+    }
+  }
+  timer.mark("gate");
   let native_motion =
     matches!(entry.motion, Some(MotionOwner::Native { .. }));
   let visible_target = state
@@ -2657,8 +2851,8 @@ fn reconcile_managed(
   // invisible throughout preparation, including its first native frame.
   let preparation =
     entry.motion.as_ref().and_then(MotionOwner::preparation);
-  let retaining_source = preparation
-    .is_some_and(|motion| motion.retains_source(compositor_frame));
+  let retaining_source =
+    source_retained(entry.motion.as_ref(), compositor_frame);
   if !retaining_source && preparation.is_some() && entry.source.is_none() {
     entry.native.present(true)?;
     entry.source = Some(SourceLease::default());
@@ -2900,17 +3094,35 @@ fn reconcile_managed(
   if native_state == NativeState::Minimized && converged {
     entry.visibility_pending = false;
   }
-  if restoring
+  let mut revealing = restoring
     && (converged
       || dragging
       || entry.frame.phase == ReconcilePhase::Failed)
-    && !entry.visibility_pending
-  {
+    && !entry.visibility_pending;
+  if !revealing {
+    entry.cover_hold = None;
+  }
+  if revealing {
     if visible && native_state != NativeState::Minimized {
       state
         .animation_manager
         .place_overlay(&id, &entry.native.window()?.frame()?)?;
     }
+    // The cover was only queued to stand here. The source stays
+    // concealed until it does, and the retry deadline below keeps the
+    // window coming back.
+    let held_since = *entry.cover_hold.get_or_insert(now);
+    if cover_holds_reveal(
+      state.animation_manager.overlay_sync(&id),
+      compositor_frame,
+      held_since,
+      now,
+    ) {
+      revealing = false;
+    }
+  }
+  if revealing {
+    entry.cover_hold = None;
     let final_alpha = effective_opacity(hidden_parking, requested_alpha);
     if entry.native.supports_opacity() {
       entry.native.opacity(final_alpha)?;
@@ -3663,13 +3875,261 @@ mod tests {
     assert!(MotionOwner::Native { batch: 1 }.preparation().is_none());
     let owner = MotionOwner::Overlay(MotionPreparation::new(
       1,
-      Some(10),
+      OverlayGate::CreatedAt(10),
       Instant::now(),
       true,
     ));
     let preparation = owner.preparation().expect("Overlay preparation.");
     assert!(preparation.retains_source(10));
     assert!(!preparation.retains_source(11));
+  }
+
+  /// Builds an overlay motion in the given gate state.
+  fn overlay_motion(
+    gate: OverlayGate,
+    requires_cover: bool,
+  ) -> MotionOwner {
+    MotionOwner::Overlay(MotionPreparation::new(
+      1,
+      gate,
+      Instant::now(),
+      requires_cover,
+    ))
+  }
+
+  /// The source of existing content is never released before its cover is
+  /// presented: not while the cover is being created, and not until a
+  /// compositor frame later than the one it was shown at.
+  #[test]
+  fn a_source_is_never_released_before_its_cover_is_presented() {
+    for frame in 0..30 {
+      assert!(source_retained(
+        Some(&overlay_motion(OverlayGate::Creating, true)),
+        frame
+      ));
+      for shown in 0..30 {
+        let motion = overlay_motion(OverlayGate::CreatedAt(shown), true);
+        assert_eq!(source_retained(Some(&motion), frame), frame <= shown);
+      }
+      assert!(!source_retained(
+        Some(&overlay_motion(OverlayGate::Presented, true)),
+        frame
+      ));
+      // Opening windows and native motion have nothing to retain.
+      assert!(!source_retained(
+        Some(&overlay_motion(OverlayGate::Creating, false)),
+        frame
+      ));
+      assert!(!source_retained(
+        Some(&MotionOwner::Native { batch: 1 }),
+        frame
+      ));
+      assert!(!source_retained(None, frame));
+    }
+  }
+
+  /// A held motion waits through creation, and is released only after the
+  /// creation reports a frame and a later one passes.
+  #[test]
+  fn held_motion_waits_for_creation_then_for_a_later_frame() {
+    let mut owner = overlay_motion(OverlayGate::Creating, true);
+    let ready = |owner: &MotionOwner, frame: u64| {
+      owner
+        .preparation()
+        .is_some_and(|motion| motion.ready(1, frame))
+    };
+    let MotionOwner::Overlay(motion) = &mut owner else {
+      panic!("Overlay motion.");
+    };
+    motion.observe(1, true, 5);
+    for frame in 6..20 {
+      assert!(
+        !ready(&owner, frame),
+        "Released while creating at {frame}."
+      );
+    }
+    let MotionOwner::Overlay(motion) = &mut owner else {
+      panic!("Overlay motion.");
+    };
+    // The creation completes, having been shown at frame 20.
+    motion.refresh_overlay(Some(20));
+    assert!(!ready(&owner, 20));
+    assert!(ready(&owner, 21));
+  }
+
+  /// A source whose cover is still being created keeps waking the pass
+  /// that gates it, by the deadline that bounds a creation that never
+  /// completes.
+  #[test]
+  fn a_creating_cover_has_a_deadline_and_no_stale_gate() {
+    let motion = overlay_motion(OverlayGate::Creating, true);
+    let frame = FrameReconciler::new(DesiredFrame {
+      rect: Rect::from_xy(0, 0, 10, 10),
+      monitor: Rect::from_xy(0, 0, 100, 100),
+      working_area: Rect::from_xy(0, 0, 100, 100),
+      dpi: 96,
+      state: NativeState::Normal,
+      parking_clamp: None,
+    });
+    let view = SettlingView {
+      frame: &frame,
+      motion: Some(&motion),
+      source: None,
+      retire_after: None,
+      decoration: None,
+      visibility_pending: false,
+      cancelled: false,
+      running: false,
+      retry_at: None,
+    };
+    assert!(view.settling());
+    let wake = view.wake(10);
+    assert!(wake.deadline);
+    assert!(wake.gate.is_none());
+  }
+
+  /// A retained overlay is presented only if it is created, and carries
+  /// the gate of the preparation it replaces; a new one starts creating.
+  #[test]
+  fn initial_gate_follows_the_overlay_and_carries_its_gate() {
+    use OverlayGate::{CreatedAt, Creating, Presented};
+    let created = || -> anyhow::Result<Option<u64>> { Ok(Some(5)) };
+    let creating = || -> anyhow::Result<Option<u64>> { Ok(None) };
+    let failed = || -> anyhow::Result<Option<u64>> {
+      Err(anyhow::anyhow!("Failed."))
+    };
+    let never = || -> anyhow::Result<Option<u64>> {
+      panic!("A new overlay has no report to ask for.")
+    };
+
+    // No overlay yet: creating, whatever was carried.
+    assert_eq!(initial_gate(false, never, None), Creating);
+    assert_eq!(initial_gate(false, never, Some(Presented)), Creating);
+    assert_eq!(initial_gate(false, never, Some(CreatedAt(9))), Creating);
+
+    // A created one is presented unless an earlier gate still waits.
+    assert_eq!(initial_gate(true, created, None), Presented);
+    assert_eq!(initial_gate(true, created, Some(Presented)), Presented);
+    assert_eq!(
+      initial_gate(true, created, Some(CreatedAt(9))),
+      CreatedAt(9)
+    );
+    assert_eq!(initial_gate(true, created, Some(Creating)), Creating);
+
+    // One still being created, or failed, is not presented.
+    for carried in [None, Some(Presented), Some(CreatedAt(9))] {
+      assert_eq!(initial_gate(true, creating, carried), Creating);
+      assert_eq!(initial_gate(true, failed, carried), Creating);
+    }
+  }
+
+  /// The reveal waits for the cover to be drawn and composed, and gives up
+  /// at the limit.
+  #[test]
+  fn the_reveal_waits_for_its_cover_within_the_limit() {
+    let since = Instant::now();
+    let soon = since + Duration::from_millis(5);
+    let late = since + PREPARATION_LIMIT;
+    assert!(!cover_holds_reveal(CoverSync::Synced, 1, since, soon));
+    assert!(cover_holds_reveal(CoverSync::Queued, 99, since, soon));
+    assert!(cover_holds_reveal(
+      CoverSync::AppliedAt(10),
+      10,
+      since,
+      soon
+    ));
+    assert!(!cover_holds_reveal(
+      CoverSync::AppliedAt(10),
+      11,
+      since,
+      soon
+    ));
+    // Never forever.
+    assert!(!cover_holds_reveal(CoverSync::Queued, 99, since, late));
+    assert!(!cover_holds_reveal(
+      CoverSync::AppliedAt(10),
+      10,
+      since,
+      late
+    ));
+  }
+
+  /// A decoration waiting for its overlay holds its native batch, until
+  /// the limit.
+  #[test]
+  fn a_pending_decoration_holds_its_batch_within_the_limit() {
+    let now = Instant::now();
+    let later = now + Duration::from_millis(5);
+    let expired = now + PREPARATION_LIMIT;
+    let pending = DecorationPhase::Pending(now);
+    assert!(decoration_blocks_batch(Some(&pending), later));
+    assert!(!decoration_blocks_batch(Some(&pending), expired));
+    assert!(!decoration_blocks_batch(None, later));
+    assert!(!decoration_blocks_batch(
+      Some(&DecorationPhase::Drawing),
+      later
+    ));
+    assert!(!decoration_blocks_batch(
+      Some(&DecorationPhase::Revealing(RetireFence::new(1, now))),
+      later
+    ));
+  }
+
+  /// A decoration publishes only once its overlay is shown during the
+  /// motion, waits while it is created, and is otherwise abandoned with
+  /// nothing published.
+  #[test]
+  fn a_decoration_publishes_only_once_its_overlay_is_shown() {
+    let now = Instant::now();
+    let later = now + Duration::from_millis(10);
+    let expired = now + PREPARATION_LIMIT;
+    let shown = Ok(Some(CompanionStatus::Shown));
+    let pending = Ok(Some(CompanionStatus::Pending));
+    assert_eq!(
+      pending_decoration(&pending, true, now, later),
+      PendingDecoration::Wait(now + PREPARATION_LIMIT)
+    );
+    assert_eq!(
+      pending_decoration(&shown, true, now, later),
+      PendingDecoration::Publish
+    );
+    // Never published for an overlay still being created, past the
+    // limit, or for motion that already ended.
+    assert_eq!(
+      pending_decoration(&pending, true, now, expired),
+      PendingDecoration::Abandon
+    );
+    assert_eq!(
+      pending_decoration(&pending, false, now, later),
+      PendingDecoration::Abandon
+    );
+    assert_eq!(
+      pending_decoration(&shown, false, now, later),
+      PendingDecoration::Abandon
+    );
+    // No companions, no overlay and a failed creation.
+    assert_eq!(
+      pending_decoration(
+        &Ok(Some(CompanionStatus::Absent)),
+        true,
+        now,
+        later
+      ),
+      PendingDecoration::Abandon
+    );
+    assert_eq!(
+      pending_decoration(&Ok(None), true, now, later),
+      PendingDecoration::Abandon
+    );
+    assert_eq!(
+      pending_decoration(
+        &Err(anyhow::anyhow!("Failed.")),
+        true,
+        now,
+        later
+      ),
+      PendingDecoration::Abandon
+    );
   }
 
   /// The fence waits for composition, then for companions, then gives
@@ -3857,7 +4317,7 @@ mod tick_due_tests {
       Self {
         motion: Some(MotionOwner::Overlay(MotionPreparation::new(
           1,
-          Some(gate),
+          OverlayGate::CreatedAt(gate),
           now,
           true,
         ))),
@@ -4046,10 +4506,10 @@ mod tick_due_tests {
     assert!(!revealed.due(synced, now, || true));
     let mut states = Vec::new();
     for in_flight in [false, true] {
-      for motion in 0..4 {
+      for motion in 0..5 {
         for source in 0..3 {
           for retire in 0..3 {
-            for decoration in 0..3 {
+            for decoration in 0..4 {
               for flags in 0..16_u8 {
                 let fence = if retire == 2 { revealed } else { waiting };
                 states.push(Parts {
@@ -4064,14 +4524,27 @@ mod tick_due_tests {
                     2 => {
                       Some(MotionOwner::Overlay(MotionPreparation::new(
                         1,
-                        Some(synced + 1),
+                        OverlayGate::CreatedAt(synced + 1),
                         now,
                         true,
                       )))
                     }
-                    _ => Some(MotionOwner::Overlay(
-                      MotionPreparation::new(1, None, now, true),
-                    )),
+                    3 => {
+                      Some(MotionOwner::Overlay(MotionPreparation::new(
+                        1,
+                        OverlayGate::Presented,
+                        now,
+                        true,
+                      )))
+                    }
+                    _ => {
+                      Some(MotionOwner::Overlay(MotionPreparation::new(
+                        1,
+                        OverlayGate::Creating,
+                        now,
+                        true,
+                      )))
+                    }
                   },
                   source: match source {
                     0 => None,
@@ -4082,6 +4555,7 @@ mod tick_due_tests {
                   decoration: match decoration {
                     0 => None,
                     1 => Some(DecorationPhase::Drawing),
+                    2 => Some(DecorationPhase::Pending(now)),
                     _ => Some(DecorationPhase::Revealing(fence)),
                   },
                   visibility_pending: flags & 1 != 0,
@@ -4105,6 +4579,7 @@ mod tick_due_tests {
       fence.is_some_and(|fence| fence.recheck_at(synced, now).is_some())
     };
     state.visibility_pending
+      || matches!(state.decoration, Some(DecorationPhase::Pending(_)))
       || state.source.as_ref().is_some_and(|source| source.restoring)
       || rechecks(state.retire_after.as_ref())
       || rechecks(match state.decoration.as_ref() {

@@ -61,6 +61,17 @@ pub type DispatchFn = dyn FnOnce() + Send + 'static;
 /// a closure before giving up on it.
 const DISPATCH_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How a cross-thread hop split between waiting in the event loop's queue
+/// and running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HopSplit {
+  /// From the caller handing the closure over to the event loop starting
+  /// it. Time the loop spent on other work.
+  pub(crate) wait: Duration,
+  /// From the event loop starting the closure to it finishing.
+  pub(crate) run: Duration,
+}
+
 /// Runs a closure on the event loop thread and waits for its result.
 ///
 /// `enqueue` hands a `'static` closure to the event loop, which is
@@ -78,11 +89,15 @@ const DISPATCH_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 /// - If the event loop already started it, the caller keeps waiting, with
 ///   no further bound, until the closure finishes. Returning earlier would
 ///   let it run against a dead stack frame.
-pub(crate) fn dispatch_sync_via<F, R>(
+///
+/// Also reports how the hop split between queue wait and run time. The
+/// event loop measures the wait itself, when it starts the closure, so it
+/// needs no clock agreement beyond one monotonic `Instant`.
+pub(crate) fn dispatch_sync_timed<F, R>(
   enqueue: impl FnOnce(Box<DispatchFn>) -> crate::Result<()>,
   dispatch_fn: F,
   timeout: Duration,
-) -> crate::Result<R>
+) -> crate::Result<(R, HopSplit)>
 where
   F: FnOnce() -> R + Send,
   R: Send,
@@ -95,9 +110,16 @@ where
   }
 
   let (result_tx, result_rx) = mpsc::channel();
+  let handed_over = Instant::now();
 
   let local_fn: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
-    if result_tx.send(dispatch_fn()).is_err() {
+    let started = Instant::now();
+    let result = dispatch_fn();
+    let split = HopSplit {
+      wait: started.saturating_duration_since(handed_over),
+      run: started.elapsed(),
+    };
+    if result_tx.send((result, split)).is_err() {
       tracing::error!("Failed to send closure result.");
     }
   });
@@ -155,6 +177,24 @@ where
       Err(crate::Error::ChannelRecv(err))
     }
   }
+}
+
+/// Runs a closure on the event loop thread and waits for its result,
+/// without the timing. See [`dispatch_sync_timed`].
+///
+/// Used where the timing is not recorded: tests and macOS.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn dispatch_sync_via<F, R>(
+  enqueue: impl FnOnce(Box<DispatchFn>) -> crate::Result<()>,
+  dispatch_fn: F,
+  timeout: Duration,
+) -> crate::Result<R>
+where
+  F: FnOnce() -> R + Send,
+  R: Send,
+{
+  dispatch_sync_timed(enqueue, dispatch_fn, timeout)
+    .map(|(result, _)| result)
 }
 
 /// A callback that pre-processes window procedure messages received by the
@@ -619,7 +659,7 @@ impl Dispatcher {
     // TODO: Block until event loop source is set.
     let source = self.source.as_ref().unwrap();
     let mut enqueued = false;
-    let result = dispatch_sync_via(
+    let result = dispatch_sync_timed(
       |queued_fn| {
         source.send_dispatch_async(queued_fn)?;
         enqueued = true;
@@ -631,10 +671,20 @@ impl Dispatcher {
 
     // Only hops that reached the event loop are counted.
     if enqueued {
-      NativeCallStats::record_hop(hop_started.elapsed());
+      let blocked = hop_started.elapsed();
+      // A hop that reports no timing never finished running: the loop did
+      // not start it, or died. All of its time was spent waiting.
+      let split = result.as_ref().map_or(
+        HopSplit {
+          wait: blocked,
+          run: Duration::ZERO,
+        },
+        |(_, split)| *split,
+      );
+      NativeCallStats::record_hop(blocked, split.wait, split.run);
     }
 
-    result
+    result.map(|(result, _)| result)
   }
 
   /// Gets the thread ID of the event loop thread.
@@ -944,7 +994,7 @@ mod tests {
     time::{Duration, Instant},
   };
 
-  use super::dispatch_sync_via;
+  use super::{dispatch_sync_timed, dispatch_sync_via};
   use crate::{DispatchFn, EventLoop, NativeCallStats};
 
   /// Records the thread that drops it.
@@ -1201,25 +1251,75 @@ mod tests {
 
   #[test]
   fn dispatch_sync_counts_hops() {
+    const RUN_FOR: Duration = Duration::from_millis(20);
+
     let (event_loop, dispatcher) = EventLoop::new().unwrap();
-    let hops = Arc::new(Mutex::new((0, 0)));
+    let hops = Arc::new(Mutex::new((0, 0, 0)));
 
     let hops_clone = hops.clone();
     std::thread::spawn(move || {
       let before = NativeCallStats::snapshot();
-      dispatcher.dispatch_sync(|| {}).unwrap();
+      dispatcher
+        .dispatch_sync(|| std::thread::sleep(RUN_FOR))
+        .unwrap();
       let spent = NativeCallStats::snapshot().since(&before);
 
-      *hops_clone.lock().unwrap() = (spent.hops, spent.hop_blocked_ns);
+      *hops_clone.lock().unwrap() =
+        (spent.hops, spent.hop_blocked_ns, spent.hop_run_ns);
       dispatcher.stop_event_loop().unwrap();
     });
 
     event_loop.run().unwrap();
 
-    // Other tests may hop meanwhile, so only a lower bound holds.
-    let (hops, blocked_ns) = *hops.lock().unwrap();
+    // Other tests may hop meanwhile, so only a lower bound holds. The
+    // closure ran for `RUN_FOR` on the loop, and the caller was blocked
+    // at least that long.
+    let (hops, blocked_ns, run_ns) = *hops.lock().unwrap();
+    let run_floor = u64::try_from(RUN_FOR.as_nanos()).unwrap();
     assert!(hops >= 1);
-    assert!(blocked_ns > 0);
+    assert!(run_ns >= run_floor);
+    assert!(blocked_ns >= run_floor);
+  }
+
+  /// A hop splits into the time the closure sat in the queue and the time
+  /// it ran, and together they never exceed what the caller waited.
+  #[test]
+  fn dispatch_sync_timed_splits_wait_and_run() {
+    const QUEUED_FOR: Duration = Duration::from_millis(30);
+    const RUN_FOR: Duration = Duration::from_millis(20);
+
+    let queue: Mutex<Vec<Box<DispatchFn>>> = Mutex::new(Vec::new());
+
+    let started_at = Instant::now();
+    let (result, split) = std::thread::scope(|scope| {
+      dispatch_sync_timed(
+        |queued_fn| {
+          // Stands in for an event loop that is busy for `QUEUED_FOR`
+          // before it gets to the closure.
+          queue.lock().unwrap().push(queued_fn);
+          scope.spawn(|| {
+            std::thread::sleep(QUEUED_FOR);
+            let queued = std::mem::take(&mut *queue.lock().unwrap());
+            for queued_fn in queued {
+              queued_fn();
+            }
+          });
+          Ok(())
+        },
+        || {
+          std::thread::sleep(RUN_FOR);
+          7
+        },
+        Duration::from_secs(5),
+      )
+    })
+    .unwrap();
+    let blocked = started_at.elapsed();
+
+    assert_eq!(result, 7);
+    assert!(split.wait >= QUEUED_FOR);
+    assert!(split.run >= RUN_FOR);
+    assert!(split.wait + split.run <= blocked);
   }
 
   #[test]

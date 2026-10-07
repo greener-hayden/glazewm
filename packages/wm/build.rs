@@ -111,6 +111,8 @@ fn write_benchmark_stamp() {
         println!("cargo:rerun-if-changed={}", root.join(path).display());
       }
     }
+    // Existing config files only: missing paths keep Cargo permanently
+    // dirty and ancestor directories are walked recursively.
     for path in benchmark_provenance::cargo_config_rerun_paths(&snapshot) {
       println!("cargo:rerun-if-changed={}", path.display());
     }

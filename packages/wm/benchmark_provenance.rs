@@ -300,24 +300,24 @@ pub fn cargo_config_paths(
   paths
 }
 
-/// Lists Cargo rerun paths that detect config edits and config-file
-/// additions/deletions.
+/// Lists the existing Cargo config files that Cargo should watch for
+/// edits and deletions.
+///
+/// Only regular files are returned. Cargo treats a missing
+/// `rerun-if-changed` path as permanently dirty, which would rebuild the
+/// crate on every invocation, and it walks watched directories
+/// recursively (ancestors of the repository reach the drive root). Added
+/// config files are therefore not watched by Cargo; the repository's own
+/// `.cargo` directory is watched separately by the build script, and any
+/// other addition is rejected by the runtime input verification.
 pub fn cargo_config_rerun_paths(snapshot: &InputSnapshot) -> Vec<PathBuf> {
-  let mut paths = Vec::new();
-  for entry in snapshot
+  let mut paths = snapshot
     .inputs
     .keys()
     .filter_map(|key| key.strip_prefix("@cargo-config:"))
-  {
-    let config = PathBuf::from(entry);
-    paths.push(config.clone());
-    if let Some(parent) = config.parent() {
-      paths.push(parent.to_path_buf());
-      if let Some(grandparent) = parent.parent() {
-        paths.push(grandparent.to_path_buf());
-      }
-    }
-  }
+    .map(PathBuf::from)
+    .filter(|path| path.is_file())
+    .collect::<Vec<_>>();
   paths.sort();
   paths.dedup();
   paths

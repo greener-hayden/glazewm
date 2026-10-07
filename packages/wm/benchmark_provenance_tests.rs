@@ -62,33 +62,88 @@ fn missing_and_wrong_mode_stamps_are_rejected() {
   assert!(validate_build_stamp(&debug, "headline").is_err());
 }
 
+fn config_snapshot(configs: &[&std::path::Path]) -> InputSnapshot {
+  InputSnapshot {
+    head: String::new(),
+    index_sha256: String::new(),
+    input_sha256: String::new(),
+    inputs: configs
+      .iter()
+      .map(|path| {
+        (format!("@cargo-config:{}", path.display()), "hash".into())
+      })
+      .collect(),
+    changes: Vec::new(),
+    settings: BTreeMap::new(),
+  }
+}
+
 #[test]
-fn cargo_config_candidates_and_rerun_paths_include_absent_files_and_parents(
-) {
+fn cargo_config_candidates_include_absent_ancestor_and_home_files() {
   let project = std::path::Path::new("C:/benchmark/project");
   let cargo_home = std::path::Path::new("C:/benchmark/cargo-home");
   let candidates =
     super::provenance::cargo_config_paths(project, Some(cargo_home));
-  let missing = project.join(".cargo/config.toml");
-  assert!(candidates.contains(&missing));
+  assert!(candidates.contains(&project.join(".cargo/config.toml")));
+  assert!(candidates.contains(&project.join(".cargo/config")));
   assert!(candidates.contains(&cargo_home.join("config.toml")));
-  let snapshot = InputSnapshot {
-    head: String::new(),
-    index_sha256: String::new(),
-    input_sha256: String::new(),
-    inputs: BTreeMap::from([(
-      format!("@cargo-config:{}", missing.display()),
-      "<missing>".into(),
-    )]),
-    changes: Vec::new(),
-    settings: BTreeMap::new(),
-  };
+  assert!(candidates.contains(&cargo_home.join("config")));
+  let ancestor = std::path::Path::new("C:/benchmark");
+  assert!(candidates.contains(&ancestor.join(".cargo/config.toml")));
+}
+
+#[test]
+fn cargo_config_rerun_paths_are_existing_files_only() {
+  let directory = std::env::temp_dir()
+    .join(format!("glazewm-provenance-rerun-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&directory);
+  std::fs::create_dir_all(directory.join(".cargo"))
+    .expect("create config directory");
+  let present = directory.join(".cargo/config.toml");
+  std::fs::write(&present, "").expect("write config");
+  let absent = directory.join(".cargo/config");
+  let absent_ancestor = directory.join("missing/.cargo/config.toml");
+  let snapshot = config_snapshot(&[&present, &absent, &absent_ancestor]);
   let rerun_paths = super::provenance::cargo_config_rerun_paths(&snapshot);
-  assert!(rerun_paths.iter().any(|path| path == &missing));
-  let parent = missing.parent().expect("config parent");
-  let grandparent = parent.parent().expect("config grandparent");
-  assert!(rerun_paths.iter().any(|path| path == parent));
-  assert!(rerun_paths.iter().any(|path| path == grandparent));
+  std::fs::remove_dir_all(&directory).expect("remove temp directory");
+  // Present files stay watched. Absent files would make Cargo permanently
+  // dirty and parent directories would be walked recursively.
+  assert_eq!(rerun_paths, vec![present]);
+}
+
+#[test]
+fn repository_rerun_paths_never_include_directories_above_the_manifest() {
+  let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .canonicalize()
+    .expect("canonical manifest directory");
+  let root = manifest.join("../..");
+  let snapshot = super::provenance::capture_inputs(&root)
+    .expect("capture repository inputs");
+  let rerun_paths = super::provenance::cargo_config_rerun_paths(&snapshot);
+  let repository_config = root
+    .join(".cargo/config.toml")
+    .canonicalize()
+    .expect("canonical repository Cargo config");
+  assert!(
+    rerun_paths
+      .iter()
+      .any(|path| path.canonicalize().ok().as_ref()
+        == Some(&repository_config)),
+    "repository Cargo config file must stay watched: {rerun_paths:?}"
+  );
+  for path in rerun_paths {
+    assert!(
+      path.is_file(),
+      "rerun path is not a file: {}",
+      path.display()
+    );
+    let canonical = path.canonicalize().expect("canonical rerun path");
+    assert!(
+      !manifest.starts_with(&canonical),
+      "rerun path is an ancestor of the manifest directory: {}",
+      canonical.display()
+    );
+  }
 }
 
 #[test]

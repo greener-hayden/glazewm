@@ -251,21 +251,42 @@ impl InputState {
     }
   }
 
-  /// Matches locally and never waits for consumers.
+  /// Matches against an explicit key snapshot.
+  ///
+  /// Test entry point; the hook samples live key state through
+  /// [`Self::handle_sampled`].
+  #[cfg(test)]
   fn handle(
     &mut self,
     code: u16,
     keydown: bool,
     keys: &KeySnapshot,
   ) -> bool {
+    self.handle_sampled(code, keydown, |_, _| keys.clone())
+  }
+
+  /// Matches locally and never waits for consumers.
+  ///
+  /// `sample` reads physical key state and runs only for a keydown that
+  /// is enabled and has a bound trigger. Any other key is passed on
+  /// without a single key-state query, since `matching` over an empty
+  /// candidate list yields no binding for any snapshot.
+  fn handle_sampled(
+    &mut self,
+    code: u16,
+    keydown: bool,
+    sample: impl FnOnce(&CompiledBindings, u16) -> KeySnapshot,
+  ) -> bool {
     self.control.callbacks.fetch_add(1, Ordering::Relaxed);
     if !keydown
       || !self.control.enabled.load(Ordering::Acquire)
       || self.control.stopping.load(Ordering::Acquire)
+      || !self.table.has_trigger(code)
     {
       return false;
     }
-    let Some(binding) = self.table.matching(code, keys) else {
+    let keys = sample(&self.table, code);
+    let Some(binding) = self.table.matching(code, &keys) else {
       return false;
     };
     self.control.suppressed.fetch_add(1, Ordering::Relaxed);
@@ -315,12 +336,7 @@ extern "system" fn keyboard_proc(
       };
       let keydown = wparam.0 == WM_KEYDOWN as usize
         || wparam.0 == WM_SYSKEYDOWN as usize;
-      let keys = if keydown {
-        input.table.sample(key)
-      } else {
-        KeySnapshot::default()
-      };
-      input.handle(key, keydown, &keys)
+      input.handle_sampled(key, keydown, CompiledBindings::sample)
     })
     .unwrap_or(false);
   if intercepted {

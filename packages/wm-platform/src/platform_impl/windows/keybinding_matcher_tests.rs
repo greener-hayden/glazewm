@@ -110,3 +110,64 @@ fn input_matcher_aliases() {
   assert!(matched(&table, Key::Win, &[Key::LWin]).is_some());
   assert!(table.matching(256, &KeySnapshot::default()).is_none());
 }
+
+/// Reports a trigger exactly for each compiled binding's trigger code.
+#[test]
+fn input_matcher_has_trigger() {
+  let table = CompiledBindings::new(&[
+    binding(&[Key::Ctrl, Key::A]),
+    binding(&[Key::LAlt, Key::Shift, Key::A]),
+    binding(&[Key::F24]),
+    binding(&[Key::Win]),
+  ]);
+  let triggers = [
+    KeyCode::try_from(Key::A).expect("Physical key.").0,
+    KeyCode::try_from(Key::F24).expect("Physical key.").0,
+    KeyCode::try_from(Key::Win).expect("Physical key.").0,
+  ];
+  for code in 0..=u16::MAX {
+    assert_eq!(
+      table.has_trigger(code),
+      triggers.contains(&code),
+      "{code}"
+    );
+  }
+  assert!(!CompiledBindings::new(&[]).has_trigger(0x41));
+}
+
+/// Pairs each table with every snapshot class that could matter.
+fn snapshots() -> Vec<KeySnapshot> {
+  let mut all = vec![KeySnapshot::default(), KeySnapshot([u64::MAX; 4])];
+  for code in 0..256u16 {
+    let mut single = KeySnapshot::default();
+    single.record(code, i16::MIN);
+    all.push(single);
+  }
+  all
+}
+
+/// Skipping the key-state sample for unbound codes is unobservable.
+///
+/// The old hook sampled and matched every key; the fast path matches only
+/// codes with a trigger. Differential over every code and snapshot class.
+#[test]
+fn input_matcher_unbound_codes_never_match() {
+  let table = CompiledBindings::new(&[
+    binding(&[Key::Ctrl, Key::A]),
+    binding(&[Key::LCtrl, Key::LShift, Key::B]),
+    binding(&[Key::Alt, Key::F24]),
+    binding(&[Key::Win]),
+  ]);
+  let snapshots = snapshots();
+  let mut bound = 0;
+  for code in 0..=u16::MAX {
+    if table.has_trigger(code) {
+      bound += 1;
+      continue;
+    }
+    for keys in &snapshots {
+      assert!(table.matching(code, keys).is_none(), "{code}");
+    }
+  }
+  assert_eq!(bound, 4);
+}

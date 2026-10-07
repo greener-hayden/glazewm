@@ -112,6 +112,26 @@ fn main() -> anyhow::Result<()> {
   }
 }
 
+/// Returns the mouse events that the WM consumes.
+///
+/// An empty set means that the mouse listener has nothing to deliver, so
+/// it does not subscribe to the system's mouse input at all.
+///
+/// # Platform-specific
+///
+/// - **Windows**: Only `Move` has a consumer (focus follows cursor).
+///   `LeftButtonUp` is paired with it for parity with macOS.
+/// - **macOS**: `LeftButtonUp` always ends a window drag.
+const fn mouse_events(
+  focus_follows_cursor: bool,
+) -> &'static [MouseEventKind] {
+  match (focus_follows_cursor, cfg!(target_os = "macos")) {
+    (true, _) => &[MouseEventKind::Move, MouseEventKind::LeftButtonUp],
+    (false, true) => &[MouseEventKind::LeftButtonUp],
+    (false, false) => &[],
+  }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn start_wm(
   config_path: Option<PathBuf>,
@@ -119,6 +139,12 @@ async fn start_wm(
   dispatcher: &Dispatcher,
 ) -> anyhow::Result<()> {
   setup_logging(&verbosity)?;
+
+  // Keep the WM on performance cores at full clock. A failure only costs
+  // latency, so it is not fatal.
+  if let Err(err) = wm_platform::disable_power_throttling() {
+    tracing::warn!("Failed to opt out of power throttling: {err}");
+  }
 
   // Ensure that only one instance of the WM is running.
   let _single_instance = SingleInstance::new()?;
@@ -167,11 +193,7 @@ async fn start_wm(
   let mut window_listener = WindowListener::new(dispatcher)?;
   let mut display_listener = DisplayListener::new(dispatcher)?;
   let mut mouse_listener = MouseListener::new(
-    if config.value.general.focus_follows_cursor {
-      &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
-    } else {
-      &[MouseEventKind::LeftButtonUp]
-    },
+    mouse_events(config.value.general.focus_follows_cursor),
     dispatcher,
   )?;
   let mut keybinding_listener =
@@ -312,13 +334,9 @@ async fn start_wm(
             break;
           }
 
-          mouse_listener.set_enabled_events(
-            if config.value.general.focus_follows_cursor {
-              &[MouseEventKind::Move, MouseEventKind::LeftButtonUp]
-            } else {
-              &[MouseEventKind::LeftButtonUp]
-            },
-          )?;
+          mouse_listener.set_enabled_events(mouse_events(
+            config.value.general.focus_follows_cursor,
+          ))?;
         }
 
         if let Err(err) = ipc_server.process_event(wm_event) {
@@ -513,5 +531,25 @@ fn update_path_env() {
     tracing::warn!(
       "Failed to query login shell for PATH. Keeping existing PATH."
     );
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Subscribes to nothing on Windows unless focus follows the cursor.
+  #[test]
+  fn mouse_events_follow_consumers() {
+    assert_eq!(
+      mouse_events(true),
+      [MouseEventKind::Move, MouseEventKind::LeftButtonUp]
+    );
+
+    if cfg!(target_os = "macos") {
+      assert_eq!(mouse_events(false), [MouseEventKind::LeftButtonUp]);
+    } else {
+      assert_eq!(mouse_events(false), []);
+    }
   }
 }

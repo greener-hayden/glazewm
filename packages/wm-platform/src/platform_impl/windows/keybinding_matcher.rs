@@ -146,6 +146,16 @@ impl CompiledBindings {
     result
   }
 
+  /// Checks whether any binding fires on this trigger key.
+  ///
+  /// Lets the hook skip key-state sampling for every unbound key.
+  pub(super) fn has_trigger(&self, trigger: u16) -> bool {
+    self
+      .triggers
+      .get(usize::from(trigger))
+      .is_some_and(|candidates| !candidates.is_empty())
+  }
+
   /// Samples input state without querying windows.
   pub(super) fn sample(&self, trigger: u16) -> KeySnapshot {
     let mut keys = KeySnapshot::default();

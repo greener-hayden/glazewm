@@ -31,6 +31,7 @@ mod placement_live_tests;
 mod placement_session;
 mod platform_event;
 mod platform_impl;
+mod qos;
 mod single_instance;
 #[cfg(feature = "test_utils")]
 pub mod test_utils;
@@ -56,6 +57,7 @@ pub use native_call_stats::*;
 pub use native_window::*;
 pub use placement_session::*;
 pub use platform_event::*;
+pub use qos::*;
 pub use single_instance::*;
 pub use thread_bound::*;
 pub use window_listener::*;

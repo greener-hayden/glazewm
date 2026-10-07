@@ -83,6 +83,37 @@ fn input_matcher_transitions() {
   );
 }
 
+/// Samples key state only for an enabled keydown on a bound trigger.
+#[test]
+fn input_samples_only_bound_keydown() {
+  let (mut input, mut output) = local_input(&[binding(&[Key::F24])], 8);
+  let mut samples = Vec::new();
+  let mut handle = |input: &mut InputState, code: u16, keydown: bool| {
+    input.handle_sampled(code, keydown, |_, sampled| {
+      samples.push(sampled);
+      KeySnapshot::default()
+    })
+  };
+  // Unbound keydown, bound keyup, and out-of-range codes never sample.
+  assert!(!handle(&mut input, 0x41, true));
+  assert!(!handle(&mut input, 0x87, false));
+  assert!(!handle(&mut input, u16::MAX, true));
+  // Disabled and stopping input never samples, bound or not.
+  input.control.enabled.store(false, Ordering::Release);
+  assert!(!handle(&mut input, 0x87, true));
+  input.control.enabled.store(true, Ordering::Release);
+  input.control.stopping.store(true, Ordering::Release);
+  assert!(!handle(&mut input, 0x87, true));
+  input.control.stopping.store(false, Ordering::Release);
+  assert!(output.pop().is_err());
+  // A bound keydown samples once, with its own code.
+  assert!(handle(&mut input, 0x87, true));
+  assert_eq!(samples, [0x87]);
+  assert!(output.pop().is_ok());
+  // Every callback is still counted.
+  assert_eq!(input.control.callbacks.load(Ordering::Relaxed), 6);
+}
+
 /// Preserves accepted commands under bounded saturation.
 #[test]
 fn input_transport_saturation() {

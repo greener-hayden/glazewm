@@ -40,15 +40,102 @@ struct CallbackData {
   last_move_emission: Option<Instant>,
 }
 
+#[cfg(test)]
+#[path = "mouse_listener_tests.rs"]
+mod tests;
+
+/// Pure state machine deciding when raw mouse input is registered.
+///
+/// Registration delivers a `WM_INPUT` message for every mouse packet to
+/// the event loop, so it is held only while the listener is enabled, has
+/// at least one event kind with a consumer, and is not terminated.
+struct RawInputPolicy {
+  /// Event kinds the listener is configured for. Empty once terminated.
+  events: Arc<[MouseEventKind]>,
+
+  /// Whether the caller wants events (cleared while the WM is paused).
+  enabled: bool,
+
+  /// Whether the raw input device is currently registered.
+  registered: bool,
+
+  /// Whether the listener has been terminated for good.
+  terminated: bool,
+}
+
+impl RawInputPolicy {
+  /// Creates an enabled policy with nothing registered yet.
+  fn new(events: Arc<[MouseEventKind]>) -> Self {
+    Self {
+      events,
+      enabled: true,
+      registered: false,
+      terminated: false,
+    }
+  }
+
+  /// Whether raw input should be registered right now.
+  fn wants_raw_input(&self) -> bool {
+    self.enabled && !self.terminated && !self.events.is_empty()
+  }
+
+  /// Returns the registration change needed to reach the wanted state.
+  ///
+  /// `None` means the device is already in the wanted state, so no native
+  /// call is needed.
+  fn pending_change(&self) -> Option<bool> {
+    let wanted = self.wants_raw_input();
+    (wanted != self.registered).then_some(wanted)
+  }
+
+  /// Records that the device is now (un)registered.
+  fn mark_registered(&mut self, registered: bool) {
+    self.registered = registered;
+  }
+
+  /// Sets whether the caller wants events. Ignored once terminated.
+  fn set_enabled(&mut self, enabled: bool) {
+    if !self.terminated {
+      self.enabled = enabled;
+    }
+  }
+
+  /// Whether `events` differ from the current set and may be applied.
+  ///
+  /// Always `false` once terminated.
+  fn accepts_events(&self, events: &[MouseEventKind]) -> bool {
+    !self.terminated && *self.events != *events
+  }
+
+  /// Replaces the configured events. Ignored once terminated.
+  fn set_events(&mut self, events: Arc<[MouseEventKind]>) {
+    if !self.terminated {
+      self.events = events;
+    }
+  }
+
+  /// Terminates for good: no events and no re-enabling.
+  fn terminate(&mut self) {
+    self.terminated = true;
+    self.events = Arc::from([]);
+  }
+}
+
 /// Platform-specific implementation of [`MouseListener`].
 pub(crate) struct MouseListener {
   callback_id: Option<usize>,
   callback_data: Arc<Mutex<CallbackData>>,
   dispatcher: Dispatcher,
+
+  /// Decides whether raw input is registered.
+  raw_input: RawInputPolicy,
 }
 
 impl MouseListener {
   /// Implements [`MouseListener::new`].
+  ///
+  /// With no enabled events, neither a callback nor raw input is
+  /// registered.
   pub(crate) fn new(
     enabled_events: &[MouseEventKind],
     event_tx: mpsc::UnboundedSender<MouseEvent>,
@@ -60,71 +147,120 @@ impl MouseListener {
       last_move_emission: None,
     }));
 
+    let enabled_events: Arc<[MouseEventKind]> = Arc::from(enabled_events);
     let callback_id = Self::register_callback(
-      enabled_events,
-      Arc::clone(&callback_data),
+      &enabled_events,
+      &callback_data,
       dispatcher,
     )?;
 
-    Ok(Self {
-      callback_id: Some(callback_id),
+    let mut listener = Self {
+      callback_id,
       dispatcher: dispatcher.clone(),
       callback_data,
-    })
+      raw_input: RawInputPolicy::new(enabled_events),
+    };
+
+    // On failure, dropping the listener removes the callback again.
+    listener.sync_raw_input()?;
+
+    Ok(listener)
   }
 
   /// Implements [`MouseListener::enable`].
+  ///
+  /// Enabling a paused listener registers raw input only if there are
+  /// events to listen for. Does nothing once terminated.
   pub(crate) fn enable(&mut self, enabled: bool) -> crate::Result<()> {
-    if self.callback_id.is_some() {
-      let handle = self.dispatcher.message_window_handle();
-      self.dispatcher.dispatch_sync(move || {
-        Self::enable_raw_input(handle, enabled)
-      })??;
-    }
-
-    Ok(())
+    self.raw_input.set_enabled(enabled);
+    self.sync_raw_input()
   }
 
   /// Implements [`MouseListener::set_enabled_events`].
+  ///
+  /// Keeps the current registration when the events are unchanged, and
+  /// never re-enables raw input while the listener is disabled. Does
+  /// nothing once terminated.
   pub(crate) fn set_enabled_events(
     &mut self,
     enabled_events: &[MouseEventKind],
   ) -> crate::Result<()> {
-    let _ = self.terminate();
+    if !self.raw_input.accepts_events(enabled_events) {
+      return Ok(());
+    }
 
+    let enabled_events: Arc<[MouseEventKind]> = Arc::from(enabled_events);
+
+    // Register the replacement first, so that a failure leaves the
+    // previous registration intact.
     let callback_id = Self::register_callback(
-      enabled_events,
-      Arc::clone(&self.callback_data),
+      &enabled_events,
+      &self.callback_data,
       &self.dispatcher,
     )?;
 
-    self.callback_id = Some(callback_id);
+    let previous_id =
+      std::mem::replace(&mut self.callback_id, callback_id);
+    self.raw_input.set_events(enabled_events);
 
-    Ok(())
+    let deregistered = previous_id.map_or(Ok(()), |id| {
+      self.dispatcher.deregister_wndproc_callback(id)
+    });
+
+    self.sync_raw_input()?;
+    deregistered
   }
 
   /// Implements [`MouseListener::terminate`].
+  ///
+  /// Safe to call repeatedly. After this, [`Self::enable`] and
+  /// [`Self::set_enabled_events`] do nothing, so nothing is registered
+  /// again.
   pub(crate) fn terminate(&mut self) -> crate::Result<()> {
-    self.enable(false)?;
+    self.raw_input.terminate();
+    let removed = self.sync_raw_input();
 
-    if let Some(id) = self.callback_id.take() {
-      self.dispatcher.deregister_wndproc_callback(id)?;
-    }
+    let deregistered = self.callback_id.take().map_or(Ok(()), |id| {
+      self.dispatcher.deregister_wndproc_callback(id)
+    });
 
+    removed.and(deregistered)
+  }
+
+  /// Registers or removes raw input so that it matches
+  /// [`RawInputPolicy::wants_raw_input`].
+  fn sync_raw_input(&mut self) -> crate::Result<()> {
+    let Some(register) = self.raw_input.pending_change() else {
+      return Ok(());
+    };
+
+    // Raw input targets the event loop's message window, so it has to be
+    // changed from the event loop thread.
+    let handle = self.dispatcher.message_window_handle();
+    self
+      .dispatcher
+      .dispatch_sync(move || Self::enable_raw_input(handle, register))??;
+
+    self.raw_input.mark_registered(register);
     Ok(())
   }
 
-  /// Registers a window procedure callback for `WM_INPUT` and enables raw
-  /// input.
+  /// Registers a window procedure callback for `WM_INPUT`.
   ///
-  /// Returns the ID of the created callback.
+  /// Returns the ID of the created callback, or `None` if there are no
+  /// events to listen for. Raw input itself is registered separately by
+  /// [`Self::sync_raw_input`].
   fn register_callback(
-    enabled_events: &[MouseEventKind],
-    callback_data: Arc<Mutex<CallbackData>>,
+    enabled_events: &Arc<[MouseEventKind]>,
+    callback_data: &Arc<Mutex<CallbackData>>,
     dispatcher: &Dispatcher,
-  ) -> crate::Result<usize> {
-    let enabled_events: Arc<[MouseEventKind]> =
-      Arc::from(enabled_events.to_vec().into_boxed_slice());
+  ) -> crate::Result<Option<usize>> {
+    if enabled_events.is_empty() {
+      return Ok(None);
+    }
+
+    let enabled_events = Arc::clone(enabled_events);
+    let callback_data = Arc::clone(callback_data);
 
     let callback_id = dispatcher.register_wndproc_callback(Box::new(
       move |_hwnd, msg, _wparam, lparam| {
@@ -148,13 +284,7 @@ impl MouseListener {
       },
     ))?;
 
-    // Register raw input devices, which will then deliver `WM_INPUT`
-    // messages to the event loop's message window.
-    let handle = dispatcher.message_window_handle();
-    dispatcher
-      .dispatch_sync(move || Self::enable_raw_input(handle, true))??;
-
-    Ok(callback_id)
+    Ok(Some(callback_id))
   }
 
   /// Processes a `WM_INPUT` message, extracting raw input data and

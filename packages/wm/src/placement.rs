@@ -605,8 +605,15 @@ struct ShellState {
   opacity_pending: bool,
   /// How long the frame write has waited on the source's concealment.
   conceal_wait: ConcealWait,
-  /// The cover was already placed for the restoration in progress.
-  restore_placed: bool,
+  /// The reveal owns the cloak for the restoration in progress.
+  ///
+  /// The conceal step at the start of each pass asks for a cloak while
+  /// the source is still held, and the reveal asks for the opposite. The
+  /// shell slot holds one desire at a time, so both asking in one pass
+  /// would cloak the source again right after it was uncloaked. Once the
+  /// reveal has asked, the conceal step stands down until the
+  /// restoration ends or the reveal is held again.
+  uncloak_requested: bool,
 }
 
 impl ManagedWindow {
@@ -2362,6 +2369,22 @@ fn cloak_landed(poll: ShellPoll, what: &str) -> anyhow::Result<bool> {
   }
 }
 
+/// Whether this pass should ask for the source's cloak.
+///
+/// Not while the reveal owns the cloak for the restoration in progress:
+/// both steps run in every pass, and asking for opposite values would
+/// cloak the source again right after its uncloak landed.
+///
+/// `eligible` is false for a window that retains its source or is
+/// minimized, which are never concealed here.
+const fn conceal_step_applies(
+  eligible: bool,
+  cloak_for_source: bool,
+  uncloak_requested: bool,
+) -> bool {
+  eligible && cloak_for_source && !uncloak_requested
+}
+
 /// Asks for another pass if nothing else is going to.
 fn backstop(entry: &mut ManagedWindow, now: Instant) {
   let at = now + SHELL_BACKSTOP;
@@ -3136,10 +3159,11 @@ fn reconcile_managed(
   // request. The frame write waits for the one that applies to this
   // source to be observed.
   let mut awaiting_conceal = false;
-  if !retaining_source
-    && native_state != NativeState::Minimized
-    && cloak_for_source
-  {
+  if conceal_step_applies(
+    !retaining_source && native_state != NativeState::Minimized,
+    cloak_for_source,
+    entry.shell.uncloak_requested,
+  ) {
     // A failure cancels only this presentation. The shell call fails
     // transiently (a stale view collection, a stalled shell), and dropping
     // the capability would cut every later slide for the window's life.
@@ -3279,9 +3303,15 @@ fn reconcile_managed(
   }
   timer.mark("visibility");
   if let Some(MotionOwner::Overlay(motion)) = &mut entry.motion {
+    // The source counts as concealed only once its concealment landed.
+    // A queued cloak or style change is not yet concealing it, and a slide
+    // started now would show the source and its cover together.
     motion.observe(
       entry.frame.generation,
-      suppressing && converged && !entry.visibility_pending,
+      suppressing
+        && converged
+        && !entry.visibility_pending
+        && !awaiting_conceal,
       sampled_frame,
     );
   }
@@ -3312,18 +3342,17 @@ fn reconcile_managed(
     && !entry.visibility_pending;
   if !revealing {
     entry.cover_hold = None;
-    entry.shell.restore_placed = false;
+    entry.shell.uncloak_requested = false;
   }
   if revealing {
-    // The cover stops at the final frame once, however many passes the
-    // uncloak below takes.
-    if !entry.shell.restore_placed {
-      if visible && native_state != NativeState::Minimized {
-        state
-          .animation_manager
-          .place_overlay(&id, &entry.native.window()?.frame()?)?;
-      }
-      entry.shell.restore_placed = true;
+    // The cover follows the source to its final frame. Placing it again
+    // for the same rectangle queues nothing, so a restoration that takes
+    // several passes costs one frame read per pass, and a drag keeps the
+    // cover under the moving source.
+    if visible && native_state != NativeState::Minimized {
+      state
+        .animation_manager
+        .place_overlay(&id, &entry.native.window()?.frame()?)?;
     }
     // The cover was only queued to stand here. The source stays
     // concealed until it does, and the retry deadline below keeps the
@@ -3336,6 +3365,8 @@ fn reconcile_managed(
       now,
     ) {
       revealing = false;
+      // Held again, so the source is concealed again at the next pass.
+      entry.shell.uncloak_requested = false;
     }
   }
   if revealing {
@@ -3353,6 +3384,7 @@ fn reconcile_managed(
     // observed.
     let mut uncloaking = false;
     if cloak_for_source && native_state != NativeState::Minimized {
+      entry.shell.uncloak_requested = true;
       let wanted =
         desired_cloak(false, native_visible, hidden_parking, hide_method);
       let poll = apply_cloak(entry, wanted)?;
@@ -3361,7 +3393,7 @@ fn reconcile_managed(
     if !uncloaking {
       entry.native.present(false)?;
       entry.source = None;
-      entry.shell.restore_placed = false;
+      entry.shell.uncloak_requested = false;
       // Preparation can fail after concealing but before creating an
       // overlay. There is then nothing to retire and no running frame
       // clock to acknowledge a retirement fence.
@@ -5368,6 +5400,73 @@ mod shell_gate_tests {
     assert_eq!(wait.check(false, now), ConcealGate::Open);
     let later = now + CONCEAL_LIMIT * 2;
     assert_eq!(wait.check(true, later), ConcealGate::Held);
+  }
+
+  #[test]
+  fn the_conceal_step_stands_down_once_the_reveal_owns_the_cloak() {
+    assert!(conceal_step_applies(true, true, false));
+    assert!(!conceal_step_applies(true, true, true));
+    assert!(!conceal_step_applies(false, true, false));
+    assert!(!conceal_step_applies(true, false, false));
+  }
+
+  /// Runs the conceal step and then the reveal step, as every pass does.
+  ///
+  /// The cloak ticket is for the reveal's uncloak. A cloak request for the
+  /// conceal step must not be submitted once the reveal has asked.
+  fn restoration_pass(
+    slot: &mut ShellSlot<bool>,
+    uncloak_requested: &mut bool,
+    observed_cloaked: bool,
+    now: Instant,
+    uncloak: Option<&ShellTicket>,
+  ) -> ShellPoll {
+    if conceal_step_applies(true, true, *uncloak_requested) {
+      slot
+        .converge(true, || Ok(Some(observed_cloaked)), now, forbidden)
+        .unwrap();
+    }
+    *uncloak_requested = true;
+    match uncloak {
+      Some(ticket) => slot
+        .converge(
+          false,
+          || Ok(Some(observed_cloaked)),
+          now,
+          submit(ticket),
+        )
+        .unwrap(),
+      None => slot
+        .converge(false, || Ok(Some(observed_cloaked)), now, forbidden)
+        .unwrap(),
+    }
+  }
+
+  #[test]
+  fn a_restoration_never_cloaks_the_source_again_after_its_uncloak() {
+    let now = Instant::now();
+    let ticket = ShellTicket::new();
+    let mut slot = ShellSlot::<bool>::default();
+    let mut requested = false;
+
+    // Settled and cloaked, the conceal step has nothing to do. The
+    // reveal asks for the uncloak.
+    let poll = restoration_pass(
+      &mut slot,
+      &mut requested,
+      true,
+      now,
+      Some(&ticket),
+    );
+    assert_eq!(poll, ShellPoll::InFlight);
+    assert!(ticket.claim());
+
+    // The uncloak lands. The next pass must not submit a cloak (the
+    // `forbidden` submission would panic), and the restoration finishes.
+    ticket.complete(true);
+    let poll =
+      restoration_pass(&mut slot, &mut requested, false, now, None);
+    assert!(cloak_landed(poll, "Source uncloaking").unwrap());
   }
 
   #[test]

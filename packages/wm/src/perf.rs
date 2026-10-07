@@ -29,9 +29,9 @@
 //! running them. A large wait means the loop was busy; a large run means
 //! the closure itself is slow.
 //!
-//! Native overlay creation (`overlay_new`) and shell cloak calls
-//! (`cloak_slow`) log under the same target, at `INFO` once they take
-//! [`SLOW_CALL`] or longer, with the cost of each step.
+//! Native overlay creation (`overlay_new`) logs under the same target,
+//! at `INFO` once it takes [`SLOW_CALL`] or longer, with the cost of each
+//! step. Shell cloak calls run on a worker and are not timed here.
 use std::{
   fmt,
   path::Path,

@@ -48,6 +48,19 @@ pub fn handle_window_moved_or_resized(
       state.native_sync.observe(window.id());
     }
     let old_frame_position = window.native_properties().frame;
+
+    // On macOS every native read is a hop to the main thread and a round
+    // trip to the application, and a window echoes each of our own writes
+    // with an event. Reading the frame and both state flags in one request
+    // spares even an event that is ignored below three of each. Only the
+    // frame must read here; each flag is checked where it is first needed,
+    // as its own read was.
+
+    #[cfg(target_os = "macos")]
+    let native_state = try_warn!(window.native().frame_and_state());
+    #[cfg(target_os = "macos")]
+    let frame_position = native_state.frame.clone();
+    #[cfg(target_os = "windows")]
     let frame_position = try_warn!(window.native().frame());
 
     window.update_native_properties(|properties| {
@@ -89,6 +102,9 @@ pub fn handle_window_moved_or_resized(
     }
 
     let old_is_maximized = window.native_properties().is_maximized;
+    #[cfg(target_os = "macos")]
+    let is_maximized = try_warn!(native_state.is_maximized);
+    #[cfg(target_os = "windows")]
     let is_maximized = try_warn!(window.native().is_maximized());
 
     // Native state changes supersede animated geometry.
@@ -136,6 +152,9 @@ pub fn handle_window_moved_or_resized(
       }
     }
 
+    #[cfg(target_os = "macos")]
+    let is_minimized = try_warn!(native_state.is_minimized);
+    #[cfg(target_os = "windows")]
     let is_minimized = try_warn!(window.native().is_minimized());
 
     // Ignore events for minimized windows. Let them be handled by the
@@ -228,9 +247,14 @@ pub fn handle_window_moved_or_resized(
       return Ok(());
     }
 
-    let nearest_monitor = state
-      .nearest_monitor(&window.native())
-      .context("No nearest monitor.")?;
+    // The frame was just read, so there is no need to read it again to
+    // find the monitor on macOS.
+    #[cfg(target_os = "macos")]
+    let nearest_monitor = state.nearest_monitor_for_rect(&frame_position);
+    #[cfg(target_os = "windows")]
+    let nearest_monitor = state.nearest_monitor(&window.native());
+    let nearest_monitor =
+      nearest_monitor.context("No nearest monitor.")?;
 
     // For `HideMethod::PlaceInCorner`, hiding/showing is implemented by
     // repositioning the window. Since the OS won't emit real

@@ -59,6 +59,15 @@ fn rect_from_cg(rect: CGRect) -> Rect {
   )
 }
 
+/// Gets the height of the primary display.
+///
+/// Answers in process, without a hop to the main thread or a walk over
+/// the screens. Needed for converting between Core Graphics coordinates
+/// (top-left origin) and AppKit's (bottom-left origin).
+pub(crate) fn primary_display_height() -> i32 {
+  rect_from_cg(CGDisplayBounds(CGMainDisplayID())).height()
+}
+
 /// Gets the working area of a screen in the same coordinate space as
 /// `CGDisplayBounds`.
 fn screen_working_area(screen: &NSScreen) -> Rect {

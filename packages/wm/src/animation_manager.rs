@@ -1111,12 +1111,9 @@ impl AnimationManager {
   pub fn finish_animation(&mut self, id: &Uuid) -> anyhow::Result<()> {
     if self.running.contains_key(id) {
       if let Some(overlay) = self.windows.get_mut(id) {
-        let frame = overlay
-          .window
-          .current_frame()?
-          .unwrap_or_else(|| overlay.frame.clone());
-        overlay.window.stop_at(&frame, None)?;
-        overlay.frame = frame;
+        // Samples and stops in one step, which on macOS is one hop to
+        // the main thread instead of two.
+        overlay.frame = overlay.window.stop_in_place(&overlay.frame)?;
       }
     }
     self.clear_motion(id);

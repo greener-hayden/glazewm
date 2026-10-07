@@ -157,7 +157,17 @@ impl PlacementSession {
     }
   }
 
-  /// Returns the native window after validating ownership.
+  /// Returns the native window, validating ownership on Windows only.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: validates ownership.
+  /// - macOS: does not validate, which costs a hop and an `AXRole` read on
+  ///   every call. Callers validate once per pass, and the accessibility
+  ///   call that follows fails for a window that is gone (with
+  ///   `InvalidUIElement` instead of [`crate::Error::WindowNotFound`]). A
+  ///   new caller that must tell a dead window from a refusing one calls
+  ///   [`Self::validate`] first.
   pub fn window(&self) -> crate::Result<&NativeWindow> {
     #[cfg(target_os = "windows")]
     {
@@ -165,7 +175,6 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
       Ok(&self.native)
     }
   }
@@ -672,6 +681,12 @@ impl PlacementSession {
   }
 
   /// Restores normal native state and requests the destination frame.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: reads both state flags in one request, without validating
+  ///   first. A minimized window is not read for full-screen, as in
+  ///   [`Self::observe`].
   pub fn restore(&self, rect: &Rect) -> crate::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -679,23 +694,25 @@ impl PlacementSession {
     }
     #[cfg(target_os = "macos")]
     {
-      self.validate()?;
-      if self.native.is_minimized()? {
+      let (minimized, maximized) = self.native.inner.window_state()?;
+      if minimized {
         self.set_boolean("AXMinimized", false)?;
       }
-      if self.native.is_maximized()? {
+      if maximized {
         self.set_boolean("AXFullScreen", false)?;
       }
       self.native.set_frame(rect)
     }
   }
 
-  /// Requests native minimization after validating the window.
+  /// Requests native minimization, validating the window first on Windows
+  /// only (see [`Self::window`]).
   pub fn minimize(&self) -> crate::Result<()> {
     self.window()?.minimize()
   }
 
-  /// Requests native maximization after validating the window.
+  /// Requests native maximization, validating the window first on Windows
+  /// only (see [`Self::window`]).
   pub fn maximize(&self) -> crate::Result<()> {
     self.window()?.maximize()
   }
@@ -953,6 +970,63 @@ mod tests {
       session.observe(),
       Err(crate::Error::WindowNotFound)
     ));
+  }
+
+  #[test]
+  fn the_window_accessor_makes_no_validation_calls() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), dead_element);
+
+    let (result, spent) = counted(|| session.window().map(|_| ()));
+
+    // Every mutation reaches the window through this accessor, and each
+    // used to pay an `AXRole` read and a hop here on top of its own
+    // calls. A dead window now fails at the call that follows.
+    assert!(result.is_ok());
+    assert_eq!(spent, NativeCallSnapshot::default());
+  }
+
+  #[test]
+  fn restoring_reads_both_state_flags_in_one_request() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), dead_element);
+    let rect = Rect::from_xy(0, 0, 10, 10);
+
+    let (result, spent) = counted(|| session.restore(&rect));
+
+    // It used to validate, then read each flag on its own. The dead
+    // element fails the one request, so nothing is written.
+    assert!(matches!(result, Err(crate::Error::Accessibility(..))));
+    assert_eq!(spent.ax_reads, 1);
+    assert_eq!(spent.ax_writes, 0);
+  }
+
+  #[test]
+  fn the_frame_is_one_request() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), system_wide_element);
+
+    let (result, spent) = counted(|| session.native.frame());
+
+    // Position and size used to be two requests. The element has no
+    // window attributes, so the read fails, but it is one request for
+    // both either way. Hops are not counted here: the closure runs in
+    // place on the harness's thread, which never queues one.
+    assert!(matches!(&result, Err(crate::Error::Accessibility(..))));
+    assert_eq!(spent.ax_reads, 1);
+  }
+
+  #[test]
+  fn the_frame_and_state_are_one_request() {
+    let (_event_loop, dispatcher) = EventLoop::new().unwrap();
+    let session = session(&dispatcher, WindowId(0), system_wide_element);
+
+    let (result, spent) = counted(|| session.native.frame_and_state());
+
+    // The element has no window attributes, so the read fails, but it is
+    // one request for all four attributes either way.
+    assert!(matches!(&result, Err(crate::Error::Accessibility(..))));
+    assert_eq!(spent.ax_reads, 1);
   }
 
   #[test]

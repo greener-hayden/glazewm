@@ -155,6 +155,17 @@ impl NativeWindow {
     }
   }
 
+  /// Implements [`NativeWindow::frame_and_state`].
+  pub(crate) fn frame_and_state(
+    &self,
+  ) -> crate::Result<crate::WindowFrameState> {
+    Ok(crate::WindowFrameState {
+      frame: self.frame()?,
+      is_minimized: self.is_minimized(),
+      is_maximized: self.is_maximized(),
+    })
+  }
+
   /// Implements [`NativeWindow::position`].
   pub(crate) fn position(&self) -> crate::Result<(f64, f64)> {
     let frame = self.frame()?;

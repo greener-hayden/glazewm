@@ -6,7 +6,7 @@ use objc2_app_kit::{
 };
 use objc2_application_services::{AXError, AXValue};
 use objc2_core_foundation::{
-  CFBoolean, CFNumber, CFRetained, CFString, CGPoint, CGSize,
+  CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGSize,
 };
 #[allow(deprecated)]
 use objc2_core_graphics::{
@@ -17,10 +17,10 @@ use objc2_core_graphics::{
 use crate::{
   platform_impl::{
     self, ffi, is_stall, AXUIElement, AXUIElementExt, AXValueExt,
-    Application,
+    AXValueTypeMarker, Application,
   },
   Dispatcher, NativeCall, NativeCallStats, Point, Rect, ThreadBound,
-  WindowId,
+  WindowFrameState, WindowId,
 };
 
 /// Platform-specific implementation of [`NativeWindow`].
@@ -141,18 +141,63 @@ impl NativeWindow {
   }
 
   /// Implements [`NativeWindow::frame`].
+  ///
+  /// Position and size are read in one request, so the frame costs a
+  /// single hop and a single round trip to the application.
   pub(crate) fn frame(&self) -> crate::Result<Rect> {
-    // TODO: Consider refactoring this to use a single dispatch.
     // TODO: Would `AXFrame` work instead?
-    let size = self.size()?;
-    let position = self.position()?;
-    #[allow(clippy::cast_possible_truncation)]
-    Ok(Rect::from_xy(
-      position.0 as i32,
-      position.1 as i32,
-      size.0 as i32,
-      size.1 as i32,
-    ))
+    self.with_element(|el| {
+      let (position, size) = read_position_and_size(el)?;
+      Ok(truncated_frame(position, size))
+    })?
+  }
+
+  /// Implements [`NativeWindow::frame_and_state`].
+  ///
+  /// Frame, minimized flag and full-screen flag are read in one request,
+  /// where [`Self::frame`], [`Self::is_minimized`] and
+  /// [`Self::is_maximized`] cost one hop and one round trip each.
+  ///
+  /// Only the frame and the request as a whole must succeed. Each flag
+  /// carries its own result, so one unreadable attribute fails only the
+  /// question about it, as it would from the separate reads. As in
+  /// [`Self::window_state`], a window read as minimized is reported as
+  /// not maximized, and its full-screen attribute is not required to be
+  /// readable.
+  pub(crate) fn frame_and_state(&self) -> crate::Result<WindowFrameState> {
+    self.with_element(|el| {
+      let mut values = el
+        .get_attributes(&[
+          "AXPosition",
+          "AXSize",
+          "AXMinimized",
+          "AXFullScreen",
+        ])?
+        .into_iter();
+
+      let position = next_value(&mut values, "AXPosition")?;
+      let size = next_value(&mut values, "AXSize")?;
+      let minimized = next_value(&mut values, "AXMinimized");
+      let maximized = next_value(&mut values, "AXFullScreen");
+
+      let frame = truncated_frame(
+        ax_value_from("AXPosition", &position)?,
+        ax_value_from("AXSize", &size)?,
+      );
+      let (is_minimized, is_maximized) = flag_results(
+        minimized.and_then(|value| flag_from_value("AXMinimized", &value)),
+        || {
+          maximized
+            .and_then(|value| flag_from_value("AXFullScreen", &value))
+        },
+      );
+
+      Ok(WindowFrameState {
+        frame,
+        is_minimized,
+        is_maximized,
+      })
+    })?
   }
 
   /// Implements [`NativeWindow::position`].
@@ -262,27 +307,7 @@ impl NativeWindow {
         .get_attributes(&["AXMinimized", "AXFullScreen"])?
         .into_iter();
       let mut flag = |attribute: &str| -> crate::Result<bool> {
-        let value = values.next().ok_or_else(|| {
-          crate::Error::InvalidPointer(format!(
-            "No value returned for {attribute}."
-          ))
-        })??;
-        // Some applications answer a flag with a number, which the
-        // single-attribute reads always took as its truth value.
-        value
-          .downcast_ref::<CFBoolean>()
-          .map(CFBoolean::value)
-          .or_else(|| {
-            value
-              .downcast_ref::<CFNumber>()
-              .and_then(CFNumber::as_i64)
-              .map(|number| number != 0)
-          })
-          .ok_or_else(|| {
-            crate::Error::Platform(format!(
-              "{attribute} is not a boolean."
-            ))
-          })
+        flag_from_value(attribute, &next_value(&mut values, attribute)?)
       };
 
       let minimized = flag("AXMinimized")?;
@@ -769,31 +794,113 @@ fn element_borrow_error() -> crate::Error {
   )
 }
 
-/// Reads the window's size via `AXSize`, rounded to pixels.
-#[allow(clippy::cast_possible_truncation)]
-fn read_size(el: &CFRetained<AXUIElement>) -> crate::Result<(i32, i32)> {
-  let size = el
-    .get_attribute::<AXValue>("AXSize")?
-    .value_strict::<CGSize>()?;
+/// Reads the window's position and size in one request.
+fn read_position_and_size(
+  el: &CFRetained<AXUIElement>,
+) -> crate::Result<(CGPoint, CGSize)> {
+  let mut values =
+    el.get_attributes(&["AXPosition", "AXSize"])?.into_iter();
 
-  Ok((size.width.round() as i32, size.height.round() as i32))
+  let position = next_value(&mut values, "AXPosition")?;
+  let size = next_value(&mut values, "AXSize")?;
+
+  Ok((
+    ax_value_from("AXPosition", &position)?,
+    ax_value_from("AXSize", &size)?,
+  ))
 }
 
-/// Reads the window's frame via `AXPosition` and `AXSize`.
+/// Reads the window's frame via `AXPosition` and `AXSize`, rounded to
+/// pixels.
 #[allow(clippy::cast_possible_truncation)]
 fn read_frame(el: &CFRetained<AXUIElement>) -> crate::Result<Rect> {
-  let position = el
-    .get_attribute::<AXValue>("AXPosition")?
-    .value_strict::<CGPoint>()?;
-
-  let (width, height) = read_size(el)?;
+  let (position, size) = read_position_and_size(el)?;
 
   Ok(Rect::from_xy(
     position.x.round() as i32,
     position.y.round() as i32,
-    width,
-    height,
+    size.width.round() as i32,
+    size.height.round() as i32,
   ))
+}
+
+/// Converts an accessibility position and size into a `Rect`, truncating
+/// to whole pixels.
+#[allow(clippy::cast_possible_truncation)]
+fn truncated_frame(position: CGPoint, size: CGSize) -> Rect {
+  Rect::from_xy(
+    position.x as i32,
+    position.y as i32,
+    size.width as i32,
+    size.height as i32,
+  )
+}
+
+/// Takes the next result of a multiple-attribute read, which holds one per
+/// requested attribute.
+fn next_value(
+  values: &mut std::vec::IntoIter<crate::Result<CFRetained<CFType>>>,
+  attribute: &str,
+) -> crate::Result<CFRetained<CFType>> {
+  values.next().ok_or_else(|| {
+    crate::Error::InvalidPointer(format!(
+      "No value returned for {attribute}."
+    ))
+  })?
+}
+
+/// Decodes a value read for `attribute` as an `AXValue` holding a `T`.
+fn ax_value_from<T: AXValueTypeMarker>(
+  attribute: &str,
+  value: &CFRetained<CFType>,
+) -> crate::Result<T> {
+  value
+    .downcast_ref::<AXValue>()
+    .ok_or_else(|| {
+      crate::Error::Platform(format!("{attribute} is not an AXValue."))
+    })?
+    .value_strict::<T>()
+}
+
+/// Settles the two state flags of a window from their own results.
+///
+/// A window read as minimized is reported as not maximized, without
+/// reading its full-screen attribute (`maximized` is not called). Any
+/// other flag keeps the result of its own read, so one that failed fails
+/// only the question about it.
+fn flag_results(
+  minimized: crate::Result<bool>,
+  maximized: impl FnOnce() -> crate::Result<bool>,
+) -> (crate::Result<bool>, crate::Result<bool>) {
+  let maximized = if matches!(minimized, Ok(true)) {
+    Ok(false)
+  } else {
+    maximized()
+  };
+
+  (minimized, maximized)
+}
+
+/// Decodes a value read for `attribute` as a flag.
+///
+/// Some applications answer a flag with a number, which the
+/// single-attribute reads always took as its truth value.
+fn flag_from_value(
+  attribute: &str,
+  value: &CFRetained<CFType>,
+) -> crate::Result<bool> {
+  value
+    .downcast_ref::<CFBoolean>()
+    .map(CFBoolean::value)
+    .or_else(|| {
+      value
+        .downcast_ref::<CFNumber>()
+        .and_then(CFNumber::as_i64)
+        .map(|number| number != 0)
+    })
+    .ok_or_else(|| {
+      crate::Error::Platform(format!("{attribute} is not a boolean."))
+    })
 }
 
 /// Messaging timeout for writes whose outcome is observed afterwards.
@@ -926,6 +1033,38 @@ mod tests {
       delivered(Err(crate::Error::WindowNotFound)),
       Err(crate::Error::WindowNotFound)
     ));
+  }
+
+  fn refused() -> crate::Error {
+    crate::Error::Accessibility(
+      "AXFullScreen".to_string(),
+      AXError::AttributeUnsupported.0,
+    )
+  }
+
+  #[test]
+  fn a_minimized_window_is_not_maximized_and_is_not_asked() {
+    let (minimized, maximized) =
+      flag_results(Ok(true), || panic!("Read the full-screen flag."));
+    assert!(matches!(minimized, Ok(true)));
+    assert!(matches!(maximized, Ok(false)));
+  }
+
+  #[test]
+  fn each_flag_keeps_the_result_of_its_own_read() {
+    let (minimized, maximized) = flag_results(Ok(false), || Ok(true));
+    assert!(matches!(minimized, Ok(false)));
+    assert!(matches!(maximized, Ok(true)));
+
+    let (minimized, maximized) =
+      flag_results(Ok(false), || Err(refused()));
+    assert!(matches!(minimized, Ok(false)));
+    assert!(maximized.is_err());
+
+    // An unreadable minimized flag does not hide the full-screen one.
+    let (minimized, maximized) = flag_results(Err(refused()), || Ok(true));
+    assert!(minimized.is_err());
+    assert!(matches!(maximized, Ok(true)));
   }
 
   #[test]

@@ -201,9 +201,14 @@ fn create_window(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<WindowContainer> {
-  let nearest_monitor = state
-    .nearest_monitor(&native_window)
-    .context("No nearest monitor.")?;
+  // The properties already hold the frame the window was just read at, so
+  // macOS does not read it again to find the monitor.
+  #[cfg(target_os = "macos")]
+  let nearest_monitor =
+    state.nearest_monitor_for_rect(&native_properties.frame);
+  #[cfg(target_os = "windows")]
+  let nearest_monitor = state.nearest_monitor(&native_window);
+  let nearest_monitor = nearest_monitor.context("No nearest monitor.")?;
 
   create_window_with_checked_monitor(
     native_window,

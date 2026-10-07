@@ -302,18 +302,60 @@ impl WmState {
   /// window.
   ///
   /// Defaults to the first monitor if the nearest monitor is invalid.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: asks the OS for the nearest display.
+  /// - macOS: reads the window's frame once and compares it with the
+  ///   monitor bounds already held, as [`Self::nearest_monitor_for_rect`]
+  ///   does. Asking the OS costs a hop, two more reads and a walk over
+  ///   every screen.
   pub fn nearest_monitor(
     &self,
     native_window: &NativeWindow,
   ) -> Option<Monitor> {
-    self
-      .monitor_from_native(
-        &self.dispatcher.nearest_display(native_window).ok()?,
-      )
-      .or(self.monitors().first().cloned())
+    #[cfg(target_os = "macos")]
+    {
+      self.nearest_monitor_for_rect(&native_window.frame().ok()?)
+    }
+    #[cfg(target_os = "windows")]
+    {
+      self
+        .monitor_from_native(
+          &self.dispatcher.nearest_display(native_window).ok()?,
+        )
+        .or(self.monitors().first().cloned())
+    }
+  }
+
+  /// Gets the monitor that encompasses the largest portion of `rect`.
+  ///
+  /// Compares `rect` with the bounds each monitor already holds, so it
+  /// makes no native call. A rect that overlaps no monitor belongs to the
+  /// primary one, or to the first monitor if none is primary. Returns
+  /// `None` only when there are no monitors.
+  ///
+  /// Of monitors that share the largest overlap, the first wins.
+  #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+  pub fn nearest_monitor_for_rect(&self, rect: &Rect) -> Option<Monitor> {
+    let (monitors, candidates): (Vec<_>, Vec<_>) = self
+      .monitors()
+      .into_iter()
+      .filter_map(|monitor| {
+        let bounds = monitor.to_rect().ok()?;
+        let is_primary = monitor.native().is_primary().unwrap_or(false);
+        Some((monitor, (bounds, is_primary)))
+      })
+      .unzip();
+
+    nearest_candidate(rect, &candidates)
+      .and_then(|index| monitors.into_iter().nth(index))
   }
 
   /// Gets monitor that corresponds to the given `Display`.
+  // LINT: Only Windows asks the OS for the nearest display (see
+  // `Self::nearest_monitor`).
+  #[cfg_attr(target_os = "macos", allow(dead_code))]
   pub fn monitor_from_native(
     &self,
     native_display: &Display,
@@ -895,5 +937,167 @@ impl Drop for WmState {
   fn drop(&mut self) {
     self.native_sync.release_all();
     self.native_sync.cleanup(&mut self.animation_manager);
+  }
+}
+
+/// Picks the candidate display that `rect` overlaps the most.
+///
+/// Each candidate is its bounds and whether it is the primary display.
+/// The first candidate wins a tie. A `rect` that overlaps none (e.g. one
+/// that is off-screen) takes the primary candidate, or else the first.
+/// Returns the index of the pick, or `None` without candidates.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn nearest_candidate(
+  rect: &Rect,
+  candidates: &[(Rect, bool)],
+) -> Option<usize> {
+  let mut best = None;
+  let mut best_area = 0;
+
+  for (index, (bounds, _)) in candidates.iter().enumerate() {
+    let area = rect.intersection_area(bounds);
+
+    if area > best_area {
+      best = Some(index);
+      best_area = area;
+    }
+  }
+
+  best
+    .or_else(|| candidates.iter().position(|(_, is_primary)| *is_primary))
+    .or_else(|| (!candidates.is_empty()).then_some(0))
+}
+
+#[cfg(test)]
+mod nearest_candidate_tests {
+  use super::*;
+
+  /// Two side-by-side displays, the right one primary.
+  fn displays() -> Vec<(Rect, bool)> {
+    vec![
+      (Rect::from_xy(-1920, 0, 1920, 1080), false),
+      (Rect::from_xy(0, 0, 2560, 1440), true),
+    ]
+  }
+
+  #[test]
+  fn a_rect_inside_one_display_picks_it() {
+    let rect = Rect::from_xy(100, 100, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(1));
+
+    let rect = Rect::from_xy(-1500, 100, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(0));
+  }
+
+  #[test]
+  fn a_straddling_rect_picks_the_larger_overlap() {
+    // 300px on the left display, 500px on the right one.
+    let rect = Rect::from_xy(-300, 100, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(1));
+
+    // 500px on the left display, 300px on the right one.
+    let rect = Rect::from_xy(-500, 100, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(0));
+  }
+
+  #[test]
+  fn an_equal_overlap_picks_the_first_candidate() {
+    // 400px on each display.
+    let rect = Rect::from_xy(-400, 100, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(0));
+  }
+
+  #[test]
+  fn a_rect_that_only_touches_a_display_overlaps_none() {
+    // Shares the edge at x = 0 with the right display, and nothing else.
+    let rect = Rect::from_xy(-800, 3000, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(1));
+
+    let rect = Rect::from_xy(-800, 100, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(0));
+  }
+
+  #[test]
+  fn an_off_screen_rect_picks_the_primary_display() {
+    let rect = Rect::from_xy(9000, 9000, 800, 600);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(1));
+
+    let mut displays = displays();
+    displays.reverse();
+    assert_eq!(nearest_candidate(&rect, &displays), Some(0));
+  }
+
+  #[test]
+  fn an_off_screen_rect_without_a_primary_picks_the_first() {
+    let rect = Rect::from_xy(9000, 9000, 800, 600);
+    let displays = vec![
+      (Rect::from_xy(0, 0, 1920, 1080), false),
+      (Rect::from_xy(1920, 0, 1920, 1080), false),
+    ];
+    assert_eq!(nearest_candidate(&rect, &displays), Some(0));
+  }
+
+  #[test]
+  fn a_degenerate_rect_picks_the_primary_display() {
+    let rect = Rect::from_xy(100, 100, 0, 0);
+    assert_eq!(nearest_candidate(&rect, &displays()), Some(1));
+  }
+
+  #[test]
+  fn no_displays_pick_nothing() {
+    let rect = Rect::from_xy(0, 0, 100, 100);
+    assert_eq!(nearest_candidate(&rect, &[]), None);
+  }
+
+  /// The walk `Dispatcher::nearest_display` makes on macOS, which
+  /// `nearest_candidate` replaces.
+  fn oracle(rect: &Rect, displays: &[(Rect, bool)]) -> Option<usize> {
+    let mut best = None;
+    let mut max_intersection_area = 0;
+
+    for (index, (screen, _)) in displays.iter().enumerate() {
+      let intersection_x = i32::max(rect.x(), screen.x());
+      let intersection_y = i32::max(rect.y(), screen.y());
+      let intersection_width =
+        i32::min(rect.x() + rect.width(), screen.x() + screen.width())
+          - intersection_x;
+      let intersection_height =
+        i32::min(rect.y() + rect.height(), screen.y() + screen.height())
+          - intersection_y;
+
+      if intersection_width > 0 && intersection_height > 0 {
+        let area = intersection_width * intersection_height;
+        if area > max_intersection_area {
+          max_intersection_area = area;
+          best = Some(index);
+        }
+      }
+    }
+
+    best
+      .or_else(|| displays.iter().position(|(_, is_primary)| *is_primary))
+      .or_else(|| (!displays.is_empty()).then_some(0))
+  }
+
+  #[test]
+  fn it_matches_the_native_walk_over_a_grid_of_rects() {
+    let displays = vec![
+      (Rect::from_xy(0, 0, 1512, 982), true),
+      (Rect::from_xy(-3008, -368, 3008, 1692), false),
+      (Rect::from_xy(1512, 100, 1920, 1080), false),
+    ];
+
+    for x in (-4000..4000).step_by(331) {
+      for y in (-1200..2000).step_by(277) {
+        for (width, height) in [(0, 0), (1, 1), (640, 480), (2400, 1300)] {
+          let rect = Rect::from_xy(x, y, width, height);
+          assert_eq!(
+            nearest_candidate(&rect, &displays),
+            oracle(&rect, &displays),
+            "{rect:?}"
+          );
+        }
+      }
+    }
   }
 }

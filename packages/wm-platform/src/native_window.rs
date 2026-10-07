@@ -468,6 +468,21 @@ impl NativeWindowWindowsExt for NativeWindow {
   }
 }
 
+/// A window's frame and display state, read together.
+///
+/// Returned by [`NativeWindow::frame_and_state`]. Each flag holds the
+/// result its own query would have given, so a caller reacts to a failed
+/// flag where it needs that flag, not for the whole snapshot.
+#[derive(Debug)]
+pub struct WindowFrameState {
+  /// Same as [`NativeWindow::frame`].
+  pub frame: Rect,
+  /// Same as [`NativeWindow::is_minimized`].
+  pub is_minimized: crate::Result<bool>,
+  /// Same as [`NativeWindow::is_maximized`].
+  pub is_maximized: crate::Result<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeWindow {
   pub(crate) inner: platform_impl::NativeWindow,
@@ -506,6 +521,23 @@ impl NativeWindow {
   ///   reflect the actual window size.
   pub fn frame(&self) -> crate::Result<Rect> {
     self.inner.frame()
+  }
+
+  /// Gets the window's frame and whether it is minimized and maximized.
+  ///
+  /// Answers as [`NativeWindow::frame`], [`NativeWindow::is_minimized`]
+  /// and [`NativeWindow::is_maximized`] would, for a caller that needs
+  /// all three. Only the frame fails the call; each flag carries its own
+  /// result.
+  ///
+  /// # Platform-specific
+  ///
+  /// - **Windows**: Composes the three queries, which are cheap.
+  /// - **macOS**: One request to the application and one hop to the main
+  ///   thread, where the three queries cost one of each apiece. A window
+  ///   read as minimized is reported as not maximized.
+  pub fn frame_and_state(&self) -> crate::Result<WindowFrameState> {
+    self.inner.frame_and_state()
   }
 
   /// Gets the window's position as (x, y) coordinates.

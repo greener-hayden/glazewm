@@ -242,9 +242,17 @@ struct ReconcileCandidate {
   ///
   /// Applying it needs a frame that is settled or has an accepted write
   /// (see `focus_ready`), so the window has to be reconciled even when
-  /// nothing else asks for it. A frame suspended by a finished drag, for
-  /// one, only restarts in a pass.
+  /// nothing else asks for it, unless `focus_settled` says its frame
+  /// already is. A frame suspended by a finished drag, for one, only
+  /// restarts in a pass.
   focus_pending: bool,
+  /// Native focus needs nothing more from this window's frame.
+  ///
+  /// The window is shown, its frame has converged and nothing hides its
+  /// source, so native focus can go ahead as it is (see `focus_ready`).
+  /// Reconciling it would only read back what is already known. Only read
+  /// while `focus_pending` is set.
+  focus_settled: bool,
   /// The applied effects differ from what the new focus asks for.
   ///
   /// Only read when `ReconcileSignals::focus_effects_changed` is set.
@@ -292,6 +300,10 @@ fn reconcile_candidates(
         dirty: dirty.contains(&id),
         planned: plans.contains_key(&id),
         focus_pending: state.native_sync.focus == Some(id),
+        focus_settled: entry.is_some_and(|entry| {
+          entry.frame.phase == ReconcilePhase::Converged
+            && focus_ready(FocusGate::of(entry))
+        }),
         effects_stale: focus_effects_changed
           && !all_effects_changed
           && focus_effects_stale(window, &state.native_sync, config),
@@ -316,6 +328,25 @@ struct FocusGate {
   observed_state: Option<NativeState>,
   /// The window is confirmed shown, with no visibility change pending.
   shown: bool,
+}
+
+impl FocusGate {
+  /// Reads the gate off a window's entry.
+  fn of(entry: &ManagedWindow) -> Self {
+    Self {
+      has_source: entry.source.is_some(),
+      phase: entry.frame.phase,
+      frame_write_accepted: PlacementSession::FOCUS_ON_ACCEPTED_WRITE
+        && entry.frame.frame_write_accepted(),
+      desired_state: entry.frame.desired.state,
+      observed_state: entry.frame.observed_state(),
+      shown: !entry.visibility_pending
+        && entry
+          .visibility
+          .as_ref()
+          .is_some_and(|(visible, _)| *visible),
+    }
+  }
 }
 
 /// Whether native focus can go to the window now.
@@ -352,7 +383,9 @@ fn focus_ready(gate: FocusGate) -> bool {
 /// reach every window on its workspace when only restacking asks for it.
 /// Platforms without native z-order have nothing to restack. A focus
 /// change there reaches only the window gaining focus, which native focus
-/// waits on, and the windows whose effects it changes.
+/// waits on, and the windows whose effects it changes. A window gaining
+/// focus whose frame has already settled (`focus_settled`) is left out,
+/// since native focus can go ahead without a pass.
 fn select_reconcile_set(
   candidates: &[ReconcileCandidate],
   signals: &ReconcileSignals<'_>,
@@ -365,7 +398,11 @@ fn select_reconcile_set(
       let reorder = has_native_z_order
         && signals.reorder_workspaces.contains(&candidate.workspace);
       // Restacking reconciled the focus target along with its workspace.
-      let focus_target = !has_native_z_order && candidate.focus_pending;
+      // A target whose frame is already settled needs no pass: native
+      // focus reads the same state it would have reconciled.
+      let focus_target = !has_native_z_order
+        && candidate.focus_pending
+        && !candidate.focus_settled;
       let effects_changed = signals.all_effects_changed
         || (signals.focus_effects_changed && candidate.effects_stale);
 
@@ -1578,19 +1615,7 @@ pub fn platform_sync(
     } else if let Some(entry) = state.native_sync.windows.get(&id) {
       if entry.frame.desired.state == NativeState::Minimized {
         state.native_sync.focus = None;
-      } else if focus_ready(FocusGate {
-        has_source: entry.source.is_some(),
-        phase: entry.frame.phase,
-        frame_write_accepted: PlacementSession::FOCUS_ON_ACCEPTED_WRITE
-          && entry.frame.frame_write_accepted(),
-        desired_state: entry.frame.desired.state,
-        observed_state: entry.frame.observed_state(),
-        shown: !entry.visibility_pending
-          && entry
-            .visibility
-            .as_ref()
-            .is_some_and(|(visible, _)| *visible),
-      }) {
+      } else if focus_ready(FocusGate::of(entry)) {
         let focus_span = PerfSpan::start("native_focus");
         // A raise that is not waited for can land after a later focus
         // change, so the window may end up above the one focused next.
@@ -1602,13 +1627,27 @@ pub fn platform_sync(
           focused.as_window_container(),
           Ok(WindowContainer::TilingWindow(_))
         );
-        if let Err(err) = entry.native.window().and_then(|native| {
-          if focused_tiling {
-            native.focus_deferred_raise()
+        // A focus target that selection skipped as settled was not
+        // validated by a pass, and macOS `window()` does not validate
+        // (Windows' does). A dead window would otherwise still bring its
+        // application to the front, so ask once, which costs one `AXRole`
+        // read where the pass it replaced cost far more.
+        let validated =
+          if cfg!(target_os = "macos") && !selected.contains_key(&id) {
+            entry.native.validate()
           } else {
-            native.focus()
-          }
-        }) {
+            Ok(())
+          };
+        if let Err(err) = validated
+          .and_then(|()| entry.native.window())
+          .and_then(|native| {
+            if focused_tiling {
+              native.focus_deferred_raise()
+            } else {
+              native.focus()
+            }
+          })
+        {
           tracing::warn!("Window focus failed: {err}");
         }
         focus_span.finish(SLOW_CALL, format_args!("window={id}"));
@@ -1869,6 +1908,17 @@ fn release_ready(state: &mut WmState) {
   }
 }
 
+/// Whether the observation a pass opens with still describes the window
+/// when it reaches its frame request.
+///
+/// On macOS nothing in between changes the window natively: concealing,
+/// opacity, decorations and presentation all act on the overlay or are
+/// no-ops, and parking is only requested by the frame request itself. On
+/// Windows cloaking, alpha and the presented flag change what is read, so
+/// the frame request observes again. Reusing the observation spares a
+/// window server lookup and an accessibility request per window per pass.
+const OBSERVATION_HOLDS_THROUGH_PASS: bool = cfg!(target_os = "macos");
+
 /// Whether a window can take an overlay this commit, as far as is known
 /// without a native query.
 ///
@@ -1886,8 +1936,22 @@ fn may_present(
     .is_some_and(|intent| intent.minimize);
   desired_state(window, minimize) == NativeState::Normal
     && coordinator.windows.get(&id).is_none_or(|entry| {
-      entry.conceal.is_some() && entry.native.supports_presentation()
+      entry.conceal.is_some()
+        && source_supports_presentation(entry.frame.observed_state())
     })
+}
+
+/// Whether a source last seen in `observed` can yield presentation.
+///
+/// Answers from the last observation instead of asking the window, which
+/// on macOS is a hop and an accessibility read. It matches
+/// `PlacementSession::supports_presentation`, up to a maximize since that
+/// observation. Reconciliation observes again before it prepares an
+/// overlay, so a stale answer only costs or spares one discarded capture.
+fn source_supports_presentation(observed: Option<NativeState>) -> bool {
+  // Only macOS refuses a maximized source (see
+  // `PlacementSession::supports_presentation`).
+  !(cfg!(target_os = "macos") && observed == Some(NativeState::Maximized))
 }
 
 /// Carries native-independent constants for one reconciliation pass.
@@ -2092,15 +2156,23 @@ fn parking_rect(
 /// must keep a tick due for such a window, or its write waits out the
 /// 250 ms retry.
 ///
+/// `known` is an observation the pass already made, used instead of
+/// observing again. It is `None` where the pass may have changed the
+/// window since (see `OBSERVATION_HOLDS_THROUGH_PASS`).
+///
 /// `placed` runs straight after a frame request is issued, with the
 /// requested rect, so work that must reach the compositor with the move
 /// follows it without a native query in between.
 fn reconcile_frame(
   entry: &mut ManagedWindow,
   now: Instant,
+  known: Option<ObservedFrame>,
   mut placed: impl FnMut(&Rect),
 ) -> anyhow::Result<ObservedFrame> {
-  let observed = observe(&entry.native)?;
+  let observed = match known {
+    Some(observed) => observed,
+    None => observe(&entry.native)?,
+  };
   if let Some(request) = entry.frame.next(&observed, now) {
     let plan = ObservePlan::after_write(
       &request.mutation,
@@ -2432,6 +2504,9 @@ fn reconcile_managed(
   }
   timer.mark("cancel");
   if let Some(plan) = plan {
+    // A source that can present is in the normal state, which the
+    // observation checks: a window that cannot (a maximized one on macOS)
+    // is not, so asking it again would only repeat that read.
     if plan.trigger.uses_native()
       && visible
       && entry.source.is_none()
@@ -2453,8 +2528,7 @@ fn reconcile_managed(
       });
       entry.retire_after = None;
       decorate_native(entry, window, &start, frame_rate, state);
-    } else if entry.native.supports_presentation()
-      && entry.conceal.is_some()
+    } else if entry.conceal.is_some()
       && native_state == NativeState::Normal
       && observed.state == NativeState::Normal
       && !dragging
@@ -2544,7 +2618,6 @@ fn reconcile_managed(
       tracing::debug!(
         window = %id,
         trigger = ?plan.trigger,
-        supported = entry.native.supports_presentation(),
         conceal = ?entry.conceal,
         desired = ?native_state,
         observed = ?observed.state,
@@ -2700,9 +2773,14 @@ fn reconcile_managed(
   timer.mark("conceal");
   if !retaining_source && !dragging {
     let animations = &mut state.animation_manager;
-    observed = reconcile_frame(entry, now, |rect| {
-      animations.draw_decoration(&id, rect);
-    })?;
+    observed = reconcile_frame(
+      entry,
+      now,
+      OBSERVATION_HOLDS_THROUGH_PASS.then_some(observed),
+      |rect| {
+        animations.draw_decoration(&id, rect);
+      },
+    )?;
   } else if retaining_source {
     entry.frame.observe(&observed, now);
   }
@@ -3019,6 +3097,7 @@ mod tests {
         dirty: false,
         planned: false,
         focus_pending: false,
+        focus_settled: false,
         effects_stale: false,
       })
       .collect();
@@ -3074,6 +3153,79 @@ mod tests {
       select_reconcile_set(&candidates, &signals, true).len(),
       10
     );
+  }
+
+  #[test]
+  fn a_settled_focus_target_is_not_reconciled_without_z_order() {
+    let (workspace, mut candidates) = idle_workspace(10);
+    candidates[3].focus_pending = true;
+    candidates[3].focus_settled = true;
+    let reorder_workspaces = HashSet::from([workspace]);
+    let signals = ReconcileSignals {
+      reorder_workspaces: &reorder_workspaces,
+      all_effects_changed: false,
+      focus_effects_changed: false,
+    };
+
+    assert!(select_reconcile_set(&candidates, &signals, false).is_empty());
+    // Restacking still reaches the whole workspace.
+    assert_eq!(
+      select_reconcile_set(&candidates, &signals, true).len(),
+      10
+    );
+  }
+
+  #[test]
+  fn a_settled_focus_target_is_still_reconciled_for_any_other_reason() {
+    let workspace = Uuid::new_v4();
+    let reorder_workspaces = HashSet::from([Uuid::new_v4()]);
+
+    // Every combination of the reasons besides the focus target itself.
+    for bits in 0u32..1 << 8 {
+      let flag = |bit: u32| bits & (1 << bit) != 0;
+      let candidate = |focus_settled| ReconcileCandidate {
+        id: Uuid::nil(),
+        workspace,
+        retired: flag(0),
+        redraw: flag(1),
+        pending: flag(2),
+        dirty: flag(3),
+        planned: flag(4),
+        focus_pending: true,
+        focus_settled,
+        effects_stale: flag(5),
+      };
+      let signals = ReconcileSignals {
+        reorder_workspaces: &reorder_workspaces,
+        all_effects_changed: flag(6),
+        focus_effects_changed: flag(7),
+      };
+      let select = |focus_settled| {
+        select_reconcile_set(
+          std::slice::from_ref(&candidate(focus_settled)),
+          &signals,
+          false,
+        )
+      };
+
+      let unsettled = select(false);
+      let settled = select(true);
+
+      // A pending focus target is always selected unless it is retired.
+      assert_eq!(unsettled.len(), usize::from(!flag(0)), "bits={bits:#b}");
+
+      let other_reason = flag(1)
+        || flag(2)
+        || flag(3)
+        || flag(4)
+        || flag(6)
+        || (flag(7) && flag(5));
+      assert_eq!(
+        settled.len(),
+        usize::from(!flag(0) && other_reason),
+        "bits={bits:#b}"
+      );
+    }
   }
 
   #[test]
@@ -3195,6 +3347,7 @@ mod tests {
         dirty: flag(4),
         planned: flag(5),
         focus_pending: flag(9),
+        focus_settled: false,
         effects_stale: flag(6),
       };
       let reorder_workspaces = HashSet::from([workspace]);

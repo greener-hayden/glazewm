@@ -360,6 +360,30 @@ impl AnimationWindow {
     }
   }
 
+  /// Cancels compositor motion and retains a stationary overlay where it
+  /// is currently presented, or at `fallback` where the platform cannot
+  /// say. Returns the frame the overlay now stands at.
+  ///
+  /// Does what [`AnimationWindow::current_frame`] followed by
+  /// [`AnimationWindow::stop_at`] (without opacity) does.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: one hop to the main thread, where the two calls cost one
+  ///   each.
+  /// - Windows: stops at `fallback`, the frame the caller already knows.
+  pub fn stop_in_place(&self, fallback: &Rect) -> crate::Result<Rect> {
+    #[cfg(target_os = "macos")]
+    {
+      self.inner.stop_in_place(fallback)
+    }
+    #[cfg(target_os = "windows")]
+    {
+      self.inner.update(fallback, None)?;
+      Ok(fallback.clone())
+    }
+  }
+
   /// Returns the compositor's currently presented geometry if available.
   /// Windows motion is driven by the caller, which already knows this
   /// frame.

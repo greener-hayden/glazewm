@@ -31,7 +31,10 @@ mod placement_session;
 mod platform_event;
 mod platform_impl;
 mod qos;
+mod shell_request;
 mod single_instance;
+#[cfg(target_os = "windows")]
+mod style_worker;
 mod thread_bound;
 mod thumbnail_layout;
 pub use thumbnail_layout::thumbnail_rects;
@@ -65,6 +68,7 @@ pub use native_window::*;
 pub use placement_session::*;
 pub use platform_event::*;
 pub use qos::*;
+pub use shell_request::*;
 pub use single_instance::*;
 pub use thread_bound::*;
 pub use window_listener::*;

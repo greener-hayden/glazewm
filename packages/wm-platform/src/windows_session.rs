@@ -25,7 +25,10 @@ use windows::{
 };
 
 use crate::{
-  ConcealMethod, NativeWindow, NativeWindowWindowsExt, OpacityValue, Rect,
+  opening_windows::{submit_shell, ShellCall},
+  style_worker::{Change, Completion, STYLES},
+  ConcealMethod, NativeWindow, NativeWindowWindowsExt, OpacityProgress,
+  OpacityValue, Rect, ShellTicket,
 };
 
 const OWNER: PCWSTR = w!("GlazeWM.greener.owner.v1");
@@ -168,7 +171,7 @@ impl NativeSession {
       return Ok(opening);
     }
     if property(&window, OWNER) != 0 {
-      recover_window(&window)?;
+      recover_window(&window, None)?;
     }
     let mut process = 0;
     // SAFETY: Process output lives through call.
@@ -286,7 +289,12 @@ impl NativeSession {
     }
   }
 
-  /// Applies only WM-owned opacity changes.
+  /// Applies only WM-owned opacity changes, waiting on the application.
+  ///
+  /// Adding or removing the layered bit blocks until the application's
+  /// thread answers, for as long as it takes. Only a thread that may block
+  /// should call this; the window manager thread calls
+  /// [`Self::request_opacity`].
   pub fn opacity(&self, value: Option<OpacityValue>) -> crate::Result<()> {
     self.validate()?;
     let changes = property(&self.window, CHANGES);
@@ -316,6 +324,203 @@ impl NativeSession {
       }
     }
     Ok(())
+  }
+
+  /// Requests an opacity without waiting on the application.
+  ///
+  /// Adding or removing `WS_EX_LAYERED` makes the application's own thread
+  /// answer a style message, so those changes run on the target process's
+  /// style lane (see `style_worker`). Setting attribute alpha on a window
+  /// that already has the bit is done here, inline, and removing the bit
+  /// first sets alpha to opaque: a reveal reaches the screen at once and
+  /// the removal follows.
+  ///
+  /// Idempotent. Call it each pass until it reports
+  /// [`OpacityProgress::Settled`]; a later request for another opacity
+  /// supersedes one still queued. `Settled` means the window shows the
+  /// requested opacity and, for a restore, that the bit is gone and its
+  /// recovery record cleared.
+  pub fn request_opacity(
+    &self,
+    value: Option<OpacityValue>,
+  ) -> crate::Result<OpacityProgress> {
+    self.validate()?;
+    let changes = property(&self.window, CHANGES);
+    let layered = self.window.has_window_style_ex(WS_EX_LAYERED);
+    match opacity_action(
+      self.supports_alpha(),
+      changes & ALPHA != 0,
+      value,
+    ) {
+      OpacityAction::Unchanged => Ok(OpacityProgress::Settled),
+      OpacityAction::Unsupported => Err(crate::Error::Platform(
+        "Application owns window transparency.".into(),
+      )),
+      OpacityAction::Set(value) => {
+        let alpha = value.to_alpha();
+        if changes & ALPHA == 0 {
+          put_property(&self.window, CHANGES, changes | ALPHA)?;
+        }
+        self.queue_layer(true, alpha, layered)?;
+        let applied = layered && self.apply_alpha(alpha);
+        Ok(if applied && !self.layer_busy() {
+          OpacityProgress::Settled
+        } else {
+          OpacityProgress::Pending
+        })
+      }
+      OpacityAction::Restore => {
+        if layered {
+          self.apply_alpha(u8::MAX);
+        }
+        self.queue_layer(false, u8::MAX, layered)?;
+        if layered || self.layer_busy() {
+          return Ok(OpacityProgress::Pending);
+        }
+        put_property(&self.window, CHANGES, changes & !ALPHA)?;
+        Ok(OpacityProgress::Settled)
+      }
+    }
+  }
+
+  /// Queues a change of the window's `WS_EX_LAYERED` bit.
+  fn queue_layer(
+    &self,
+    on: bool,
+    alpha: u8,
+    observed_on: bool,
+  ) -> crate::Result<()> {
+    self
+      .queue_layer_with(on, alpha, observed_on, None)
+      .map(|_| ())
+  }
+
+  /// Queues a change of the `WS_EX_LAYERED` bit, with a hook that runs
+  /// when it ends.
+  ///
+  /// Returns whether work is outstanding, which is whether `done` will
+  /// run: a window that already is as asked has nothing to wait for.
+  fn queue_layer_with(
+    &self,
+    on: bool,
+    alpha: u8,
+    observed_on: bool,
+    done: Option<Completion>,
+  ) -> crate::Result<bool> {
+    STYLES.request(
+      self.process,
+      self.window.hwnd().0,
+      self,
+      Change {
+        on,
+        alpha,
+        observed_on,
+      },
+      done,
+    )
+  }
+
+  /// Conceals an opening window by attribute alpha without waiting on its
+  /// application.
+  ///
+  /// For the shell worker. Adding the layered bit is queued on the target
+  /// process's own lane, so a hung application cannot hold up the shell
+  /// thread, and `done` runs when that ends, with whether it worked. It
+  /// does not run when nothing needed queueing. Setting alpha on a window
+  /// that already has the bit is inline.
+  pub(crate) fn conceal_queued(
+    &self,
+    done: Completion,
+  ) -> crate::Result<()> {
+    self.validate()?;
+    let changes = property(&self.window, CHANGES);
+    let layered = self.window.has_window_style_ex(WS_EX_LAYERED);
+    match opacity_action(
+      self.supports_alpha(),
+      changes & ALPHA != 0,
+      Some(OpacityValue(0.0)),
+    ) {
+      OpacityAction::Set(value) => {
+        if changes & ALPHA == 0 {
+          put_property(&self.window, CHANGES, changes | ALPHA)?;
+        }
+        let alpha = value.to_alpha();
+        if layered {
+          self.apply_alpha(alpha);
+        }
+        self.queue_layer_with(true, alpha, layered, Some(done))?;
+        Ok(())
+      }
+      OpacityAction::Unsupported => Err(crate::Error::Platform(
+        "Application owns window transparency.".into(),
+      )),
+      OpacityAction::Unchanged | OpacityAction::Restore => Ok(()),
+    }
+  }
+
+  /// Whether a style change is queued or running for this window.
+  fn layer_busy(&self) -> bool {
+    STYLES.busy(self.process, self.window.hwnd().0)
+  }
+
+  /// Sets attribute alpha on a window that has the layered bit.
+  ///
+  /// Returns whether the window shows the alpha afterwards. A window whose
+  /// bit a queued removal took away meanwhile rejects the call, and that
+  /// is not an error: the removal is what the caller asked for next.
+  fn apply_alpha(&self, alpha: u8) -> bool {
+    let native = &self.window.inner;
+    if native.layered_alpha() == Some(alpha) {
+      return true;
+    }
+    match native.set_layered_alpha(alpha) {
+      Ok(()) => true,
+      Err(err) => {
+        tracing::debug!("Inline alpha was rejected: {err}");
+        false
+      }
+    }
+  }
+
+  /// Adds or removes `WS_EX_LAYERED` on the style lane's thread.
+  ///
+  /// Raw mutation only: recovery records belong to whoever asked for the
+  /// change. Ownership is checked again once the add has landed. The call
+  /// can take as long as the application likes, and `release` may have
+  /// run meanwhile, so an add that outlived its ownership is undone
+  /// rather than left on a window nobody will restore.
+  pub(crate) fn execute_layered(
+    &self,
+    on: bool,
+    alpha: &dyn Fn() -> u8,
+  ) -> crate::Result<()> {
+    self.validate()?;
+    if on {
+      self.window.add_window_style_ex(WS_EX_LAYERED);
+      if !self.window.has_window_style_ex(WS_EX_LAYERED) {
+        return Err(crate::Error::Platform(
+          "Opacity application failed.".into(),
+        ));
+      }
+      // A layered window draws nothing until it has attributes, so this
+      // follows the add at once, with the alpha wanted now.
+      let applied = self.window.inner.set_layered_alpha(alpha());
+      if self.validate().is_err() {
+        self.window.remove_window_style_ex(WS_EX_LAYERED);
+        return Err(crate::Error::Platform(
+          "Window ownership expired.".into(),
+        ));
+      }
+      applied
+    } else {
+      self.window.remove_window_style_ex(WS_EX_LAYERED);
+      if self.window.has_window_style_ex(WS_EX_LAYERED) {
+        return Err(crate::Error::Platform(
+          "Opacity restoration failed.".into(),
+        ));
+      }
+      Ok(())
+    }
   }
 
   /// Preserves application-owned title-bar state.
@@ -365,6 +570,97 @@ impl NativeSession {
     }
     if !hidden {
       put_property(&self.window, CHANGES, changes & !CLOAK)?;
+    }
+    Ok(())
+  }
+
+  /// Queues recoverable workspace cloaking without waiting on the shell.
+  ///
+  /// Returns the ticket of the queued call, or `None` when there is
+  /// nothing to do because the window was not cloaked by us. The recovery
+  /// record is written here, before the call can run, and the call itself
+  /// only makes the shell request; the caller reports the outcome to
+  /// [`Self::finish_cloak`].
+  pub fn request_cloak(
+    &self,
+    hidden: bool,
+  ) -> crate::Result<Option<ShellTicket>> {
+    self.validate()?;
+    let changes = property(&self.window, CHANGES);
+    if !hidden && changes & CLOAK == 0 {
+      return Ok(None);
+    }
+    if hidden && changes & CLOAK == 0 {
+      put_property(&self.window, CHANGES, changes | CLOAK)?;
+    }
+    let ticket = ShellTicket::new();
+    if let Err(err) = submit_shell(self, ShellCall::Cloak(hidden), &ticket)
+    {
+      if hidden {
+        put_property(&self.window, CHANGES, changes & !CLOAK)?;
+      }
+      return Err(err);
+    }
+    Ok(Some(ticket))
+  }
+
+  /// Settles the recovery record of a cloak request that has ended.
+  ///
+  /// A cloak that failed leaves no record behind, so a later uncloak
+  /// stays a no-op instead of failing the same way again, and an uncloak
+  /// that took effect no longer needs one. A cloak that took effect, and
+  /// an uncloak that failed, keep it.
+  pub fn finish_cloak(
+    &self,
+    hidden: bool,
+    applied: bool,
+  ) -> crate::Result<()> {
+    if hidden == applied {
+      return Ok(());
+    }
+    self.validate()?;
+    let changes = property(&self.window, CHANGES);
+    put_property(&self.window, CHANGES, changes & !CLOAK)
+  }
+
+  /// Queues a taskbar tab change without waiting on the shell.
+  pub fn request_taskbar_visibility(
+    &self,
+    visible: bool,
+  ) -> crate::Result<Option<ShellTicket>> {
+    self.validate()?;
+    let ticket = ShellTicket::new();
+    submit_shell(self, ShellCall::TaskbarTab(visible), &ticket)?;
+    Ok(Some(ticket))
+  }
+
+  /// Queues the taskbar's fullscreen mark without waiting on the shell.
+  pub fn request_fullscreen_mark(
+    &self,
+    fullscreen: bool,
+  ) -> crate::Result<Option<ShellTicket>> {
+    self.validate()?;
+    let ticket = ShellTicket::new();
+    submit_shell(self, ShellCall::MarkFullscreen(fullscreen), &ticket)?;
+    Ok(Some(ticket))
+  }
+
+  /// Makes the shell cloak call. The shell worker's thread only.
+  ///
+  /// Ownership is checked again once a cloak has landed. The call waits
+  /// on explorer and `release` may have run meanwhile, so a cloak that
+  /// outlived its ownership is undone rather than left on a window nobody
+  /// will restore.
+  pub(crate) fn execute_cloak(&self, hidden: bool) -> crate::Result<()> {
+    self.validate()?;
+    self.window.inner.set_cloaked_cached(hidden)?;
+    if hidden && self.validate().is_err() {
+      if let Err(err) = self.window.inner.set_cloaked_cached(false) {
+        tracing::warn!("Expired cloak could not be undone: {err}");
+      }
+      return Err(crate::Error::Platform(
+        "Window ownership expired.".into(),
+      ));
     }
     Ok(())
   }
@@ -494,10 +790,66 @@ impl NativeSession {
   }
 
   /// Restores owned changes before relinquishing ownership.
+  ///
+  /// Waits on the shell and on the window's application, so it belongs to
+  /// a thread that may block.
+  ///
+  /// Work a worker already holds for this window cannot be recalled, and
+  /// is settled from the other side rather than waited for. Queued style
+  /// changes are dropped here; queued shell calls fail their ownership
+  /// check once the record is gone; and a call that is already running
+  /// undoes itself when it lands and finds ownership expired (see
+  /// `execute_cloak` and `execute_layered`). The recovery below looks
+  /// again after the record is removed, so a change that landed between
+  /// its first look and the removal is undone too.
   pub fn release(&self) -> crate::Result<()> {
     self.validate()?;
-    recover_window(&self.window)
+    STYLES.forget(self.window.hwnd().0);
+    recover_window(&self.window, None).map(|_| ())
   }
+
+  /// Restores owned changes without waiting on the window's application.
+  ///
+  /// For the shell worker. Removing the layered bit is queued on the
+  /// target process's lane instead, after revealing the window by setting
+  /// alpha opaque inline, and the recovery record is retained until it is
+  /// gone. Returns `true` when recovery is complete. Returns `false` when
+  /// the removal was queued, in which case `done` runs once it ends, with
+  /// whether it worked, for the caller to try again. A caller should not
+  /// retry a failed removal, since that would only fail the same way; the
+  /// record stays for the next claim of the window. `done` does not run
+  /// when this returns `true`.
+  pub(crate) fn release_queued(
+    &self,
+    done: Completion,
+  ) -> crate::Result<bool> {
+    self.validate()?;
+    recover_window(
+      &self.window,
+      Some(QueuedRemoval {
+        session: self,
+        done,
+      }),
+    )
+    .map(|recovery| recovery == Recovery::Complete)
+  }
+}
+
+/// How far `recover_window` got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recovery {
+  /// Every change is undone and the record is removed.
+  Complete,
+  /// The layered bit's removal is queued, and the record is retained
+  /// until it lands.
+  Queued,
+}
+
+/// A layered-bit removal that recovery may queue rather than perform.
+struct QueuedRemoval<'a> {
+  session: &'a NativeSession,
+  /// Runs once the removal has ended.
+  done: Completion,
 }
 
 /// Reads a pointer-sized recovery value.
@@ -546,9 +898,15 @@ fn parked_home(
 /// frame; returning early with the window still cloaked or transparent
 /// strands it invisible whenever no caller retries. A misplaced window
 /// is recoverable by the user, an unseen one is not.
-fn recover_window(window: &NativeWindow) -> crate::Result<()> {
+///
+/// With `queued`, removing the layered bit does not wait on the
+/// application; see `NativeSession::release_queued`.
+fn recover_window(
+  window: &NativeWindow,
+  queued: Option<QueuedRemoval<'_>>,
+) -> crate::Result<Recovery> {
   if property(window, OWNER) == 0 {
-    return Ok(());
+    return Ok(Recovery::Complete);
   }
   let changes = property(window, CHANGES);
   // Start the move first, so concealment lifts over a travelling window.
@@ -565,11 +923,24 @@ fn recover_window(window: &NativeWindow) -> crate::Result<()> {
     window.show()?;
   }
   if changes & ALPHA != 0 {
-    window.remove_window_style_ex(WS_EX_LAYERED);
-    if window.has_window_style_ex(WS_EX_LAYERED) {
-      return Err(crate::Error::Platform(
-        "Opacity restoration failed.".into(),
-      ));
+    match queued {
+      Some(QueuedRemoval { session, done })
+        if window.has_window_style_ex(WS_EX_LAYERED) =>
+      {
+        // Reveal now; the bit follows. The record stays until it does.
+        session.apply_alpha(u8::MAX);
+        session.queue_layer_with(false, u8::MAX, true, Some(done))?;
+        return Ok(Recovery::Queued);
+      }
+      Some(_) => {}
+      None => {
+        window.remove_window_style_ex(WS_EX_LAYERED);
+        if window.has_window_style_ex(WS_EX_LAYERED) {
+          return Err(crate::Error::Platform(
+            "Opacity restoration failed.".into(),
+          ));
+        }
+      }
     }
   }
   if changes & TITLE != 0 {
@@ -591,7 +962,19 @@ fn recover_window(window: &NativeWindow) -> crate::Result<()> {
       }
     }
   }
-  Ok(())
+  // A worker's call that was already running when the checks above ran
+  // may have landed since. Its own ownership check fails now that the
+  // record is gone, so it undoes itself; this look catches one that
+  // landed before its check. Best effort: nothing is left to retry with.
+  if changes & CLOAK != 0 && window.inner.is_cloaked().unwrap_or(false) {
+    if let Err(err) = window.set_cloaked(false) {
+      tracing::warn!("Late cloak could not be undone: {err}");
+    }
+  }
+  if changes & ALPHA != 0 && window.has_window_style_ex(WS_EX_LAYERED) {
+    window.remove_window_style_ex(WS_EX_LAYERED);
+  }
+  Ok(Recovery::Complete)
 }
 
 /// Recovers windows missed by IPC delivery.
@@ -614,7 +997,9 @@ pub fn recover_owned_windows() -> crate::Result<()> {
   }
   let mut failure = None;
   for handle in handles {
-    if let Err(err) = recover_window(&NativeWindow::from_handle(handle)) {
+    if let Err(err) =
+      recover_window(&NativeWindow::from_handle(handle), None)
+    {
       tracing::warn!("Window recovery failed: {err}");
       failure = Some(err);
     }

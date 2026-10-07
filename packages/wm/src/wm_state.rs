@@ -132,6 +132,12 @@ impl WmState {
     exit_tx: mpsc::UnboundedSender<()>,
   ) -> Self {
     let animation_manager = AnimationManager::new(&dispatcher);
+    // Workers report finished native work through the frame clock's
+    // wake, so a pass records it as soon as it lands.
+    #[cfg(target_os = "windows")]
+    wm_platform::set_native_wake(
+      animation_manager.native_completion_wake(),
+    );
     Self::with_animation_manager(
       dispatcher,
       animation_manager,

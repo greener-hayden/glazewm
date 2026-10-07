@@ -14,8 +14,8 @@ use objc2_core_graphics::{
 #[cfg(target_os = "macos")]
 use crate::platform_impl::AXUIElementExt;
 use crate::{
-  Color, CornerStyle, NativeWindow, OpacityValue, Rect, WindowId,
-  WindowZOrder,
+  Color, CornerStyle, NativeWindow, OpacityProgress, OpacityValue, Rect,
+  ShellTicket, WindowId, WindowZOrder,
 };
 #[cfg(target_os = "macos")]
 use crate::{NativeCall, NativeCallStats};
@@ -399,6 +399,12 @@ impl PlacementSession {
   }
 
   /// Applies recoverable opacity where native attribute alpha is safe.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: waits on the window's own application, for as long as it
+  ///   takes. The window manager thread uses [`Self::request_opacity`].
+  /// - macOS: no-op.
   pub fn opacity(&self, value: Option<OpacityValue>) -> crate::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -408,6 +414,33 @@ impl PlacementSession {
     {
       let _ = value;
       Ok(())
+    }
+  }
+
+  /// Requests recoverable opacity without waiting on the application.
+  ///
+  /// Idempotent: call it each pass until it reports
+  /// [`OpacityProgress::Settled`], at which point the window shows the
+  /// requested opacity.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: attribute alpha on a layered window is set inline. Adding
+  ///   or removing the layered bit is queued on the target process's own
+  ///   lane, because it waits on that process.
+  /// - macOS: no-op, always settled.
+  pub fn request_opacity(
+    &self,
+    value: Option<OpacityValue>,
+  ) -> crate::Result<OpacityProgress> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.request_opacity(value)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = value;
+      Ok(OpacityProgress::Settled)
     }
   }
 
@@ -444,6 +477,12 @@ impl PlacementSession {
   }
 
   /// Changes taskbar membership where the platform supports it.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: waits on explorer. The window manager thread uses
+  ///   [`Self::request_taskbar_visibility`].
+  /// - macOS: no-op.
   pub fn set_taskbar_visibility(
     &self,
     visible: bool,
@@ -460,6 +499,12 @@ impl PlacementSession {
   }
 
   /// Marks taskbar fullscreen ownership where supported.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: waits on explorer. The window manager thread uses
+  ///   [`Self::request_fullscreen_mark`].
+  /// - macOS: no-op.
   pub fn mark_fullscreen(&self, fullscreen: bool) -> crate::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -469,6 +514,51 @@ impl PlacementSession {
     {
       let _ = fullscreen;
       Ok(())
+    }
+  }
+
+  /// Queues a taskbar tab change without waiting on the shell.
+  ///
+  /// Returns the ticket of the queued work, or `None` when there is none
+  /// to do. Drive it with a [`ShellSlot`].
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: runs on the shell worker.
+  /// - macOS: no-op, so no ticket.
+  pub fn request_taskbar_visibility(
+    &self,
+    visible: bool,
+  ) -> crate::Result<Option<ShellTicket>> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.request_taskbar_visibility(visible)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = visible;
+      Ok(None)
+    }
+  }
+
+  /// Queues the taskbar's fullscreen mark without waiting on the shell.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: runs on the shell worker.
+  /// - macOS: no-op, so no ticket.
+  pub fn request_fullscreen_mark(
+    &self,
+    fullscreen: bool,
+  ) -> crate::Result<Option<ShellTicket>> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.request_fullscreen_mark(fullscreen)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = fullscreen;
+      Ok(None)
     }
   }
 
@@ -591,6 +681,12 @@ impl PlacementSession {
   }
 
   /// Changes workspace visibility using the native hide capability.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: waits on explorer. The window manager thread uses
+  ///   [`Self::request_cloak`].
+  /// - macOS: no-op.
   pub fn cloak(&self, hidden: bool) -> crate::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -599,6 +695,57 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       let _ = hidden;
+      Ok(())
+    }
+  }
+
+  /// Queues a workspace cloak change without waiting on the shell.
+  ///
+  /// Returns the ticket of the queued work, or `None` when there is none
+  /// to do, such as an uncloak of a window we did not cloak. Drive it with
+  /// a [`ShellSlot`], observing the result with [`Self::is_cloaked`], and
+  /// report the outcome to [`Self::finish_cloak`].
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: runs on the shell worker.
+  /// - macOS: no-op, so no ticket.
+  pub fn request_cloak(
+    &self,
+    hidden: bool,
+  ) -> crate::Result<Option<ShellTicket>> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.request_cloak(hidden)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = hidden;
+      Ok(None)
+    }
+  }
+
+  /// Settles the recovery record once a cloak request has ended.
+  ///
+  /// `applied` is whether the request took effect.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: clears the record of a failed cloak or a completed
+  ///   uncloak.
+  /// - macOS: no-op.
+  pub fn finish_cloak(
+    &self,
+    hidden: bool,
+    applied: bool,
+  ) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      self.native.finish_cloak(hidden, applied)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      let _ = (hidden, applied);
       Ok(())
     }
   }

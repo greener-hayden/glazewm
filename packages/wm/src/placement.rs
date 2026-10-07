@@ -11,8 +11,9 @@ use wm_common::{
 };
 use wm_platform::{
   Color, CompanionStatus, ConcealMethod, CornerStyle, Delta,
-  NativeCallSnapshot, NativeCallStats, OpacityValue, PlacementSession,
-  Rect, WindowId, WindowZOrder,
+  NativeCallSnapshot, NativeCallStats, OpacityProgress, OpacityValue,
+  PlacementSession, Rect, ShellPoll, ShellSlot, ShellTicket, WindowId,
+  WindowZOrder,
 };
 
 use crate::{
@@ -587,6 +588,25 @@ struct ManagedWindow {
   /// When the reveal of the source began waiting for its cover to show
   /// where the source now stands. Bounded by `PREPARATION_LIMIT`.
   cover_hold: Option<Instant>,
+  /// Native work queued on worker threads, and what waits on it.
+  shell: ShellState,
+}
+
+/// Native work queued on worker threads for one window.
+#[derive(Default)]
+struct ShellState {
+  /// The cloak request the shell worker has not yet confirmed.
+  cloak: ShellSlot<bool>,
+  /// The taskbar tab request the shell worker has not yet confirmed.
+  taskbar_request: ShellSlot<bool>,
+  /// The fullscreen mark request the shell worker has not yet confirmed.
+  fullscreen_request: ShellSlot<bool>,
+  /// An opacity change is queued on the application's style lane.
+  opacity_pending: bool,
+  /// How long the frame write has waited on the source's concealment.
+  conceal_wait: ConcealWait,
+  /// The cover was already placed for the restoration in progress.
+  restore_placed: bool,
 }
 
 impl ManagedWindow {
@@ -594,9 +614,22 @@ impl ManagedWindow {
   ///
   /// An in-flight frame counts: a frame write is confirmed by a later
   /// pass, which this keeps scheduled for a window whose echo is not
-  /// marked (see `reconcile_frame`).
+  /// marked (see `reconcile_frame`). So does native work queued on a
+  /// worker, whose completion wakes a pass that records it.
   fn settling(&self) -> bool {
-    self.settling_view(false).settling()
+    self.settling_view(false).settling() || self.shell_pending()
+  }
+
+  /// Whether native work for this window is queued or running on a
+  /// worker thread.
+  ///
+  /// Not part of `SettlingView`: only Windows queues work, and there
+  /// every frame signal starts a pass, so no tick rule needs to know.
+  fn shell_pending(&self) -> bool {
+    self.shell.cloak.in_flight()
+      || self.shell.taskbar_request.in_flight()
+      || self.shell.fullscreen_request.in_flight()
+      || self.shell.opacity_pending
   }
 
   /// Borrows what keeps the window settling.
@@ -2252,44 +2285,188 @@ fn observed_visible(
   actual || (cloak_for_source && native_visible)
 }
 
+/// How long a frame write waits for the source's concealment to land
+/// before the presentation gives up.
+///
+/// A shell call takes a few milliseconds, and a style change to a busy
+/// application longer. Past this the application is treated as hung, so
+/// it cannot hold the window's placement forever.
+const CONCEAL_LIMIT: Duration = Duration::from_millis(500);
+
+/// How soon a pass is asked for again while native work is outstanding.
+///
+/// The worker's completion wakes a pass by itself; this is only the
+/// backstop for a completion that is observed late or lost.
+const SHELL_BACKSTOP: Duration = Duration::from_millis(250);
+
+/// Whether a frame write may go ahead of the source's concealment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConcealGate {
+  /// Nothing the write depends on is outstanding.
+  Open,
+  /// The concealment has not landed yet. Writing now could show the
+  /// destination on screen.
+  Held,
+  /// The wait outlasted `CONCEAL_LIMIT`, so the write goes ahead.
+  TimedOut,
+}
+
+/// Keeps a frame write behind the concealment of its source.
+///
+/// The concealment is a cloak or an alpha of zero, both queued off the
+/// window manager thread, so it lands some time after it is requested.
+#[derive(Debug, Default)]
+struct ConcealWait {
+  /// When the current wait began.
+  since: Option<Instant>,
+}
+
+impl ConcealWait {
+  /// Decides whether the frame write may go ahead.
+  ///
+  /// `waiting` is whether the concealment the write depends on has been
+  /// requested but not observed. A wait that ends starts afresh.
+  fn check(&mut self, waiting: bool, now: Instant) -> ConcealGate {
+    if !waiting {
+      self.since = None;
+      return ConcealGate::Open;
+    }
+    let since = *self.since.get_or_insert(now);
+    if now.saturating_duration_since(since) >= CONCEAL_LIMIT {
+      ConcealGate::TimedOut
+    } else {
+      ConcealGate::Held
+    }
+  }
+}
+
+impl ConcealGate {
+  /// Whether the frame write may go ahead.
+  fn permits_write(self) -> bool {
+    self != Self::Held
+  }
+}
+
+/// Whether a cloak change has taken effect.
+///
+/// `false` while it is still on its way. A change that failed is an
+/// error, because the window is left in a state the caller did not ask
+/// for, and the pass is retried at its backstop.
+fn cloak_landed(poll: ShellPoll, what: &str) -> anyhow::Result<bool> {
+  match poll {
+    ShellPoll::Settled | ShellPoll::Applied => Ok(true),
+    ShellPoll::InFlight => Ok(false),
+    ShellPoll::Failed | ShellPoll::Backoff => {
+      anyhow::bail!("{what} failed.")
+    }
+  }
+}
+
+/// Asks for another pass if nothing else is going to.
+fn backstop(entry: &mut ManagedWindow, now: Instant) {
+  let at = now + SHELL_BACKSTOP;
+  entry.retry_at = Some(entry.retry_at.map_or(at, |retry| retry.min(at)));
+}
+
 /// Converges observed cloaking on the desired state.
 ///
 /// Observation rather than a cache: a cloak left by a crashed instance or
 /// by the shell is healed on the next pass, and only our own cloak is
-/// ever removed.
+/// ever removed. The shell call itself runs on the shell worker, so this
+/// returns `InFlight` until a pass observes the result.
 fn apply_cloak(
   entry: &mut ManagedWindow,
   cloaked: bool,
-) -> anyhow::Result<()> {
-  let started = Instant::now();
-  let observed = entry.native.is_cloaked()?;
-  let read = started.elapsed();
-  if observed != cloaked {
-    entry.native.cloak(cloaked)?;
+) -> anyhow::Result<ShellPoll> {
+  let now = Instant::now();
+  let native = &entry.native;
+  // Observed only once the slot has looked at its ticket, so that a
+  // cloak that finishes in between is never read as its absence.
+  let poll = entry.shell.cloak.converge(
+    cloaked,
+    || native.is_cloaked().map(Some),
+    now,
+    || native.request_cloak(cloaked),
+  )?;
+  match poll {
+    ShellPoll::Applied => entry.native.finish_cloak(cloaked, true)?,
+    ShellPoll::Failed => {
+      entry.native.finish_cloak(cloaked, false)?;
+      backstop(entry, now);
+    }
+    ShellPoll::InFlight | ShellPoll::Backoff => backstop(entry, now),
+    ShellPoll::Settled => {}
   }
-  let total = started.elapsed();
-  // A call that crosses to the shell is logged from `SLOW_CALL` on, so a
-  // slow one is found in the perf log without `-v`.
-  let slow = total >= SLOW_CALL;
-  if slow
-    || (total >= Duration::from_micros(500)
-      && tracing::enabled!(
-        target: perf::PERF_TARGET,
-        tracing::Level::DEBUG
-      ))
-  {
-    perf::emit(
-      slow,
-      format_args!(
-        "cloak_slow total={}us read={}us write={}us changed={}",
-        total.as_micros(),
-        read.as_micros(),
-        total.saturating_sub(read).as_micros(),
-        observed != cloaked,
-      ),
-    );
+  Ok(poll)
+}
+
+/// Requests an alpha without waiting on the application.
+///
+/// Records the alpha as applied only once it shows. Until then the
+/// window's opacity is unknown, so any later desire is asked of the
+/// platform again rather than skipped as unchanged, and its style lane's
+/// completion wakes a pass.
+fn request_alpha(
+  entry: &mut ManagedWindow,
+  alpha: Option<OpacityValue>,
+) -> anyhow::Result<()> {
+  entry.shell.opacity_pending = false;
+  entry.opacity = AppliedOpacity::Unknown;
+  match entry.native.request_opacity(alpha)? {
+    OpacityProgress::Settled => {
+      entry.opacity = AppliedOpacity::Value(alpha);
+    }
+    OpacityProgress::Pending => {
+      entry.shell.opacity_pending = true;
+      backstop(entry, Instant::now());
+    }
   }
   Ok(())
+}
+
+/// What an unobservable shell request has come to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlagProgress {
+  /// The shell has done it.
+  Applied,
+  /// It is queued, backing off after a failure, or about to be retried.
+  Waiting,
+}
+
+/// Drives a shell request that cannot be observed, such as a taskbar tab.
+///
+/// Only the worker's report says whether it took effect. A failure is
+/// logged and retried after a pause, and never aborts the pass: nothing
+/// else the window needs depends on it.
+fn converge_shell_flag(
+  slot: &mut ShellSlot<bool>,
+  desired: bool,
+  now: Instant,
+  what: &str,
+  submit: impl FnOnce() -> wm_platform::Result<Option<ShellTicket>>,
+) -> FlagProgress {
+  match slot.converge(desired, || Ok(None), now, submit) {
+    Ok(ShellPoll::Applied | ShellPoll::Settled) => FlagProgress::Applied,
+    Ok(ShellPoll::InFlight | ShellPoll::Backoff) => FlagProgress::Waiting,
+    Ok(ShellPoll::Failed) => {
+      // Each retry waits longer than the last, but a shell that keeps
+      // failing should not fill the log: the first failure speaks, the
+      // rest are detail.
+      if slot.failures() <= 1 {
+        tracing::warn!("{what} failed; retrying.");
+      } else {
+        tracing::debug!(
+          failures = slot.failures(),
+          "{what} failed again; retrying."
+        );
+      }
+      FlagProgress::Waiting
+    }
+    Err(err) => {
+      tracing::debug!("{what} could not be requested: {err}");
+      FlagProgress::Waiting
+    }
+  }
 }
 
 /// Decorates a window whose native motion was just prepared.
@@ -2607,6 +2784,7 @@ fn reconcile_window(
       retired: false,
       recovery_at: None,
       cover_hold: None,
+      shell: ShellState::default(),
     });
   }
   // Keep the session outside the map while borrowing other coordinator
@@ -2751,8 +2929,7 @@ fn reconcile_managed(
           } else {
             let alpha = Some(OpacityValue(0.0));
             if entry.opacity != AppliedOpacity::Value(alpha) {
-              entry.native.opacity(alpha)?;
-              entry.opacity = AppliedOpacity::Value(alpha);
+              request_alpha(entry, alpha)?;
             }
           }
         }
@@ -2934,8 +3111,11 @@ fn reconcile_managed(
   if entry.native.supports_opacity()
     && entry.opacity != AppliedOpacity::Value(alpha)
   {
-    entry.native.opacity(alpha)?;
-    entry.opacity = AppliedOpacity::Value(alpha);
+    request_alpha(entry, alpha)?;
+  } else if !entry.native.supports_opacity() {
+    // The application took over its transparency, so there is nothing
+    // left to wait for.
+    entry.shell.opacity_pending = false;
   }
   timer.mark("opacity");
   let decorations = desired_decorations(window, intent, config);
@@ -2952,6 +3132,10 @@ fn reconcile_managed(
   let native_visible = visible || presenting;
   let cloak_for_source =
     concealed && entry.conceal == Some(ConcealMethod::Cloak);
+  // Both concealments are queued off this thread, so they land after the
+  // request. The frame write waits for the one that applies to this
+  // source to be observed.
+  let mut awaiting_conceal = false;
   if !retaining_source
     && native_state != NativeState::Minimized
     && cloak_for_source
@@ -2959,13 +3143,34 @@ fn reconcile_managed(
     // A failure cancels only this presentation. The shell call fails
     // transiently (a stale view collection, a stalled shell), and dropping
     // the capability would cut every later slide for the window's life.
-    if let Err(err) = apply_cloak(entry, true) {
-      tracing::warn!(window = %id, "Source cloaking failed: {err}");
+    match apply_cloak(entry, true) {
+      Ok(ShellPoll::InFlight) => awaiting_conceal = true,
+      Ok(ShellPoll::Settled | ShellPoll::Applied) => {}
+      Ok(ShellPoll::Failed | ShellPoll::Backoff) => {
+        tracing::warn!(window = %id, "Source cloaking failed.");
+        entry.cancelled = true;
+      }
+      Err(err) => {
+        tracing::warn!(window = %id, "Source cloaking failed: {err}");
+        entry.cancelled = true;
+      }
+    }
+  }
+  awaiting_conceal |= concealed
+    && !retaining_source
+    && entry.conceal == Some(ConcealMethod::Alpha)
+    && entry.shell.opacity_pending;
+  let conceal_gate = entry.shell.conceal_wait.check(awaiting_conceal, now);
+  if conceal_gate == ConcealGate::TimedOut {
+    // The application or the shell is not answering. Cut to the
+    // destination rather than hold the window's placement indefinitely.
+    if entry.source.is_some() && !entry.cancelled {
+      tracing::warn!(window = %id, "Source concealment timed out.");
       entry.cancelled = true;
     }
   }
   timer.mark("conceal");
-  if !retaining_source && !dragging {
+  if !retaining_source && !dragging && conceal_gate.permits_write() {
     let animations = &mut state.animation_manager;
     observed = reconcile_frame(
       entry,
@@ -3027,11 +3232,12 @@ fn reconcile_managed(
   // early.
   if !retaining_source && native_state != NativeState::Minimized {
     // Reveal workspace arrivals only after their placement write.
+    let mut cloak_pending = false;
     if !cloak_for_source {
-      apply_cloak(
-        entry,
-        desired_cloak(false, native_visible, hidden_parking, hide_method),
-      )?;
+      let wanted =
+        desired_cloak(false, native_visible, hidden_parking, hide_method);
+      let poll = apply_cloak(entry, wanted)?;
+      cloak_pending = !cloak_landed(poll, "Window cloaking")?;
     }
     // Visibility is read again only after a write, which is rare; an
     // unchanged window costs one query per pass.
@@ -3039,8 +3245,13 @@ fn reconcile_managed(
     let was_visible =
       observed_visible(shown, cloak_for_source, native_visible);
     if native_visible && !was_visible {
-      entry.native.show(true)?;
-      shown = entry.native.is_visible()?;
+      // A window still cloaked is shown by its uncloak, so showing it
+      // again while that is queued would only repeat a message to its
+      // application.
+      if !cloak_pending {
+        entry.native.show(true)?;
+        shown = entry.native.is_visible()?;
+      }
     } else if !native_visible
       && !hidden_parking
       && was_visible
@@ -3101,12 +3312,18 @@ fn reconcile_managed(
     && !entry.visibility_pending;
   if !revealing {
     entry.cover_hold = None;
+    entry.shell.restore_placed = false;
   }
   if revealing {
-    if visible && native_state != NativeState::Minimized {
-      state
-        .animation_manager
-        .place_overlay(&id, &entry.native.window()?.frame()?)?;
+    // The cover stops at the final frame once, however many passes the
+    // uncloak below takes.
+    if !entry.shell.restore_placed {
+      if visible && native_state != NativeState::Minimized {
+        state
+          .animation_manager
+          .place_overlay(&id, &entry.native.window()?.frame()?)?;
+      }
+      entry.shell.restore_placed = true;
     }
     // The cover was only queued to stand here. The source stays
     // concealed until it does, and the retry deadline below keeps the
@@ -3124,27 +3341,36 @@ fn reconcile_managed(
   if revealing {
     entry.cover_hold = None;
     let final_alpha = effective_opacity(hidden_parking, requested_alpha);
+    // The reveal is inline, so the source shows at once; the style
+    // lane removes the layered bit afterwards.
     if entry.native.supports_opacity() {
-      entry.native.opacity(final_alpha)?;
+      request_alpha(entry, final_alpha)?;
+    } else {
+      entry.opacity = AppliedOpacity::Value(final_alpha);
     }
-    entry.opacity = AppliedOpacity::Value(final_alpha);
-    // The source must be composed again before its overlay retires.
+    // The source must be composed again before its overlay retires, so
+    // the overlay's retirement fence starts only once the uncloak is
+    // observed.
+    let mut uncloaking = false;
     if cloak_for_source && native_state != NativeState::Minimized {
-      apply_cloak(
-        entry,
-        desired_cloak(false, native_visible, hidden_parking, hide_method),
-      )?;
+      let wanted =
+        desired_cloak(false, native_visible, hidden_parking, hide_method);
+      let poll = apply_cloak(entry, wanted)?;
+      uncloaking = !cloak_landed(poll, "Source uncloaking")?;
     }
-    entry.native.present(false)?;
-    entry.source = None;
-    // Preparation can fail after concealing but before creating an
-    // overlay. There is then nothing to retire and no running frame clock
-    // to acknowledge a retirement fence.
-    entry.retire_after = state
-      .animation_manager
-      .has_overlay(&id)
-      .then(|| RetireFence::new(sampled_frame, now));
-    tracing::debug!(window = %id, "Presentation source restored.");
+    if !uncloaking {
+      entry.native.present(false)?;
+      entry.source = None;
+      entry.shell.restore_placed = false;
+      // Preparation can fail after concealing but before creating an
+      // overlay. There is then nothing to retire and no running frame
+      // clock to acknowledge a retirement fence.
+      entry.retire_after = state
+        .animation_manager
+        .has_overlay(&id)
+        .then(|| RetireFence::new(sampled_frame, now));
+      tracing::debug!(window = %id, "Presentation source restored.");
+    }
   }
   timer.mark("restore");
   // Companions reveal themselves only after the source does; the overlay
@@ -3208,24 +3434,53 @@ fn reconcile_managed(
     entry.stacking = z_order;
   }
   timer.mark("z_order");
-  // Taskbar membership is a round trip to the shell, measured at 1-8ms,
-  // and blocks every running cover until it returns. It waits while the
-  // window is presented, so it lands with the reveal, and a switch that
-  // reverses mid-slide makes no call at all. The pass that restores the
-  // source clears both conditions, so the wait always ends.
+  // Taskbar membership is a round trip to the shell, measured at 1-8ms.
+  // It runs on the shell worker, so it no longer holds up this thread or
+  // a running cover, and a failure is retried rather than aborting the
+  // pass. It still waits while the window is presented, so it lands with
+  // the reveal, and a switch that reverses mid-slide makes no call at
+  // all. The pass that restores the source clears both conditions, so the
+  // wait always ends.
   let taskbar = visible || config.value.general.show_all_in_taskbar;
   let presented = entry.source.is_some()
     || retaining_source
     || state.animation_manager.is_running(&id);
-  if entry.taskbar != Some(taskbar) && !presented {
-    entry.native.set_taskbar_visibility(taskbar)?;
-    entry.taskbar = Some(taskbar);
+  let mut shell_waiting = false;
+  if (entry.taskbar != Some(taskbar)
+    || entry.shell.taskbar_request.in_flight())
+    && !presented
+  {
+    let native = &entry.native;
+    match converge_shell_flag(
+      &mut entry.shell.taskbar_request,
+      taskbar,
+      now,
+      "Taskbar tab change",
+      || native.request_taskbar_visibility(taskbar),
+    ) {
+      FlagProgress::Applied => entry.taskbar = Some(taskbar),
+      FlagProgress::Waiting => shell_waiting = true,
+    }
   }
   timer.mark("taskbar");
   let fullscreen = matches!(window.state(), WindowState::Fullscreen(_));
-  if entry.fullscreen != Some(fullscreen) {
-    entry.native.mark_fullscreen(fullscreen)?;
-    entry.fullscreen = Some(fullscreen);
+  if entry.fullscreen != Some(fullscreen)
+    || entry.shell.fullscreen_request.in_flight()
+  {
+    let native = &entry.native;
+    match converge_shell_flag(
+      &mut entry.shell.fullscreen_request,
+      fullscreen,
+      now,
+      "Fullscreen mark",
+      || native.request_fullscreen_mark(fullscreen),
+    ) {
+      FlagProgress::Applied => entry.fullscreen = Some(fullscreen),
+      FlagProgress::Waiting => shell_waiting = true,
+    }
+  }
+  if shell_waiting {
+    backstop(entry, now);
   }
   timer.mark("fullscreen");
   timer.report(&id, || window.native_properties().process_name);
@@ -5005,5 +5260,252 @@ mod tick_due_tests {
       before.syncs, after.syncs
     );
     assert!(after.syncs < before.syncs);
+  }
+}
+
+/// The gating of source concealment and reveal on native work that runs on
+/// worker threads. Nothing here touches a native window.
+#[cfg(test)]
+mod shell_gate_tests {
+  use super::*;
+
+  /// Submits one ticket, which the test completes by hand.
+  fn submit(
+    ticket: &ShellTicket,
+  ) -> impl FnOnce() -> wm_platform::Result<Option<ShellTicket>> + '_ {
+    move || Ok(Some(ticket.clone()))
+  }
+
+  /// A submission that must not happen.
+  fn forbidden() -> wm_platform::Result<Option<ShellTicket>> {
+    panic!("No request was expected.");
+  }
+
+  /// Whether the frame write may go ahead after a pass saw `poll`.
+  fn write_allowed(
+    wait: &mut ConcealWait,
+    poll: ShellPoll,
+    now: Instant,
+  ) -> bool {
+    let awaiting = !cloak_landed(poll, "Cloaking").unwrap_or(true);
+    wait.check(awaiting, now).permits_write()
+  }
+
+  #[test]
+  fn the_frame_write_waits_for_the_cloak_to_be_observed() {
+    let now = Instant::now();
+    let ticket = ShellTicket::new();
+    let mut slot = ShellSlot::<bool>::default();
+    let mut wait = ConcealWait::default();
+
+    // The pass that requests the cloak must not write the frame.
+    let poll = slot
+      .converge(true, || Ok(Some(false)), now, submit(&ticket))
+      .unwrap();
+    assert!(!write_allowed(&mut wait, poll, now));
+
+    // Still queued, then running: the write keeps waiting.
+    let poll = slot
+      .converge(true, || Ok(Some(false)), now, forbidden)
+      .unwrap();
+    assert!(!write_allowed(&mut wait, poll, now));
+    assert!(ticket.claim());
+    let poll = slot
+      .converge(true, || Ok(Some(false)), now, forbidden)
+      .unwrap();
+    assert!(!write_allowed(&mut wait, poll, now));
+
+    // The shell reported success but the cloak is not yet observed.
+    ticket.complete(true);
+    let poll = slot
+      .converge(true, || Ok(Some(false)), now, forbidden)
+      .unwrap();
+    assert!(!write_allowed(&mut wait, poll, now));
+
+    // Observed cloaked: the write goes ahead.
+    let poll = slot
+      .converge(true, || Ok(Some(true)), now, forbidden)
+      .unwrap();
+    assert_eq!(poll, ShellPoll::Applied);
+    assert!(write_allowed(&mut wait, poll, now));
+  }
+
+  #[test]
+  fn a_source_already_cloaked_never_holds_the_write() {
+    let now = Instant::now();
+    let mut slot = ShellSlot::<bool>::default();
+    let mut wait = ConcealWait::default();
+    let poll = slot
+      .converge(true, || Ok(Some(true)), now, forbidden)
+      .unwrap();
+    assert_eq!(poll, ShellPoll::Settled);
+    assert!(write_allowed(&mut wait, poll, now));
+  }
+
+  #[test]
+  fn a_concealment_that_never_lands_times_out_instead_of_holding_forever()
+  {
+    let now = Instant::now();
+    let mut wait = ConcealWait::default();
+    assert_eq!(wait.check(true, now), ConcealGate::Held);
+    let almost = now + CONCEAL_LIMIT / 2;
+    assert_eq!(wait.check(true, almost), ConcealGate::Held);
+    let due = now + CONCEAL_LIMIT;
+    assert_eq!(wait.check(true, due), ConcealGate::TimedOut);
+    assert!(ConcealGate::TimedOut.permits_write());
+    // It stays open while the concealment is still outstanding.
+    assert_eq!(
+      wait.check(true, due + Duration::from_secs(5)),
+      ConcealGate::TimedOut
+    );
+  }
+
+  #[test]
+  fn a_new_wait_starts_afresh_after_the_gate_opens() {
+    let now = Instant::now();
+    let mut wait = ConcealWait::default();
+    assert_eq!(wait.check(true, now), ConcealGate::Held);
+    assert_eq!(wait.check(false, now), ConcealGate::Open);
+    let later = now + CONCEAL_LIMIT * 2;
+    assert_eq!(wait.check(true, later), ConcealGate::Held);
+  }
+
+  #[test]
+  fn the_source_is_not_handed_back_before_the_uncloak_lands() {
+    let now = Instant::now();
+    let ticket = ShellTicket::new();
+    let mut slot = ShellSlot::<bool>::default();
+
+    // Restoration requests the uncloak and must not finish in that pass,
+    // or the overlay's fence would start before the source is composed.
+    let poll = slot
+      .converge(false, || Ok(Some(true)), now, submit(&ticket))
+      .unwrap();
+    assert!(!cloak_landed(poll, "Uncloaking").unwrap());
+    assert!(ticket.claim());
+    let poll = slot
+      .converge(false, || Ok(Some(true)), now, forbidden)
+      .unwrap();
+    assert!(!cloak_landed(poll, "Uncloaking").unwrap());
+
+    ticket.complete(true);
+    let poll = slot
+      .converge(false, || Ok(Some(false)), now, forbidden)
+      .unwrap();
+    assert!(cloak_landed(poll, "Uncloaking").unwrap());
+  }
+
+  #[test]
+  fn a_reversed_switch_withdraws_the_queued_cloak_before_it_runs() {
+    let now = Instant::now();
+    let hide = ShellTicket::new();
+    let mut slot = ShellSlot::<bool>::default();
+    slot
+      .converge(true, || Ok(Some(false)), now, submit(&hide))
+      .unwrap();
+    // The workspace is shown again before the worker reached the cloak.
+    let poll = slot
+      .converge(false, || Ok(Some(false)), now, forbidden)
+      .unwrap();
+    assert_eq!(poll, ShellPoll::Applied);
+    assert!(!hide.claim(), "The worker must skip the withdrawn cloak.");
+    assert_eq!(hide.state(), wm_platform::TicketState::Cancelled);
+  }
+
+  /// The workspace is shown again while the worker is already inside the
+  /// cloak call. The window still reads uncloaked, but the cloak is about
+  /// to land: the uncloak must not be taken as done, the source must not
+  /// be handed back, and the recovery record must not be cleared.
+  #[test]
+  fn a_cloak_already_running_is_not_mistaken_for_a_finished_uncloak() {
+    let now = Instant::now();
+    let hide = ShellTicket::new();
+    let unhide = ShellTicket::new();
+    let mut slot = ShellSlot::<bool>::default();
+    slot
+      .converge(true, || Ok(Some(false)), now, submit(&hide))
+      .unwrap();
+    assert!(hide.claim());
+
+    let poll = slot
+      .converge(
+        false,
+        || -> wm_platform::Result<Option<bool>> {
+          panic!("Observed while the cloak was running.")
+        },
+        now,
+        forbidden,
+      )
+      .unwrap();
+    assert_eq!(poll, ShellPoll::InFlight);
+    assert!(!cloak_landed(poll, "Uncloaking").unwrap());
+
+    // The cloak lands, so the uncloak is issued behind it, and only its
+    // own landing is reported as applied.
+    hide.complete(true);
+    let poll = slot
+      .converge(false, || Ok(Some(true)), now, submit(&unhide))
+      .unwrap();
+    assert_eq!(poll, ShellPoll::InFlight);
+    assert!(unhide.claim());
+    unhide.complete(true);
+    let poll = slot
+      .converge(false, || Ok(Some(false)), now, forbidden)
+      .unwrap();
+    assert_eq!(poll, ShellPoll::Applied);
+  }
+
+  #[test]
+  fn a_failed_uncloak_is_an_error_not_a_landing() {
+    assert!(cloak_landed(ShellPoll::Failed, "Uncloaking").is_err());
+    assert!(cloak_landed(ShellPoll::Backoff, "Uncloaking").is_err());
+    assert!(!cloak_landed(ShellPoll::InFlight, "Uncloaking").unwrap());
+    assert!(cloak_landed(ShellPoll::Settled, "Uncloaking").unwrap());
+  }
+
+  #[test]
+  fn unobservable_shell_requests_retry_instead_of_failing_the_pass() {
+    let now = Instant::now();
+    let ticket = ShellTicket::new();
+    let mut slot = ShellSlot::<bool>::default();
+    let progress = converge_shell_flag(
+      &mut slot,
+      true,
+      now,
+      "Taskbar tab change",
+      submit(&ticket),
+    );
+    assert_eq!(progress, FlagProgress::Waiting);
+    assert!(ticket.claim());
+    ticket.complete(false);
+    // A failure is logged and waited out, not propagated.
+    let progress = converge_shell_flag(
+      &mut slot,
+      true,
+      now,
+      "Taskbar tab change",
+      forbidden,
+    );
+    assert_eq!(progress, FlagProgress::Waiting);
+    let retry = ShellTicket::new();
+    let later = now + wm_platform::SHELL_RETRY;
+    let progress = converge_shell_flag(
+      &mut slot,
+      true,
+      later,
+      "Taskbar tab change",
+      submit(&retry),
+    );
+    assert_eq!(progress, FlagProgress::Waiting);
+    assert!(retry.claim());
+    retry.complete(true);
+    let progress = converge_shell_flag(
+      &mut slot,
+      true,
+      later,
+      "Taskbar tab change",
+      forbidden,
+    );
+    assert_eq!(progress, FlagProgress::Applied);
   }
 }

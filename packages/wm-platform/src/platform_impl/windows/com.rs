@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
 use windows::{
   core::{ComInterface, IUnknown, IUnknown_Vtbl, GUID, HRESULT},
@@ -25,10 +25,19 @@ thread_local! {
   pub(crate) static COM_INIT: RefCell<ComInit> = RefCell::new(ComInit::new());
 }
 
+/// How many `IApplicationView` proxies a thread keeps.
+///
+/// Destroyed windows are evicted as they are reported, so this only bounds
+/// the cache against reports that never arrive.
+const MAX_CACHED_VIEWS: usize = 128;
+
 pub(crate) struct ComInit {
   service_provider: Option<IServiceProvider>,
   application_view_collection: Option<IApplicationViewCollection>,
   taskbar_list: Option<ITaskbarList2>,
+  /// Shell views by window handle, so repeat cloaking of a window skips
+  /// the lookup round trip into explorer.
+  views: HashMap<isize, IApplicationView>,
 }
 
 impl ComInit {
@@ -62,7 +71,62 @@ impl ComInit {
       service_provider,
       application_view_collection,
       taskbar_list,
+      views: HashMap::new(),
     }
+  }
+
+  /// Cloaks or uncloaks a window through a cached shell view.
+  ///
+  /// A cached view that no longer answers is evicted, and the window's
+  /// view is looked up again, refreshing the shell interfaces once if
+  /// that fails as well. The call is one round trip into explorer when
+  /// the view is cached, and two otherwise.
+  pub(crate) fn set_cloak_cached(
+    &mut self,
+    hwnd: isize,
+    cloaked: bool,
+  ) -> crate::Result<()> {
+    let flag = if cloaked { 2 } else { 0 };
+    if let Some(view) = self.views.get(&hwnd) {
+      // SAFETY: The view is a live shell proxy owned by this thread.
+      if unsafe { view.set_cloak(1, flag) }.ok().is_ok() {
+        return Ok(());
+      }
+      self.views.remove(&hwnd);
+    }
+
+    let view = self.with_retry(|com| {
+      let view_collection = com.application_view_collection()?;
+
+      let mut view: Option<IApplicationView> = None;
+      // SAFETY: `view` outlives the call and receives the shell's proxy.
+      unsafe { view_collection.get_view_for_hwnd(hwnd, &raw mut view) }
+        .ok()?;
+
+      let view = view.ok_or_else(|| {
+        crate::Error::Platform(
+          "Unable to get application view by window handle.".to_string(),
+        )
+      })?;
+
+      // Ref: https://github.com/Ciantic/AltTabAccessor/issues/1#issuecomment-1426877843
+      // SAFETY: The view was just returned by the shell.
+      unsafe { view.set_cloak(1, flag) }.ok().map_err(|_| {
+        crate::Error::Platform("Failed to cloak window.".to_string())
+      })?;
+      Ok(view)
+    })?;
+
+    if self.views.len() >= MAX_CACHED_VIEWS {
+      self.views.clear();
+    }
+    self.views.insert(hwnd, view);
+    Ok(())
+  }
+
+  /// Drops the cached view of a destroyed window.
+  pub(crate) fn forget_view(&mut self, hwnd: isize) {
+    self.views.remove(&hwnd);
   }
 
   /// Returns an instance of `IApplicationViewCollection`.
@@ -91,7 +155,11 @@ impl ComInit {
   /// Called automatically by `with_retry` when COM operations fail due to
   /// stale interface pointers (e.g. after Explorer restarts).
   pub(crate) fn refresh(&mut self) {
+    // Views from the previous shell are stale.
+    self.views.clear();
+
     // Re-create the service provider.
+
     self.service_provider = unsafe {
       CoCreateInstance(&CLSID_IMMERSIVE_SHELL, None, CLSCTX_ALL)
     }
@@ -135,6 +203,7 @@ impl Default for ComInit {
 impl Drop for ComInit {
   fn drop(&mut self) {
     // Explicitly drop COM interfaces first.
+    self.views.clear();
     drop(self.taskbar_list.take());
     drop(self.application_view_collection.take());
     drop(self.service_provider.take());

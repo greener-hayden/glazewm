@@ -27,14 +27,15 @@ use windows::{
       },
       WindowsAndMessaging::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
-        GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongPtrW,
-        GetWindowPlacement, GetWindowRect, GetWindowTextW,
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
-        IsZoomed, SendNotifyMessageW, SetForegroundWindow,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPlacement,
-        SetWindowPos, ShowWindowAsync, WindowFromPoint, GA_ROOT,
-        GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_OWNER, HWND_BOTTOM,
-        HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, LWA_ALPHA,
+        GetForegroundWindow, GetLayeredWindowAttributes, GetShellWindow,
+        GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible, IsZoomed, SendNotifyMessageW,
+        SetForegroundWindow, SetLayeredWindowAttributes,
+        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+        ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
+        GW_HWNDNEXT, GW_OWNER, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP,
+        HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA,
         SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
         SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOOWNERZORDER,
         SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
@@ -555,6 +556,22 @@ impl NativeWindow {
     })
   }
 
+  /// Cloaks or uncloaks through the calling thread's cached shell view.
+  ///
+  /// For the shell worker, which cloaks the same windows repeatedly. A
+  /// thread that cloaks once should use [`Self::set_cloaked`], which keeps
+  /// no state.
+  pub(crate) fn set_cloaked_cached(
+    &self,
+    cloaked: bool,
+  ) -> crate::Result<()> {
+    COM_INIT.with(|com_init| {
+      com_init
+        .borrow_mut()
+        .set_cloak_cached(self.hwnd().0, cloaked)
+    })
+  }
+
   /// Implements [`NativeWindowWindowsExt::mark_fullscreen`].
   pub(crate) fn mark_fullscreen(
     &self,
@@ -800,6 +817,43 @@ impl NativeWindow {
     Ok(())
   }
 
+  /// Sets the window's attribute alpha, which must already be layered.
+  ///
+  /// Does not touch the extended style, so it makes no call that waits
+  /// on the window's own thread.
+  pub(crate) fn set_layered_alpha(&self, alpha: u8) -> crate::Result<()> {
+    // SAFETY: Plain handle and value arguments; the call keeps no pointer.
+    unsafe {
+      SetLayeredWindowAttributes(self.hwnd(), None, alpha, LWA_ALPHA)?;
+    }
+
+    Ok(())
+  }
+
+  /// Reads the attribute alpha the window was last given.
+  ///
+  /// `None` when the window has no layered attributes to read.
+  pub(crate) fn layered_alpha(&self) -> Option<u8> {
+    let mut alpha = 0u8;
+    let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+    // SAFETY: Both outputs live through the call.
+    unsafe {
+      GetLayeredWindowAttributes(
+        self.hwnd(),
+        None,
+        Some(&raw mut alpha),
+        Some(&raw mut flags),
+      )
+    }
+    .ok()?;
+
+    Some(if flags.0 & LWA_ALPHA.0 != 0 {
+      alpha
+    } else {
+      u8::MAX
+    })
+  }
+
   /// Whether the window is cloaked. For some UWP apps, `WS_VISIBLE` will
   /// be present even if the window isn't actually visible. The
   /// `DWMWA_CLOAKED` attribute is used to check whether these apps are
@@ -973,4 +1027,11 @@ fn desktop_window() -> NativeWindow {
   };
 
   NativeWindow::new(handle.0)
+}
+
+/// Drops the calling thread's cached shell view of a destroyed window.
+///
+/// Only the shell worker caches views, so only it should call this.
+pub(crate) fn forget_cloak_view(handle: isize) {
+  COM_INIT.with(|com_init| com_init.borrow_mut().forget_view(handle));
 }

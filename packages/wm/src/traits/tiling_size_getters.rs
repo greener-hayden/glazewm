@@ -5,7 +5,9 @@ use anyhow::Context;
 use wm_common::{GapsConfig, TilingDirection};
 
 use super::{CommonGetters, TilingDirectionGetters};
-use crate::models::{Container, DirectionContainer, TilingContainer};
+use crate::models::{
+  Container, DirectionContainer, MonitorMetrics, TilingContainer,
+};
 
 pub const MIN_TILING_SIZE: f32 = 0.01;
 
@@ -22,23 +24,31 @@ pub trait TilingSizeGetters: CommonGetters {
   /// Gets the horizontal and vertical gaps between windows in pixels.
   fn inner_gaps(&self) -> anyhow::Result<(i32, i32)> {
     let monitor = self.monitor().context("No monitor.")?;
-    let monitor_rect = monitor.native_properties().bounds;
+    Ok(self.inner_gaps_with(&monitor.metrics()))
+  }
+
+  /// Gets the horizontal and vertical gaps between windows in pixels,
+  /// given the measurements of the monitor that the container is on.
+  ///
+  /// Same as `inner_gaps`, for callers that already hold the metrics and
+  /// so do not need to look the monitor up for every container.
+  fn inner_gaps_with(&self, metrics: &MonitorMetrics) -> (i32, i32) {
     let gaps_config = self.gaps_config();
 
     let scale_factor = if gaps_config.scale_with_dpi {
-      monitor.native_properties().scale_factor
+      metrics.scale_factor
     } else {
       1.
     };
 
-    Ok((
+    (
       gaps_config
         .inner_gap
-        .to_px(monitor_rect.height(), Some(scale_factor)),
+        .to_px(metrics.height, Some(scale_factor)),
       gaps_config
         .inner_gap
-        .to_px(monitor_rect.width(), Some(scale_factor)),
-    ))
+        .to_px(metrics.width, Some(scale_factor)),
+    )
   }
 
   /// Gets the container to resize when resizing a tiling window.
@@ -65,7 +75,7 @@ pub trait TilingSizeGetters: CommonGetters {
     } else {
       let grandparent = parent.parent().context("No grandparent.")?;
 
-      if self.tiling_siblings().count() > 0 {
+      if self.tiling_sibling_count() > 0 {
         // Window can only be resized if it has siblings.
         Some(self.as_tiling_container()?)
       } else {

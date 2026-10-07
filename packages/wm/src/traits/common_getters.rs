@@ -90,6 +90,35 @@ pub trait CommonGetters {
       .cloned()
   }
 
+  /// Number of direct children that are tiling containers.
+  ///
+  /// Counts in place, so unlike `tiling_children().count()` it neither
+  /// clones the children nor allocates.
+  fn tiling_child_count(&self) -> usize {
+    self
+      .borrow_children()
+      .iter()
+      .filter(|child| child.is_tiling())
+      .count()
+  }
+
+  /// Number of tiling containers that share this container's parent,
+  /// excluding the container itself.
+  ///
+  /// Counts in place, so unlike `tiling_siblings().count()` it neither
+  /// clones the siblings nor allocates. Returns 0 if the container has no
+  /// parent.
+  fn tiling_sibling_count(&self) -> usize {
+    let id = self.id();
+    self.borrow_parent().as_ref().map_or(0, |parent| {
+      parent
+        .borrow_children()
+        .iter()
+        .filter(|sibling| sibling.is_tiling() && sibling.id() != id)
+        .count()
+    })
+  }
+
   fn tiling_children(
     &self,
   ) -> Box<dyn Iterator<Item = TilingContainer> + '_> {
@@ -300,11 +329,13 @@ impl Iterator for Descendants {
   type Item = Container;
 
   fn next(&mut self) -> Option<Container> {
-    if let Some(container) = self.stack.pop_front() {
-      self.stack.extend(container.children());
-      return Some(container);
-    }
-    None
+    let container = self.stack.pop_front()?;
+    // Extends from the borrowed children, so no copy of the child list is
+    // made per visited container.
+    self
+      .stack
+      .extend(container.borrow_children().iter().cloned());
+    Some(container)
   }
 }
 

@@ -165,7 +165,16 @@ pub trait WindowGetters: CommonGetters {
   fn set_active_drag(&self, active_drag: Option<ActiveDrag>);
 
   /// Gets the cached native window properties.
+  ///
+  /// Clones every field, strings included. Callers that need one scalar
+  /// should use a dedicated accessor such as `min_size`.
   fn native_properties(&self) -> NativeWindowProperties;
+
+  /// Smallest frame the window has been observed to accept, as
+  /// `(width, height)`.
+  ///
+  /// Reads the cached value without cloning the rest of the properties.
+  fn min_size(&self) -> Option<(i32, i32)>;
 
   /// Updates the cached native window properties using a closure.
   fn update_native_properties<F>(&self, updater: F)
@@ -273,6 +282,10 @@ macro_rules! impl_window_getters {
 
       fn native_properties(&self) -> NativeWindowProperties {
         self.0.borrow().native_properties.clone()
+      }
+
+      fn min_size(&self) -> Option<(i32, i32)> {
+        self.0.borrow().native_properties.min_size
       }
 
       fn update_native_properties<F>(&self, updater: F)

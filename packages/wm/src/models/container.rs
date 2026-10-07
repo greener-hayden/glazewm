@@ -15,8 +15,8 @@ use wm_platform::{Direction, NativeWindow, Rect, RectDelta};
 #[allow(clippy::wildcard_imports)]
 use crate::{
   models::{
-    Monitor, NativeWindowProperties, NonTilingWindow, RootContainer,
-    SplitContainer, TilingWindow, Workspace,
+    Monitor, MonitorMetrics, NativeWindowProperties, NonTilingWindow,
+    RootContainer, SplitContainer, TilingWindow, Workspace,
   },
   traits::*,
   user_config::UserConfig,
@@ -116,6 +116,15 @@ impl PartialEq for Container {
 
 impl Eq for Container {}
 
+impl Container {
+  /// Whether this container takes part in a tiling layout, i.e. it is a
+  /// split container or a tiling window.
+  #[must_use]
+  pub fn is_tiling(&self) -> bool {
+    matches!(self, Self::Split(_) | Self::TilingWindow(_))
+  }
+}
+
 impl TilingContainer {
   /// Smallest this container can be along an axis, in pixels.
   ///
@@ -125,50 +134,96 @@ impl TilingContainer {
   /// it only has to be as wide as its widest child.
   ///
   /// Returns 0 where nothing is known, which leaves the layout free.
+  ///
+  /// Walks the whole subtree without allocating. Callers that solve many
+  /// containers on one monitor should use `min_length_with` instead.
   pub fn min_length(&self, is_horizontal: bool) -> i32 {
     match self {
-      Self::TilingWindow(window) => window
-        .native_properties()
-        .min_size
-        .map_or(
-          0,
-          |(width, height)| {
-            if is_horizontal {
-              width
-            } else {
-              height
-            }
-          },
-        ),
-      Self::Split(split) => {
-        let children = split.tiling_children().collect::<Vec<_>>();
-
-        let mins =
-          children.iter().map(|child| child.min_length(is_horizontal));
-
-        let divides_axis =
-          matches!(split.tiling_direction(), TilingDirection::Horizontal)
-            == is_horizontal;
-
-        if divides_axis {
-          let gap =
-            split.inner_gaps().map_or(0, |(horizontal, vertical)| {
-              if is_horizontal {
-                horizontal
-              } else {
-                vertical
-              }
-            });
-
-          mins.sum::<i32>()
-            + gap
-              * i32::try_from(children.len().saturating_sub(1))
-                .unwrap_or(0)
-        } else {
-          mins.max().unwrap_or(0)
-        }
+      // A window has no gaps, so it does not need its monitor.
+      Self::TilingWindow(window) => {
+        window_min_length(window, is_horizontal)
+      }
+      Self::Split(_) => {
+        let metrics = self.monitor().map(|monitor| monitor.metrics());
+        self.min_length_with(is_horizontal, metrics.as_ref())
       }
     }
+  }
+
+  /// Same as `min_length`, given the measurements of the monitor that
+  /// the container is on.
+  ///
+  /// Every container in a subtree shares its monitor, so the metrics are
+  /// looked up once by the caller rather than once per split. Without
+  /// metrics (a detached container) splits have no gaps.
+  pub fn min_length_with(
+    &self,
+    is_horizontal: bool,
+    metrics: Option<&MonitorMetrics>,
+  ) -> i32 {
+    match self {
+      Self::TilingWindow(window) => {
+        window_min_length(window, is_horizontal)
+      }
+      Self::Split(split) => {
+        split_min_length(split, is_horizontal, metrics)
+      }
+    }
+  }
+}
+
+/// Floor of a window along an axis, or 0 where none has been observed.
+fn window_min_length(window: &TilingWindow, is_horizontal: bool) -> i32 {
+  window.min_size().map_or(
+    0,
+    |(width, height)| if is_horizontal { width } else { height },
+  )
+}
+
+/// Floor of a split along an axis, recursing over its tiling children in
+/// place.
+fn split_min_length(
+  split: &SplitContainer,
+  is_horizontal: bool,
+  metrics: Option<&MonitorMetrics>,
+) -> i32 {
+  let mut count = 0_usize;
+  let mut sum = 0_i32;
+  let mut widest: Option<i32> = None;
+
+  for child in split.borrow_children().iter() {
+    let min = match child {
+      Container::TilingWindow(window) => {
+        window_min_length(window, is_horizontal)
+      }
+      Container::Split(split) => {
+        split_min_length(split, is_horizontal, metrics)
+      }
+      _ => continue,
+    };
+
+    count += 1;
+    sum += min;
+    widest = Some(widest.map_or(min, |widest| widest.max(min)));
+  }
+
+  let divides_axis =
+    matches!(split.tiling_direction(), TilingDirection::Horizontal)
+      == is_horizontal;
+
+  if divides_axis {
+    let gap = metrics.map_or(0, |metrics| {
+      let (horizontal, vertical) = split.inner_gaps_with(metrics);
+      if is_horizontal {
+        horizontal
+      } else {
+        vertical
+      }
+    });
+
+    sum + gap * i32::try_from(count.saturating_sub(1)).unwrap_or(0)
+  } else {
+    widest.unwrap_or(0)
   }
 }
 

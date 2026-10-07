@@ -60,19 +60,51 @@ pub fn usable_tiling_sizes(sizes: &[f32]) -> Vec<f32> {
 /// shortfall would leave every window wrong instead of one. `to_rect`
 /// then keeps each child inside its parent, so the overflow shows as
 /// overlap rather than a window past the workspace edge.
+///
+/// Production callers use [`resolve_lengths_into`]; this allocating
+/// wrapper stays for tests and their oracles.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resolve_lengths(
   sizes: &[f32],
   mins: &[i32],
   total: i32,
 ) -> Vec<i32> {
-  if sizes.len() <= 4 {
+  let mut lengths = vec![0; sizes.len()];
+  resolve_lengths_into(
+    sizes,
+    mins,
+    total,
+    &mut lengths,
+    &mut SolverBuffers::default(),
+  );
+  lengths
+}
+
+/// Solves like `resolve_lengths`, writing into `lengths` instead of
+/// allocating one.
+///
+/// Up to four children are solved on the stack. Larger rows use
+/// `buffers`, which a caller solving many rows keeps and reuses so that
+/// none of them allocates once the largest row has been seen.
+///
+/// `lengths` must hold at least `sizes.len()` elements; only that many
+/// are written.
+pub fn resolve_lengths_into(
+  sizes: &[f32],
+  mins: &[i32],
+  total: i32,
+  lengths: &mut [i32],
+  buffers: &mut SolverBuffers,
+) {
+  let count = sizes.len();
+  let lengths = &mut lengths[..count];
+  if count <= 4 {
     let mut floors = [0; 4];
     let mut weights = [0.0; 4];
     let mut pinned = [false; 4];
     let mut exact = [0.0; 4];
     let mut order = [0; 4];
-    let count = sizes.len();
-    return resolve_lengths_with_scratch(
+    resolve_lengths_with_scratch(
       sizes,
       mins,
       total,
@@ -83,25 +115,48 @@ pub fn resolve_lengths(
         exact: &mut exact[..count],
         order: &mut order[..count],
       },
+      lengths,
     );
+    return;
   }
-  let mut floors = vec![0; sizes.len()];
-  let mut weights = vec![0.0; sizes.len()];
-  let mut pinned = vec![false; sizes.len()];
-  let mut exact = vec![0.0; sizes.len()];
-  let mut order = vec![0; sizes.len()];
   resolve_lengths_with_scratch(
     sizes,
     mins,
     total,
+    buffers.scratch(count),
+    lengths,
+  );
+}
+
+/// Solver work storage that is kept between calls for rows of more than
+/// four children.
+#[derive(Default)]
+pub struct SolverBuffers {
+  mins: Vec<i32>,
+  weights: Vec<f64>,
+  pinned: Vec<bool>,
+  exact: Vec<f64>,
+  order: Vec<usize>,
+}
+
+impl SolverBuffers {
+  /// Sizes every buffer for `count` children and clears the pin flags,
+  /// the only state the solver reads before writing it.
+  fn scratch(&mut self, count: usize) -> LengthScratch<'_> {
+    self.mins.resize(count, 0);
+    self.weights.resize(count, 0.0);
+    self.pinned.clear();
+    self.pinned.resize(count, false);
+    self.exact.resize(count, 0.0);
+    self.order.resize(count, 0);
     LengthScratch {
-      mins: &mut floors,
-      weights: &mut weights,
-      pinned: &mut pinned,
-      exact: &mut exact,
-      order: &mut order,
-    },
-  )
+      mins: &mut self.mins,
+      weights: &mut self.weights,
+      pinned: &mut self.pinned,
+      exact: &mut self.exact,
+      order: &mut self.order,
+    }
+  }
 }
 
 /// Borrows per-call solver storage; never survives a layout operation.
@@ -145,13 +200,15 @@ fn fill_floors_and_weights(
   }
 }
 
-/// Uses the same water-filling algorithm with stack or heap work storage.
+/// Uses the same water-filling algorithm with stack or heap work storage,
+/// writing one length per child into `lengths`.
 fn resolve_lengths_with_scratch(
   sizes: &[f32],
   minimums: &[i32],
   total: i32,
   scratch: LengthScratch<'_>,
-) -> Vec<i32> {
+  lengths: &mut [i32],
+) {
   let total = i64::from(total.max(0));
   let LengthScratch {
     mins,
@@ -162,7 +219,8 @@ fn resolve_lengths_with_scratch(
   } = scratch;
   fill_floors_and_weights(sizes, minimums, mins, weights);
   if mins.iter().map(|value| i64::from(*value)).sum::<i64>() >= total {
-    return mins.to_vec();
+    lengths.copy_from_slice(mins);
+    return;
   }
   loop {
     let remaining = total
@@ -174,7 +232,8 @@ fn resolve_lengths_with_scratch(
         .sum::<i64>();
     let free = pinned.iter().filter(|pinned| !**pinned).count();
     if free == 0 {
-      return mins.to_vec();
+      lengths.copy_from_slice(mins);
+      return;
     }
     let weight = weights
       .iter()
@@ -207,11 +266,12 @@ fn resolve_lengths_with_scratch(
       break;
     }
   }
-  #[allow(clippy::cast_possible_truncation)]
-  let mut lengths = exact
-    .iter()
-    .map(|value| value.floor() as i32)
-    .collect::<Vec<_>>();
+  for (length, value) in lengths.iter_mut().zip(exact.iter()) {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+      *length = value.floor() as i32;
+    }
+  }
   let mut free = 0;
   for (index, is_pinned) in pinned.iter().enumerate() {
     if !is_pinned {
@@ -235,7 +295,6 @@ fn resolve_lengths_with_scratch(
   {
     lengths[index] += 1;
   }
-  lengths
 }
 
 /// Keeps a child's rect inside its parent.
@@ -271,15 +330,7 @@ macro_rules! impl_position_getters_as_resizable {
   ($struct_name:ident) => {
     impl PositionGetters for $struct_name {
       fn to_rect(&self) -> anyhow::Result<Rect> {
-        let parent = self
-          .parent()
-          .and_then(|parent| parent.as_direction_container().ok())
-          .context("Parent lacks tiling direction.")?;
-        $crate::layout_snapshot::child_rects(&parent, &parent.to_rect()?)?
-          .into_iter()
-          .find(|(child, _)| child.id() == self.id())
-          .map(|(_, rect)| rect)
-          .context("Missing tiling child.")
+        $crate::layout_snapshot::tiling_rect(&self.as_tiling_container()?)
       }
     }
   };
@@ -287,7 +338,7 @@ macro_rules! impl_position_getters_as_resizable {
 
 #[cfg(test)]
 mod tests {
-  use super::resolve_lengths;
+  use super::{resolve_lengths, resolve_lengths_into, SolverBuffers};
 
   /// Frozen pre-optimization solver used only as a differential oracle.
   fn reference_lengths(
@@ -414,6 +465,11 @@ mod tests {
       f32::MAX,
     ];
     let floors = [i32::MIN, -1, 0, 1, 3, 200, i32::MAX];
+
+    // One set of buffers for every row, as a capture reuses them, so rows
+    // that shrink and grow again see the leftovers of the one before.
+    let mut buffers = SolverBuffers::default();
+    let mut lengths = [i32::MIN; 16];
     for count in 0..13usize {
       for seed in 0..256usize {
         let mut random = seed;
@@ -432,10 +488,23 @@ mod tests {
           })
           .collect::<Vec<_>>();
         for total in [-1, 0, 1, 3, 31, 300, i32::MAX] {
+          let expected = reference_lengths(&sizes, &mins, total);
           assert_eq!(
             resolve_lengths(&sizes, &mins, total),
-            reference_lengths(&sizes, &mins, total),
+            expected,
             "count={count}, seed={seed}, total={total}"
+          );
+          resolve_lengths_into(
+            &sizes,
+            &mins,
+            total,
+            &mut lengths,
+            &mut buffers,
+          );
+          assert_eq!(
+            lengths[..count],
+            expected[..],
+            "reused buffers: count={count}, seed={seed}, total={total}"
           );
         }
       }

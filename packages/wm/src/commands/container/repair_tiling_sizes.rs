@@ -21,10 +21,7 @@ pub fn repair_tiling_sizes(root: &Container) -> bool {
   for parent in root.self_and_descendants() {
     // Checked first, as this runs on every sync and nearly always finds
     // nothing to repair.
-    if parent
-      .tiling_children()
-      .all(|child| is_usable_tiling_size(child.tiling_size()))
-    {
+    if has_only_usable_sizes(&parent) {
       continue;
     }
 
@@ -45,6 +42,20 @@ pub fn repair_tiling_sizes(root: &Container) -> bool {
   }
 
   repaired
+}
+
+/// Whether every tiling child of `parent` has a size that can be laid out.
+///
+/// Reads the children in place, so the check that nearly every row passes
+/// allocates nothing.
+fn has_only_usable_sizes(parent: &Container) -> bool {
+  parent.borrow_children().iter().all(|child| match child {
+    Container::Split(split) => is_usable_tiling_size(split.tiling_size()),
+    Container::TilingWindow(window) => {
+      is_usable_tiling_size(window.tiling_size())
+    }
+    _ => true,
+  })
 }
 
 /// Sets `children` to `sizes` made usable, scaled to sum to `total`.

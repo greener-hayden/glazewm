@@ -21,6 +21,22 @@ use crate::{
 #[derive(Clone)]
 pub struct Monitor(Rc<RefCell<MonitorInner>>);
 
+/// The monitor measurements that resolving gaps depends on.
+///
+/// Copied out of a monitor once so a layout pass does not walk back up
+/// to its monitor for every container.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MonitorMetrics {
+  /// Width of the monitor bounds in pixels.
+  pub width: i32,
+
+  /// Height of the monitor bounds in pixels.
+  pub height: i32,
+
+  /// DPI scale factor of the monitor.
+  pub scale_factor: f32,
+}
+
 struct MonitorInner {
   id: Uuid,
   parent: Option<Container>,
@@ -57,6 +73,35 @@ impl Monitor {
 
   pub fn native_properties(&self) -> NativeMonitorProperties {
     self.0.borrow().native_properties.clone()
+  }
+
+  /// Bounds of the monitor.
+  ///
+  /// Copies one rectangle, unlike `native_properties` which clones its
+  /// strings too.
+  pub fn bounds(&self) -> Rect {
+    self.0.borrow().native_properties.bounds.clone()
+  }
+
+  /// Working area of the monitor, which excludes the taskbar.
+  pub fn working_area(&self) -> Rect {
+    self.0.borrow().native_properties.working_area.clone()
+  }
+
+  /// DPI scale factor of the monitor.
+  pub fn scale_factor(&self) -> f32 {
+    self.0.borrow().native_properties.scale_factor
+  }
+
+  /// Measurements of the monitor that gap resolution reads.
+  pub fn metrics(&self) -> MonitorMetrics {
+    let inner = self.0.borrow();
+    let bounds = &inner.native_properties.bounds;
+    MonitorMetrics {
+      width: bounds.width(),
+      height: bounds.height(),
+      scale_factor: inner.native_properties.scale_factor,
+    }
   }
 
   pub fn set_native_properties(
@@ -140,7 +185,7 @@ impl_common_getters!(Monitor);
 
 impl PositionGetters for Monitor {
   fn to_rect(&self) -> anyhow::Result<Rect> {
-    Ok(self.0.borrow().native_properties.bounds.clone())
+    Ok(self.bounds())
   }
 }
 

@@ -1248,9 +1248,7 @@ pub fn platform_sync(
   // thing that moves a rect: a dropped floating window writes its own
   // placement and asks for no redraw, and reconciling that window against
   // a snapshot from before the drag puts it back where it started.
-  state.layout_snapshot = crate::layout_snapshot::LayoutSnapshot::capture(
-    &state.root_container,
-  )?;
+  state.layout_snapshot.recapture(&state.root_container)?;
   let t_snapshot = span.elapsed();
   let focused =
     state.focused_container().context("No focused container.")?;

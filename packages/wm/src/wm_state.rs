@@ -440,8 +440,9 @@ impl WmState {
     native_window: &NativeWindow,
   ) -> Option<WindowContainer> {
     self
-      .windows()
-      .into_iter()
+      .root_container
+      .descendants()
+      .filter_map(|container| WindowContainer::try_from(container).ok())
       .find(|window| &*window.native() == native_window)
   }
 

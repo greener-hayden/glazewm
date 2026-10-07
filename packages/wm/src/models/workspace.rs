@@ -80,7 +80,7 @@ impl Workspace {
   /// Uses `single_window_outer_gap` when the workspace has a single tiling
   /// window, otherwise falls back to `outer_gap`.
   pub fn outer_gaps(&self) -> RectDelta {
-    let is_single_window = self.tiling_children().nth(1).is_none();
+    let is_single_window = self.tiling_child_count() < 2;
 
     let gaps_config = &self.0.borrow().gaps_config;
     let gaps = if is_single_window {
@@ -106,17 +106,14 @@ impl Workspace {
 
     let gaps_config = &self.0.borrow().gaps_config;
     let scale_factor = if gaps_config.scale_with_dpi {
-      monitor.native_properties().scale_factor
+      monitor.scale_factor()
     } else {
       1.
     };
 
     // Get the delta between the monitor's bounds and its working area.
-    let monitor_bounds = monitor.native_properties().bounds;
-    let working_area_delta = monitor
-      .native_properties()
-      .working_area
-      .delta(&monitor_bounds);
+    let monitor_bounds = monitor.bounds();
+    let working_area_delta = monitor.working_area().delta(&monitor_bounds);
 
     Ok(
       monitor_bounds

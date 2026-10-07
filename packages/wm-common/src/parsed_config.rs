@@ -172,6 +172,12 @@ pub struct WindowBehaviorConfig {
   /// New windows are created in this state whenever possible.
   pub initial_state: InitialWindowState,
 
+  /// Keeps floating windows above tiled windows in their displayed
+  /// workspace. Windows-only; fullscreen priority is preserved. This
+  /// does not enable native global topmost behavior and is unsupported
+  /// on macOS.
+  pub floating_above_tiled: bool,
+
   /// Sets the default options for when a new window is created. This also
   /// changes the defaults for when the state change commands, like
   /// `set_floating`, are used without any flags.
@@ -586,6 +592,60 @@ mod tests {
   /// Parses an `animations` block.
   fn parse(yaml: &str) -> anyhow::Result<AnimationsConfig> {
     Ok(serde_yaml::from_str(yaml)?)
+  }
+
+  #[test]
+  fn floating_above_tiled_defaults_and_parses() -> anyhow::Result<()> {
+    assert!(!WindowBehaviorConfig::default().floating_above_tiled);
+    assert!(
+      !serde_yaml::from_str::<ParsedConfig>("{}")?
+        .window_behavior
+        .floating_above_tiled
+    );
+    assert!(
+      !serde_yaml::from_str::<ParsedConfig>("window_behavior: {}")?
+        .window_behavior
+        .floating_above_tiled
+    );
+    assert!(
+      !serde_yaml::from_str::<WindowBehaviorConfig>(
+        "initial_state: floating"
+      )?
+      .floating_above_tiled
+    );
+    assert!(
+      !serde_yaml::from_str::<WindowBehaviorConfig>(
+        "floating_above_tiled: false"
+      )?
+      .floating_above_tiled
+    );
+    assert!(
+      serde_yaml::from_str::<WindowBehaviorConfig>(
+        "floating_above_tiled: true"
+      )?
+      .floating_above_tiled
+    );
+    assert!(serde_yaml::from_str::<WindowBehaviorConfig>(
+      "floating_above_tiled: yes"
+    )
+    .is_err());
+
+    let defaults = WindowBehaviorConfig::default();
+    assert!(defaults.state_defaults.floating.centered);
+    assert!(!defaults.state_defaults.floating.shown_on_top);
+    assert!(defaults.state_defaults.fullscreen.maximized);
+    assert!(!defaults.state_defaults.fullscreen.shown_on_top);
+
+    let serialized = serde_yaml::to_string(&ParsedConfig {
+      window_behavior: WindowBehaviorConfig {
+        floating_above_tiled: true,
+        ..WindowBehaviorConfig::default()
+      },
+      ..ParsedConfig::default()
+    })?;
+    assert!(serialized.contains("windowBehavior:"));
+    assert!(serialized.contains("floatingAboveTiled: true"));
+    Ok(())
   }
 
   #[test]

@@ -57,6 +57,8 @@ mod wm;
 mod wm_state;
 
 #[cfg(test)]
+mod benchmarks;
+#[cfg(test)]
 mod test_utils;
 
 /// Main entry point for the application.

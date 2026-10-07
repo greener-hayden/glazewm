@@ -1,7 +1,14 @@
 use tauri_winres::VersionInfo;
 
+#[allow(dead_code)]
+#[path = "benchmark_provenance.rs"]
+mod benchmark_provenance;
+
 fn main() {
   println!("cargo:rerun-if-env-changed=VERSION_NUMBER");
+  println!("cargo:rerun-if-env-changed=GLAZEWM_BENCHMARK_PROVENANCE");
+  println!("cargo:rerun-if-env-changed=GLAZEWM_BENCHMARK_MODE");
+  write_benchmark_stamp();
   let mut res = tauri_winres::WindowsResource::new();
 
   // When the `ui_access` feature is enabled, the `uiAccess` attribute is
@@ -83,4 +90,82 @@ fn main() {
   res.set_version_info(VersionInfo::PRODUCTVERSION, version_u64);
 
   res.compile().unwrap();
+}
+
+fn write_benchmark_stamp() {
+  use std::{fs, path::PathBuf};
+  let enabled =
+    std::env::var("GLAZEWM_BENCHMARK_PROVENANCE").as_deref() == Ok("1");
+  let mode = std::env::var("GLAZEWM_BENCHMARK_MODE").unwrap_or_default();
+  let root = PathBuf::from(
+    std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"),
+  )
+  .join("../..");
+  let snapshot = if enabled {
+    // Shared inputs are intentionally captured at the evidence build
+    // boundary.
+    let snapshot = benchmark_provenance::capture_inputs(&root)
+      .expect("capture benchmark build provenance");
+    for path in snapshot.inputs.keys() {
+      if !path.starts_with('@') {
+        println!("cargo:rerun-if-changed={}", root.join(path).display());
+      }
+    }
+    for path in benchmark_provenance::cargo_config_rerun_paths(&snapshot) {
+      println!("cargo:rerun-if-changed={}", path.display());
+    }
+    for directory in ["packages", "resources/assets", ".cargo"] {
+      println!(
+        "cargo:rerun-if-changed={}",
+        root.join(directory).display()
+      );
+    }
+    for git_path in ["index", "HEAD", "refs"] {
+      if let Ok(path) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", git_path])
+        .current_dir(&root)
+        .output()
+      {
+        if path.status.success() {
+          println!(
+            "cargo:rerun-if-changed={}",
+            root
+              .join(String::from_utf8_lossy(&path.stdout).trim())
+              .display()
+          );
+        }
+      }
+    }
+    Some(snapshot)
+  } else {
+    None
+  };
+  let rustc = snapshot
+    .as_ref()
+    .and_then(|value| value.settings.get("build-only:rustc-version"))
+    .cloned()
+    .unwrap_or_else(|| "not captured for ordinary builds".into());
+  let cargo = snapshot
+    .as_ref()
+    .and_then(|value| value.settings.get("build-only:cargo-version"))
+    .cloned()
+    .unwrap_or_else(|| "not captured for ordinary builds".into());
+  let provenance = benchmark_provenance::BuildProvenance {
+    schema_version: benchmark_provenance::SCHEMA_VERSION,
+    enabled,
+    mode,
+    snapshot,
+    rustc,
+    cargo,
+    contract: "conditional provenance; no concurrent covered edits during normal Cargo compilation and measurement; registry sources, toolchain and SDK are trusted; transient edit-and-revert is not detected".into(),
+  };
+  let output =
+    PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output dir"))
+      .join("benchmark-provenance.json");
+  fs::write(
+    output,
+    serde_json::to_vec(&provenance)
+      .expect("serialize benchmark provenance"),
+  )
+  .expect("write benchmark provenance stamp");
 }

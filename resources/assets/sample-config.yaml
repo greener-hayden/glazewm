@@ -143,6 +143,11 @@ window_effects:
       opacity: '0%'
 
 window_behavior:
+  # Windows-only: keep floating windows above tiled windows in their
+  # displayed workspace. Preserves fullscreen priority; not global topmost.
+  # Unsupported on macOS.
+  floating_above_tiled: false
+
   # New windows are created in this state whenever possible.
   # Allowed values: 'tiling', 'floating'.
   initial_state: 'tiling'

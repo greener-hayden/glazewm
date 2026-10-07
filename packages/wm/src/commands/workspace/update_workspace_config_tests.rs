@@ -246,8 +246,7 @@ fn origin_child_count(state: &WmState, monitor_id: uuid::Uuid) -> usize {
     .monitors()
     .into_iter()
     .find(|monitor| monitor.id() == monitor_id)
-    .map(|monitor| monitor.child_count())
-    .unwrap_or_default()
+    .map_or_default(|monitor| monitor.child_count())
 }
 
 /// Windows on a moved workspace are flagged for DPI adjustment and have

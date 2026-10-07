@@ -13,8 +13,13 @@ path = "src/main.rs"
 
 [features]
 ui_access = []
+benchmark-allocations = []
 
 [build-dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
 tauri-winres = { workspace = true }
 
 [dependencies]
@@ -45,4 +50,5 @@ wm-platform = { path = "../wm-platform" }
 
 [dev-dependencies]
 bon = "3"
+sha2 = "0.10"
 wm-platform = { path = "../wm-platform", features = ["test_utils"] }

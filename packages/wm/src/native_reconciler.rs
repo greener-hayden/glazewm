@@ -211,6 +211,15 @@ impl FrameReconciler {
     )
   }
 
+  /// Whether reconciliation reached a terminal outcome.
+  #[cfg(target_os = "windows")]
+  pub fn settled(&self) -> bool {
+    matches!(
+      self.phase,
+      ReconcilePhase::Converged | ReconcilePhase::Failed
+    )
+  }
+
   /// Whether the request accepted last was a frame write.
   ///
   /// Only an `Accepted` frame has one outstanding; in any other phase

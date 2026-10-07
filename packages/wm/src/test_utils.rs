@@ -27,11 +27,7 @@ use crate::{
 /// Returns the state and the receiving end of its event channel, so tests
 /// can assert emitted events.
 pub fn mock_state() -> (WmState, mpsc::UnboundedReceiver<WmEvent>) {
-  let (event_tx, event_rx) = mpsc::unbounded_channel();
-  let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
-
-  let mut state =
-    WmState::new(wm_platform::Dispatcher::mock(), event_tx, exit_tx);
+  let (mut state, event_rx) = WmState::mock_with_events();
   state.mark_initialized();
 
   (state, event_rx)

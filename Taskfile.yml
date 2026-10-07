@@ -6,10 +6,35 @@ tasks:
     cmds:
       - cargo build --release --locked -p wm -p wm-cli {{if eq OS "windows"}}-p wm-watcher{{end}}
 
+  check:windows:
+    desc: Offline Windows workspace compile check; no install or desktop launch
+    cmds:
+      - cargo check --offline --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+
+  check:macos:
+    desc: Offline macOS cross-target compile check; not native SDK/link or desktop proof
+    cmds:
+      - cargo check --offline --locked --workspace --exclude wm-watcher --all-targets --all-features --target aarch64-apple-darwin
+
   fmt:
     desc: Format all crates
     cmds:
       - cargo fmt --all
+
+  fmt:benchmark-repair:
+    desc: Format only benchmark repair and its owned observer edits
+    cmds:
+      - rustfmt --edition 2021 packages/wm/benchmark_provenance.rs packages/wm/benchmark_provenance_tests.rs packages/wm/build.rs packages/wm/src/benchmarks.rs packages/wm/src/benchmarks/intents.rs packages/wm-platform/src/placement_live_tests.rs packages/wm-platform/src/floating_stacking_live_tests.rs
+
+  check:fmt:
+    desc: Check formatting without changing files
+    cmds:
+      - cargo fmt --all -- --check
+
+  lock:refresh:
+    desc: Refresh the SHA-256 dependency lock offline
+    cmds:
+      - cargo update -p sha2 --offline
 
   lint:
     desc: Clippy with warnings as errors
@@ -20,6 +45,138 @@ tasks:
     desc: Run workspace tests (macOS desktop harness is separate)
     cmds:
       - cargo test --workspace {{if ne OS "windows"}}--exclude wm-watcher --exclude wm-platform{{end}} --locked
+
+  test:floating:
+    desc: Run safe floating config, ownership planning, and placement unit tests
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked floating_plan_ -- --test-threads=1'
+      - 'cargo test -p wm-common --locked parsed_config::tests::floating_above_tiled_defaults_and_parses'
+      - 'cargo test -p wm --bin glazewm --locked user_config::tests::floating_above_tiled_config_reload'
+      - 'cargo test -p wm --bin glazewm --locked placement::tests'
+
+  test:benchmarks:
+    desc: Run deterministic benchmark schema and statistics tests in both allocator modes
+    cmds:
+      - 'cargo test -p wm --bin glazewm --locked benchmarks:: -- --skip benchmarks::core'
+      - 'cargo test -p wm --bin glazewm --features benchmark-allocations --locked benchmarks:: -- --skip benchmarks::core'
+
+  test:benchmark-provenance-smoke:
+    desc: Run isolated release Cargo provenance smoke tests without benchmark workloads
+    platforms: [windows]
+    env:
+      GLAZEWM_BENCHMARK_PROVENANCE: '1'
+      GLAZEWM_BENCHMARK_MODE: headline
+      GLAZEWM_OPERATOR_RUSTFLAGS: ''
+      GLAZEWM_OPERATOR_CARGO_ENCODED_RUSTFLAGS: ''
+      GLAZEWM_OPERATOR_RUSTC: ''
+      GLAZEWM_OPERATOR_RUSTC_WRAPPER: ''
+      GLAZEWM_OPERATOR_RUSTC_WORKSPACE_WRAPPER: ''
+      GLAZEWM_OPERATOR_VERSION_NUMBER: ''
+    cmds:
+      - >-
+        powershell -NoProfile -Command '$env:RUSTFLAGS = $null; $env:CARGO_ENCODED_RUSTFLAGS = $null; $env:CARGO_BUILD_RUSTFLAGS = $null; $env:RUSTC = $null; $env:RUSTC_WRAPPER = $null; $env:RUSTC_WORKSPACE_WRAPPER = $null; $env:VERSION_NUMBER = $null; cargo test -p wm --bin glazewm --release --locked benchmarks::provenance_smoke_unset_overrides -- --ignored --exact --test-threads=1 --nocapture'
+      - >-
+        powershell -NoProfile -Command '$env:CARGO_ENCODED_RUSTFLAGS = $null; $env:CARGO_BUILD_RUSTFLAGS = $null; $env:RUSTC = $null; $env:RUSTC_WRAPPER = $null; $env:RUSTC_WORKSPACE_WRAPPER = $null; $env:VERSION_NUMBER = $null; $env:RUSTFLAGS = "-C debuginfo=0"; $env:GLAZEWM_OPERATOR_RUSTFLAGS = $env:RUSTFLAGS; cargo test -p wm --bin glazewm --release --locked benchmarks::provenance_smoke_nonempty_rustflags -- --ignored --exact --test-threads=1 --nocapture'
+      - >-
+        powershell -NoProfile -Command '$env:RUSTFLAGS = $null; $env:CARGO_ENCODED_RUSTFLAGS = $null; $env:CARGO_BUILD_RUSTFLAGS = $null; $env:RUSTC = $null; $env:RUSTC_WRAPPER = $null; $env:RUSTC_WORKSPACE_WRAPPER = $null; $env:VERSION_NUMBER = $null; cargo test -p wm --bin glazewm --release --locked benchmarks::provenance_smoke_rejects_operator_setting_change -- --ignored --exact --test-threads=1 --nocapture'
+
+  bench:core:
+    desc: Run default-allocator headline core-kernel release benchmarks (no desktop/native work)
+    env:
+      GLAZEWM_BENCHMARK_PROVENANCE: '1'
+      GLAZEWM_BENCHMARK_MODE: headline
+      GLAZEWM_OPERATOR_RUSTFLAGS: '{{.RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_CARGO_ENCODED_RUSTFLAGS: '{{.CARGO_ENCODED_RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC: '{{.RUSTC | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WRAPPER: '{{.RUSTC_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WORKSPACE_WRAPPER: '{{.RUSTC_WORKSPACE_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_VERSION_NUMBER: '{{.VERSION_NUMBER | default ""}}'
+    cmds:
+      - 'cargo test -p wm --bin glazewm --release --locked benchmarks::core -- --ignored --exact --test-threads=1 --nocapture'
+
+  bench:core:allocations:
+    desc: Run an independent opt-in Rust allocation-counter pass
+    env:
+      GLAZEWM_BENCHMARK_PROVENANCE: '1'
+      GLAZEWM_BENCHMARK_MODE: allocations
+      GLAZEWM_OPERATOR_RUSTFLAGS: '{{.RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_CARGO_ENCODED_RUSTFLAGS: '{{.CARGO_ENCODED_RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC: '{{.RUSTC | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WRAPPER: '{{.RUSTC_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WORKSPACE_WRAPPER: '{{.RUSTC_WORKSPACE_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_VERSION_NUMBER: '{{.VERSION_NUMBER | default ""}}'
+    cmds:
+      - 'cargo test -p wm --bin glazewm --release --features benchmark-allocations --locked benchmarks::core -- --ignored --exact --test-threads=1 --nocapture'
+
+  bench:intents:
+    desc: Run native-free focus, workspace, checked creation, and resize-burst benchmarks
+    env:
+      GLAZEWM_BENCHMARK_PROVENANCE: '1'
+      GLAZEWM_BENCHMARK_MODE: headline
+      GLAZEWM_OPERATOR_RUSTFLAGS: '{{.RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_CARGO_ENCODED_RUSTFLAGS: '{{.CARGO_ENCODED_RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC: '{{.RUSTC | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WRAPPER: '{{.RUSTC_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WORKSPACE_WRAPPER: '{{.RUSTC_WORKSPACE_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_VERSION_NUMBER: '{{.VERSION_NUMBER | default ""}}'
+    cmds:
+      - 'cargo test -p wm --bin glazewm --release --locked benchmarks::intent_scenarios -- --ignored --exact --test-threads=1 --nocapture'
+
+  bench:intents:allocations:
+    desc: Run a separate Rust allocation pass for all four intent scenarios
+    env:
+      GLAZEWM_BENCHMARK_PROVENANCE: '1'
+      GLAZEWM_BENCHMARK_MODE: allocations
+      GLAZEWM_OPERATOR_RUSTFLAGS: '{{.RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_CARGO_ENCODED_RUSTFLAGS: '{{.CARGO_ENCODED_RUSTFLAGS | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC: '{{.RUSTC | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WRAPPER: '{{.RUSTC_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_RUSTC_WORKSPACE_WRAPPER: '{{.RUSTC_WORKSPACE_WRAPPER | default ""}}'
+      GLAZEWM_OPERATOR_VERSION_NUMBER: '{{.VERSION_NUMBER | default ""}}'
+    cmds:
+      - 'cargo test -p wm --bin glazewm --release --features benchmark-allocations --locked benchmarks::intent_scenarios -- --ignored --exact --test-threads=1 --nocapture'
+
+  test:floating:desktop-probe:
+    desc: Probe band-preserving native batching with one blocked unmanaged fixture UI
+    platforms: [windows]
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked live_floating_batch_blocked_ui -- --ignored --exact --test-threads=1 --nocapture'
+
+  test:floating:desktop-move-probe:
+    desc: Probe synchronous band-preserving raises with one blocked unmanaged fixture UI
+    platforms: [windows]
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked live_floating_move_blocked_ui -- --ignored --exact --test-threads=1 --nocapture'
+
+  test:floating:desktop-completion:
+    desc: Diagnose native stacking completion with unmanaged fixtures only; no typing tests
+    platforms: [windows]
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked live_floating_production_worker_blocked_ui -- --ignored --exact --test-threads=1 --nocapture'
+
+  test:floating:desktop-caller-queue:
+    desc: Probe one native stacking request across caller-queue processing; no typing tests
+    platforms: [windows]
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked live_floating_caller_queue_processing -- --ignored --exact --test-threads=1 --nocapture'
+
+  test:floating:desktop-foreground-owner:
+    desc: Probe one native stacking request with the source-owning process foreground
+    platforms: [windows]
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked live_floating_foreground_owner_permission -- --ignored --exact --test-threads=1 --nocapture'
+
+  test:floating:desktop:
+    desc: Test floating native ordering, pixels, ownership, overlays, and blocked-app responsiveness
+    platforms: [windows]
+    cmds:
+      - 'cargo test -p wm-platform --test test --locked live_floating_ -- --ignored --test-threads=1 --nocapture'
+
+  test:layout:
+    desc: Run native-free layout solver, snapshot, and differential tests
+    cmds:
+      - cargo test -p wm --bin glazewm --locked traits::position_getters
+      - cargo test -p wm --bin glazewm --locked layout_snapshot::tests
 
   test:reconciliation:
     desc: Run native reconciler and placement unit tests

@@ -12,7 +12,11 @@ mod display;
 mod display_listener;
 mod error;
 mod event_loop;
+#[cfg(target_os = "windows")]
+mod floating_stacking;
 mod frame_clock;
+#[cfg(target_os = "windows")]
+pub use floating_stacking::*;
 #[cfg(target_os = "windows")]
 mod input_test_allocator;
 mod keybinding_listener;

@@ -148,7 +148,9 @@ impl NativeWindow {
         rect.bottom,
       ))
     } else {
-      warn!("Failed to get window's frame position. Falling back to border position.");
+      warn!(
+        "Failed to get window's frame position. Falling back to border position."
+      );
       self.frame_with_shadows()
     }
   }
@@ -830,6 +832,50 @@ impl From<NativeWindow> for crate::NativeWindow {
 /// [`WindowLiveness::from_window_server`]: crate::WindowLiveness::from_window_server
 pub(crate) fn listed_window_ids() -> Option<HashSet<WindowId>> {
   None
+}
+
+/// Implements [`Dispatcher::stacking_order`].
+pub(crate) fn stacking_order(
+  ids: &[WindowId],
+  _: &Dispatcher,
+) -> crate::Result<Vec<WindowId>> {
+  let requested = ids
+    .iter()
+    .copied()
+    .collect::<std::collections::HashSet<_>>();
+  if requested.is_empty() {
+    return Ok(Vec::new());
+  }
+
+  let mut order = Vec::with_capacity(requested.len());
+  #[allow(clippy::items_after_statements)]
+  extern "system" fn collect_requested(
+    handle: HWND,
+    data: LPARAM,
+  ) -> BOOL {
+    // SAFETY: `data` points to the live request/order pair for this call.
+    let (requested, order) = unsafe {
+      &mut *(data.0
+        as *mut (&std::collections::HashSet<WindowId>, &mut Vec<WindowId>))
+    };
+    let id = WindowId(handle.0);
+    if requested.contains(&id) {
+      order.push(id);
+    }
+    true.into()
+  }
+
+  let mut context = (&requested, &mut order);
+  // EnumWindows enumerates top-level windows in front-to-back order and
+  // reports enumeration failure rather than returning a partial success.
+  unsafe {
+    EnumWindows(
+      Some(collect_requested),
+      LPARAM(std::ptr::from_mut(&mut context) as _),
+    )
+  }?;
+
+  Ok(order)
 }
 
 /// Implements [`Dispatcher::visible_windows`].

@@ -19,7 +19,7 @@ use crate::{
   animation_manager::{
     AnimationPlan, AnimationTrigger, MotionStart, WindowChange,
   },
-  models::{Monitor, NativeMonitorProperties, WindowContainer},
+  models::{Container, Monitor, NativeMonitorProperties, WindowContainer},
   native_reconciler::{
     DesiredFrame, FrameReconciler, NativeMutation, NativeState,
     ObservePlan, ObservedFrame, ReconcilePhase,
@@ -1221,6 +1221,226 @@ fn apply_floating_preference(state: &mut WmState) -> anyhow::Result<()> {
   Ok(())
 }
 
+/// Lists windows from least to most recently focused, the order the
+/// reconciler stacks them in.
+///
+/// One walk of the focus order, reversed. Windows the focus order does not
+/// reach cannot be ranked by it, so those trees take the exact fallback in
+/// `stacking_order`.
+fn windows_in_stacking_order(state: &WmState) -> Vec<WindowContainer> {
+  let focus_windows = state
+    .root_container
+    .descendant_focus_order()
+    .filter_map(|container| container.try_into().ok())
+    .collect::<Vec<WindowContainer>>();
+  let window_count = state
+    .root_container
+    .descendants()
+    .filter(|container| {
+      matches!(
+        container,
+        Container::TilingWindow(_) | Container::NonTilingWindow(_)
+      )
+    })
+    .count();
+
+  stacking_order(
+    focus_windows,
+    window_count,
+    || state.windows(),
+    CommonGetters::id,
+  )
+}
+
+/// Orders `focus_windows` (most recently focused first) for stacking.
+///
+/// Fast path: when the focus order reached all `window_count` windows, its
+/// reverse is the answer, with no lookups or sort. Otherwise `tree_order`
+/// is ranked by focus position and windows the focus order missed sort
+/// first, in tree order.
+fn stacking_order<T>(
+  mut focus_windows: Vec<T>,
+  window_count: usize,
+  tree_order: impl FnOnce() -> Vec<T>,
+  id: impl Fn(&T) -> Uuid,
+) -> Vec<T> {
+  if focus_windows.len() == window_count {
+    focus_windows.reverse();
+    return focus_windows;
+  }
+
+  let rank = focus_windows
+    .iter()
+    .enumerate()
+    .map(|(index, window)| (id(window), index))
+    .collect::<HashMap<_, _>>();
+  let mut windows = tree_order();
+  windows.sort_by_key(|window| {
+    std::cmp::Reverse(rank.get(&id(window)).copied().unwrap_or(usize::MAX))
+  });
+  windows
+}
+
+#[cfg(test)]
+mod stacking_order_tests {
+  use super::*;
+  use crate::{
+    commands::container::set_focused_descendant,
+    models::{TilingWindow, Workspace},
+    test_utils::{attach_monitor, mock_state},
+  };
+
+  /// The ordering before the focus-order walk: a rank map over every
+  /// focus-order container, then a stable sort of the tree-order windows.
+  fn oracle(state: &WmState) -> Vec<Uuid> {
+    let mut windows = state.windows();
+    let order = state
+      .root_container
+      .descendant_focus_order()
+      .enumerate()
+      .map(|(index, container)| (container.id(), index))
+      .collect::<HashMap<_, _>>();
+    windows.sort_by_key(|window| {
+      std::cmp::Reverse(
+        order.get(&window.id()).copied().unwrap_or(usize::MAX),
+      )
+    });
+    windows.iter().map(CommonGetters::id).collect()
+  }
+
+  /// Orders `state`'s windows with the production function.
+  fn actual(state: &WmState) -> Vec<Uuid> {
+    windows_in_stacking_order(state)
+      .iter()
+      .map(CommonGetters::id)
+      .collect()
+  }
+
+  /// Builds two workspaces of `count` windows in total plus an empty third
+  /// workspace, which is a non-window leaf of the focus order.
+  fn tree(count: usize) -> (WmState, Vec<TilingWindow>) {
+    let (state, _events) = mock_state();
+    let windows = (0..count)
+      .map(|index| TilingWindow::mock().title(format!("w{index}")).call())
+      .collect::<Vec<_>>();
+    let containers = |range: &[TilingWindow]| {
+      range.iter().cloned().map(Into::into).collect::<Vec<_>>()
+    };
+    let midpoint = count / 2;
+    let monitor = Monitor::mock()
+      .workspaces(vec![
+        Workspace::mock()
+          .name("1".to_string())
+          .tiling_containers(containers(&windows[..midpoint]))
+          .call(),
+        Workspace::mock()
+          .name("2".to_string())
+          .tiling_containers(containers(&windows[midpoint..]))
+          .call(),
+        Workspace::mock().name("3".to_string()).call(),
+      ])
+      .call();
+    attach_monitor(&state, &monitor).expect("Monitor attaches.");
+    (state, windows)
+  }
+
+  /// Focuses every window once, in a fixed scrambled order.
+  fn focus_scrambled(windows: &[TilingWindow], stride: usize) {
+    let count = windows.len();
+    for step in 0..count {
+      let window = &windows[(step * stride + 1) % count];
+      set_focused_descendant(&window.clone().into(), None);
+    }
+  }
+
+  /// Matches the old ordering at 10, 50 and 100 windows under several
+  /// focus histories.
+  #[test]
+  fn matches_oracle_on_real_trees() {
+    for count in [10, 50, 100] {
+      // Strides coprime to every count visit each window exactly once.
+      for stride in [1, 3, 7, 9] {
+        let (state, windows) = tree(count);
+        focus_scrambled(&windows, stride);
+        assert_eq!(state.windows().len(), count);
+        assert_eq!(actual(&state), oracle(&state), "n={count} s={stride}");
+      }
+    }
+  }
+
+  /// A window the focus order never reaches sorts first, and the result
+  /// still equals the old ordering.
+  #[test]
+  fn focus_order_hole_takes_exact_fallback() {
+    let (state, windows) = tree(10);
+    focus_scrambled(&windows, 3);
+    for hole in [0, 4, 9] {
+      let victim = &windows[hole];
+      let parent = victim.parent().expect("Window has a parent.");
+      let removed = {
+        let mut order = parent.borrow_child_focus_order_mut();
+        let before = order.len();
+        order.retain(|id| *id != victim.id());
+        before - order.len()
+      };
+      assert_eq!(removed, 1);
+      assert_eq!(actual(&state), oracle(&state), "hole={hole}");
+      assert_eq!(actual(&state)[0], victim.id());
+      // Restore the entry so the next hole is the only one.
+      parent.borrow_child_focus_order_mut().push_back(victim.id());
+    }
+  }
+
+  /// An empty tree has no windows to order.
+  #[test]
+  fn empty_tree_is_empty() {
+    let (state, _events) = mock_state();
+    assert_eq!(actual(&state), Vec::<Uuid>::new());
+    assert_eq!(oracle(&state), Vec::<Uuid>::new());
+  }
+
+  /// The generic core matches the old algorithm for the full focus order,
+  /// every single-hole position and one double hole, with non-window ids
+  /// mixed into the focus order.
+  #[test]
+  fn generic_core_matches_oracle() {
+    let id = |value: &u128| Uuid::from_u128(*value);
+    let tree_order = (0..9_u128).collect::<Vec<_>>();
+    // Focus order, most recent first, with non-window ids (100+) mixed in.
+    let full = vec![4_u128, 100, 7, 1, 101, 0, 8, 3, 5, 2, 6];
+    let mut cases = vec![full.clone()];
+    for hole in 0..9_u128 {
+      cases.push(full.iter().copied().filter(|v| *v != hole).collect());
+    }
+    // Two holes at once.
+    cases.push(full.iter().copied().filter(|v| *v > 2).collect());
+
+    for focus in cases {
+      let windows_only = focus
+        .iter()
+        .copied()
+        .filter(|value| *value < 100)
+        .collect::<Vec<_>>();
+      let mut expected = tree_order.clone();
+      let rank = focus
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (*value, index))
+        .collect::<HashMap<_, _>>();
+      expected.sort_by_key(|value| {
+        std::cmp::Reverse(rank.get(value).copied().unwrap_or(usize::MAX))
+      });
+      let actual = stacking_order(
+        windows_only,
+        tree_order.len(),
+        || tree_order.clone(),
+        id,
+      );
+      assert_eq!(actual, expected, "focus={focus:?}");
+    }
+  }
+}
+
 /// Applies queued state through guarded native sessions.
 #[allow(clippy::too_many_lines)]
 pub fn platform_sync(
@@ -1274,18 +1494,7 @@ pub fn platform_sync(
   let all_effects_changed = state.pending_sync.needs_all_effects_update();
   let focus_effects_changed =
     state.pending_sync.needs_focused_effect_update();
-  let mut windows = state.windows();
-  let order = state
-    .root_container
-    .descendant_focus_order()
-    .enumerate()
-    .map(|(index, container)| (container.id(), index))
-    .collect::<HashMap<_, _>>();
-  windows.sort_by_key(|window| {
-    std::cmp::Reverse(
-      order.get(&window.id()).copied().unwrap_or(usize::MAX),
-    )
-  });
+  let windows = windows_in_stacking_order(state);
   let t_order = span.elapsed();
   let dirty = std::mem::take(&mut state.native_sync.dirty);
   let now = Instant::now();

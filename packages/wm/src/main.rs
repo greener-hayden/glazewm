@@ -196,6 +196,10 @@ async fn start_wm(
 
   let mut topology = event_batch::TopologyDebounce::default();
   let mut input_failure = None;
+  // Created once: a fresh future per iteration would allocate and
+  // register a signal listener on every wake.
+  let ctrl_c = signal::ctrl_c();
+  tokio::pin!(ctrl_c);
   loop {
     window_listener.set_opening_concealment(
       !wm.state.is_paused && config.value.animations.window_open.is_some(),
@@ -206,7 +210,7 @@ async fn start_wm(
       wm.state.native_sync.deadline(wm.state.is_paused);
 
     let res = tokio::select! {
-      _ = signal::ctrl_c() => {
+      _ = &mut ctrl_c => {
         tracing::info!("Received SIGINT signal.");
         break;
       },
@@ -275,17 +279,9 @@ async fn start_wm(
       Some(signal) = wm.state.animation_manager.tick_rx.recv() => {
         wm.update_animations(signal, &config)
       },
-      Some((
-        message,
-        response_tx,
-        disconnection_tx
-      )) = ipc_server.message_rx.recv() => {
-        tracing::info!("Received IPC message: {:?}", message);
-
+      Some(request) = ipc_server.message_rx.recv() => {
         if let Err(err) = ipc_server.process_message(
-          message,
-          &response_tx,
-          &disconnection_tx,
+          request,
           &mut wm,
           &mut config,
         ) {

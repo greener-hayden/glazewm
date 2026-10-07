@@ -410,17 +410,23 @@ impl UserConfig {
   }
 
   /// Keeps paused bindings eligible for interception.
+  ///
+  /// Clones only the bindings, not the configs that own them.
   pub fn listener_bindings(
     &self,
     modes: &[wm_common::BindingModeConfig],
   ) -> Vec<wm_platform::Keybinding> {
     self
       .active_keybinding_configs(modes, false)
-      .flat_map(|config| config.bindings)
+      .flat_map(|config| config.bindings.iter().cloned())
       .collect()
   }
 
   /// Resolves queued bindings against current configuration.
+  ///
+  /// Borrows the config table and clones only the matched commands, as
+  /// those must outlive the `&mut UserConfig` the caller then runs them
+  /// with.
   pub fn keybinding_commands(
     &self,
     event: &wm_platform::KeybindingEvent,
@@ -430,7 +436,7 @@ impl UserConfig {
     self
       .active_keybinding_configs(modes, paused)
       .find(|config| config.bindings.contains(&event.binding))
-      .map(|config| config.commands)
+      .map(|config| config.commands.clone())
   }
 
   /// Keybinding configs that should be active for the current binding mode
@@ -438,25 +444,25 @@ impl UserConfig {
   ///
   /// When paused, only the configs with `InvokeCommand::WmTogglePause` are
   /// returned so that unpausing remains possible.
-  pub fn active_keybinding_configs(
-    &self,
-    binding_modes: &[wm_common::BindingModeConfig],
+  ///
+  /// Borrows from the config table (or the first binding mode's table)
+  /// instead of copying it.
+  pub fn active_keybinding_configs<'a>(
+    &'a self,
+    binding_modes: &'a [wm_common::BindingModeConfig],
     is_paused: bool,
-  ) -> impl Iterator<Item = KeybindingConfig> {
+  ) -> impl Iterator<Item = &'a KeybindingConfig> {
     let source_configs = if let Some(first_mode) = binding_modes.first() {
       &first_mode.keybindings
     } else {
       &self.value.keybindings
-    }
-    .clone();
+    };
 
-    source_configs.into_iter().filter(move |kb| {
-      if is_paused {
-        kb.commands
+    source_configs.iter().filter(move |kb| {
+      !is_paused
+        || kb
+          .commands
           .contains(&wm_common::InvokeCommand::WmTogglePause)
-      } else {
-        true
-      }
     })
   }
 }

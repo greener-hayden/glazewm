@@ -26,13 +26,49 @@ use crate::{
   wm::WindowManager,
 };
 
+/// A client message, already parsed by the connection task that received
+/// it.
+///
+/// Parsing happens off the WM thread, which only runs the command.
+pub struct IpcRequest {
+  /// Raw text of the client's message, echoed back in the response.
+  message: String,
+
+  /// Parsed command, or the rendered parse error to report to the client.
+  command: Result<AppCommand, String>,
+
+  response_tx: mpsc::UnboundedSender<Message>,
+  disconnection_tx: broadcast::Sender<()>,
+}
+
+impl IpcRequest {
+  /// Parses a client message into a request.
+  ///
+  /// The message is split on whitespace and parsed as CLI arguments, the
+  /// same way the CLI would. A parse failure is kept as its rendered text
+  /// so the response carries exactly the message clap produced.
+  fn parse(
+    message: String,
+    response_tx: mpsc::UnboundedSender<Message>,
+    disconnection_tx: broadcast::Sender<()>,
+  ) -> Self {
+    let command = AppCommand::try_parse_from(
+      iter::once("").chain(message.split_whitespace()),
+    )
+    .map_err(|err| err.to_string());
+
+    Self {
+      message,
+      command,
+      response_tx,
+      disconnection_tx,
+    }
+  }
+}
+
 pub struct IpcServer {
   abort_handle: task::AbortHandle,
-  pub message_rx: mpsc::UnboundedReceiver<(
-    String,
-    mpsc::UnboundedSender<Message>,
-    broadcast::Sender<()>,
-  )>,
+  pub message_rx: mpsc::UnboundedReceiver<IpcRequest>,
   _event_rx: broadcast::Receiver<(SubscribableEvent, WmEvent)>,
   event_tx: broadcast::Sender<(SubscribableEvent, WmEvent)>,
   _unsubscribe_rx: broadcast::Receiver<Uuid>,
@@ -78,11 +114,7 @@ impl IpcServer {
   async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
-    message_tx: mpsc::UnboundedSender<(
-      String,
-      mpsc::UnboundedSender<Message>,
-      broadcast::Sender<()>,
-    )>,
+    message_tx: mpsc::UnboundedSender<IpcRequest>,
   ) -> anyhow::Result<()> {
     info!("Incoming IPC connection from: {}.", addr);
 
@@ -104,8 +136,11 @@ impl IpcServer {
             match message {
               Some(Ok(message)) => {
                 if message.is_text() || message.is_binary() {
-                  message_tx.send((
-                    message.to_text()?.to_string(),
+                  let message = message.to_text()?.to_string();
+                  info!("Received IPC message: {:?}", message);
+
+                  message_tx.send(IpcRequest::parse(
+                    message,
                     response_tx.clone(),
                     disconnection_tx.clone(),
                   ))?;
@@ -132,30 +167,30 @@ impl IpcServer {
     res
   }
 
+  /// Runs a parsed client request and responds with the result.
   pub fn process_message(
     &self,
-    message: String,
-    response_tx: &mpsc::UnboundedSender<Message>,
-    disconnection_tx: &broadcast::Sender<()>,
+    request: IpcRequest,
     wm: &mut WindowManager,
     config: &mut UserConfig,
   ) -> anyhow::Result<()> {
-    let app_command = AppCommand::try_parse_from(
-      iter::once("").chain(message.split_whitespace()),
-    );
+    let IpcRequest {
+      message,
+      command,
+      response_tx,
+      disconnection_tx,
+    } = request;
 
     let response_data =
-      app_command
-        .map_err(anyhow::Error::msg)
-        .and_then(|app_command| {
-          self.handle_app_command(
-            app_command,
-            response_tx,
-            disconnection_tx,
-            wm,
-            config,
-          )
-        });
+      command.map_err(anyhow::Error::msg).and_then(|app_command| {
+        self.handle_app_command(
+          app_command,
+          &response_tx,
+          &disconnection_tx,
+          wm,
+          config,
+        )
+      });
 
     // Respond to the client with the result of the command.
     response_tx
@@ -408,5 +443,80 @@ impl IpcServer {
 impl Drop for IpcServer {
   fn drop(&mut self) {
     self.stop();
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Parses `message` through the connection task's path.
+  fn parse(message: &str) -> IpcRequest {
+    let (response_tx, _response_rx) = mpsc::unbounded_channel();
+    let (disconnection_tx, _) = broadcast::channel(1);
+    IpcRequest::parse(message.to_string(), response_tx, disconnection_tx)
+  }
+
+  /// The parse the WM thread used to run on the raw message.
+  fn oracle(message: &str) -> Result<AppCommand, String> {
+    AppCommand::try_parse_from(
+      iter::once("").chain(message.split_whitespace()),
+    )
+    .map_err(|err| anyhow::Error::msg(err).to_string())
+  }
+
+  /// Parsing in the connection task yields the same command or the same
+  /// error text, and keeps the message for the response echo.
+  #[test]
+  fn parse_matches_wm_thread_parse() {
+    for message in [
+      "query windows",
+      "  query   focused ",
+      "command focus --direction left",
+      "sub --events focus_changed",
+      "query nonsense",
+      "command",
+      "",
+      "--help",
+      "--version",
+    ] {
+      let request = parse(message);
+      assert_eq!(request.message, message);
+      match (request.command, oracle(message)) {
+        (Ok(actual), Ok(expected)) => {
+          assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+        (actual, expected) => {
+          panic!("{message:?}: {actual:?} vs {expected:?}")
+        }
+      }
+    }
+  }
+
+  /// A rejected message is reported in the same response JSON the WM
+  /// thread produced.
+  #[test]
+  fn rejected_message_response_is_unchanged() -> anyhow::Result<()> {
+    let message = "query nonsense";
+    let request = parse(message);
+    let Err(error) = request.command else {
+      bail!("Message should be rejected.");
+    };
+    let new = IpcServer::to_client_response_msg(
+      request.message,
+      Err(anyhow::Error::msg(error)),
+    )?;
+    let old = IpcServer::to_client_response_msg(
+      message.to_string(),
+      Err(anyhow::Error::msg(
+        AppCommand::try_parse_from(
+          iter::once("").chain(message.split_whitespace()),
+        )
+        .expect_err("Message is invalid."),
+      )),
+    )?;
+    assert_eq!(new, old);
+    Ok(())
   }
 }

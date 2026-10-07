@@ -116,6 +116,13 @@ impl PlacementSession {
     }
   }
 
+  /// Copies weak recovery ownership for one in-flight stacking job.
+  #[cfg(target_os = "windows")]
+  pub fn stacking_session(&self) -> crate::Result<NativeSession> {
+    self.validate()?;
+    Ok(self.native.clone())
+  }
+
   /// Observes the native rectangle in placement coordinates.
   pub fn observed_frame(&self) -> crate::Result<Rect> {
     #[cfg(target_os = "windows")]

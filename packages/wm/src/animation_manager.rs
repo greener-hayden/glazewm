@@ -653,6 +653,30 @@ impl AnimationManager {
     }
   }
 
+  /// Creates an empty test manager without overlays, clocks, or OS
+  /// queries.
+  #[cfg(test)]
+  #[allow(clippy::zero_sized_map_values)]
+  pub(crate) fn mock() -> Self {
+    let (tick_tx, tick_rx) = mpsc::channel(1);
+    Self {
+      animations: HashMap::new(),
+      running: HashMap::new(),
+      failed_updates: HashSet::new(),
+      tick_tx,
+      tick_rx,
+      windows: HashMap::new(),
+      decorations: HashMap::new(),
+      pending_captures: HashMap::new(),
+      context: None,
+      clock: None,
+      pending_starts: Vec::new(),
+      last_submitted: None,
+      #[cfg(target_os = "macos")]
+      displays_have_separate_spaces: false,
+    }
+  }
+
   /// Whether an animation is currently active for a given window.
   pub fn is_animating(&self, window_id: &Uuid) -> bool {
     self.animations.contains_key(window_id)
@@ -729,6 +753,15 @@ impl AnimationManager {
           |spec| spec.target_rect.clone(),
         ),
     )
+  }
+
+  /// Creates a completion wake without inventing compositor progress.
+  #[cfg(target_os = "windows")]
+  pub fn native_completion_wake(&self) -> impl Fn() + Send + 'static {
+    let sender = self.tick_tx.clone();
+    move || {
+      let _ = sender.try_send(FrameSignal::Wake);
+    }
   }
 
   /// Whether any overlay or motion still depends on the frame clock.
@@ -1774,26 +1807,9 @@ mod tests {
     }
   }
 
-  // LINT: Windows capture tokens are zero-sized, as in `new`.
-  #[allow(clippy::zero_sized_map_values)]
+  /// Reuses the native-free manager fixture.
   fn manager_without_overlays() -> AnimationManager {
-    let (tick_tx, tick_rx) = mpsc::channel(1);
-    AnimationManager {
-      animations: HashMap::new(),
-      running: HashMap::new(),
-      failed_updates: HashSet::new(),
-      tick_tx,
-      tick_rx,
-      windows: HashMap::new(),
-      decorations: HashMap::new(),
-      pending_captures: HashMap::new(),
-      context: None,
-      clock: None,
-      pending_starts: Vec::new(),
-      last_submitted: None,
-      #[cfg(target_os = "macos")]
-      displays_have_separate_spaces: false,
-    }
+    AnimationManager::mock()
   }
 
   fn test_spec() -> AnimationSpec {

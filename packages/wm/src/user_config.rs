@@ -61,6 +61,31 @@ impl UserConfig {
     })
   }
 
+  /// Creates a config for tests from the given parsed value.
+  ///
+  /// Reads from and writes to no files. Window rules are indexed as they
+  /// are for a config read from disk.
+  #[cfg(test)]
+  pub(crate) fn mock(value: ParsedConfig) -> Self {
+    let window_rules_by_event = Self::window_rules_by_event(&value);
+    Self {
+      path: PathBuf::new(),
+      value,
+      value_str: String::new(),
+      window_rules_by_event,
+    }
+  }
+
+  /// Creates a config for tests by parsing the given YAML.
+  ///
+  /// Reads from and writes to no files.
+  #[cfg(test)]
+  pub(crate) fn mock_from_str(config_str: &str) -> anyhow::Result<Self> {
+    let mut config = Self::mock(serde_yaml::from_str(config_str)?);
+    config.value_str = config_str.to_owned();
+    Ok(config)
+  }
+
   /// Reads and validates the user config from the given path.
   ///
   /// Creates a new config file from sample if it doesn't exist.
@@ -76,22 +101,16 @@ impl UserConfig {
 
     // TODO: Improve error formatting of serde_yaml errors. Something
     // similar to https://github.com/AlexanderThaller/format_serde_error
-    let config_value = serde_yaml::from_str(&config_str)?;
+    let config_value: ParsedConfig = serde_yaml::from_str(&config_str)?;
+
+    #[cfg(target_os = "macos")]
+    if config_value.window_behavior.floating_above_tiled {
+      tracing::warn!(
+        "window_behavior.floating_above_tiled is unsupported on macOS and will be ignored"
+      );
+    }
 
     Ok((config_value, config_str))
-  }
-
-  /// Creates a config for tests from the given parsed value.
-  ///
-  /// Reads from and writes to no files.
-  #[cfg(test)]
-  pub(crate) fn mock(value: ParsedConfig) -> Self {
-    Self {
-      path: PathBuf::new(),
-      value,
-      value_str: String::new(),
-      window_rules_by_event: HashMap::new(),
-    }
   }
 
   /// Initializes a new config file from the sample config resource.

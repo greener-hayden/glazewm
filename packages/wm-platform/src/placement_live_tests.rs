@@ -1,6 +1,15 @@
 //! Desktop integration checks using only explicitly unmanaged fixtures.
 
-use std::{sync::mpsc, time::Duration};
+#[path = "floating_stacking_live_tests.rs"]
+mod floating_stacking_live_tests;
+
+use std::{
+  sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc, Mutex, OnceLock,
+  },
+  time::Duration,
+};
 
 use windows::{
   core::{w, PCWSTR},
@@ -19,12 +28,16 @@ use windows::{
       },
     },
     UI::WindowsAndMessaging::{
-      CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-      GetLayeredWindowAttributes, PeekMessageW, RegisterClassW,
-      TranslateMessage, MSG, PM_REMOVE, WINDOW_EX_STYLE, WINDOW_STYLE,
-      WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-      WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-      WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+      BeginDeferWindowPos, CreateWindowExW, DefWindowProcW,
+      DeferWindowPos, DestroyWindow, DispatchMessageW, EndDeferWindowPos,
+      GetForegroundWindow, GetLayeredWindowAttributes, PeekMessageW,
+      RegisterClassW, SetWindowPos, TranslateMessage, HWND_TOP, MSG,
+      PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+      SWP_NOREDRAW, SWP_NOSENDCHANGING, SWP_NOSIZE, WINDOWPOS,
+      WINDOW_EX_STYLE, WINDOW_STYLE, WM_WINDOWPOSCHANGED,
+      WM_WINDOWPOSCHANGING, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
+      WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+      WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
     },
   },
 };
@@ -38,13 +51,92 @@ use crate::{
 /// Owns a nonactivating tool window that the WM will never manage.
 struct Fixture(HWND);
 
-/// Delegates fixture messages to the system's standard painting behavior.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct WindowPositionMessage {
+  pub(super) window: isize,
+  pub(super) message: u32,
+  pub(super) flags: u32,
+  pub(super) insert_after: isize,
+}
+
+static WINDOW_POSITION_MESSAGES: OnceLock<
+  Mutex<Vec<WindowPositionMessage>>,
+> = OnceLock::new();
+static DROPPED_WINDOW_POSITION_MESSAGES: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_POSITION_OBSERVATION_ENABLED: AtomicBool =
+  AtomicBool::new(false);
+
+/// Disables the fixture message observer when the diagnostic ends.
+pub(super) struct WindowPositionObservation;
+
+impl Drop for WindowPositionObservation {
+  fn drop(&mut self) {
+    WINDOW_POSITION_OBSERVATION_ENABLED.store(false, Ordering::Release);
+  }
+}
+
+/// Starts a fresh bounded message log for the native completion
+/// diagnostic.
+pub(super) fn observe_window_positions() -> WindowPositionObservation {
+  let messages =
+    WINDOW_POSITION_MESSAGES.get_or_init(|| Mutex::new(Vec::new()));
+  messages
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+    .clear();
+  DROPPED_WINDOW_POSITION_MESSAGES.store(0, Ordering::Relaxed);
+  WINDOW_POSITION_OBSERVATION_ENABLED.store(true, Ordering::Release);
+  WindowPositionObservation
+}
+
+/// Takes the bounded fixture `WINDOWPOS` observations since the last
+/// boundary.
+fn take_window_position_messages() -> (Vec<WindowPositionMessage>, usize) {
+  let messages =
+    WINDOW_POSITION_MESSAGES.get_or_init(|| Mutex::new(Vec::new()));
+  let mut messages = messages
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  let taken = std::mem::take(&mut *messages);
+  let dropped =
+    DROPPED_WINDOW_POSITION_MESSAGES.swap(0, Ordering::Relaxed);
+  (taken, dropped)
+}
+
+/// Delegates fixture messages and records bounded `WINDOWPOS`
+/// observations.
 unsafe extern "system" fn fixture_wnd_proc(
   window: HWND,
   message: u32,
   wparam: WPARAM,
   lparam: LPARAM,
 ) -> LRESULT {
+  if WINDOW_POSITION_OBSERVATION_ENABLED.load(Ordering::Acquire)
+    && (message == WM_WINDOWPOSCHANGING || message == WM_WINDOWPOSCHANGED)
+  {
+    // SAFETY: USER32 supplies a live `WINDOWPOS` for these window
+    // messages.
+    let position = unsafe { &*(lparam.0 as *const WINDOWPOS) };
+    if let Ok(mut messages) = WINDOW_POSITION_MESSAGES
+      .get_or_init(|| Mutex::new(Vec::new()))
+      .try_lock()
+    {
+      if messages.len() < 64 {
+        // SAFETY: The callback copies fields only; it makes no USER32
+        // calls.
+        messages.push(WindowPositionMessage {
+          window: window.0,
+          message,
+          flags: position.flags.0,
+          insert_after: position.hwndInsertAfter.0,
+        });
+      } else {
+        DROPPED_WINDOW_POSITION_MESSAGES.fetch_add(1, Ordering::Relaxed);
+      }
+    } else {
+      DROPPED_WINDOW_POSITION_MESSAGES.fetch_add(1, Ordering::Relaxed);
+    }
+  }
   // SAFETY: Windows supplied this callback's live message parameters.
   unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
@@ -172,6 +264,38 @@ pub fn register() {
     );
   }
   for (name, test) in [
+    (
+      "live_floating_owner_modal_pixels",
+      floating_stacking_live_tests::owner_modal_and_pixels as fn(),
+    ),
+    (
+      "live_floating_production_worker_blocked_ui",
+      floating_stacking_live_tests::blocked_worker,
+    ),
+    (
+      "live_floating_caller_queue_processing",
+      floating_stacking_live_tests::caller_queue_processing,
+    ),
+    (
+      "live_floating_foreground_owner_permission",
+      floating_stacking_live_tests::foreground_owner_permission,
+    ),
+    (
+      "live_floating_focused_dialog_typing",
+      floating_stacking_live_tests::focused_dialog_typing,
+    ),
+    (
+      "live_floating_changed_context_overlay",
+      floating_stacking_live_tests::changed_context_and_overlay,
+    ),
+    (
+      "live_floating_batch_blocked_ui",
+      live_floating_batch_blocked_ui as fn(),
+    ),
+    (
+      "live_floating_move_blocked_ui",
+      live_floating_move_blocked_ui,
+    ),
     (
       "live_thumbnail_decorations",
       live_thumbnail_decorations as fn(),
@@ -971,4 +1095,226 @@ fn live_source_overlay_handoff(pixels: bool, opening: bool) {
     "Restored source is not visible after retirement.",
   );
   session.release().expect("Source release failed.");
+}
+
+/// Probes whether a z-only synchronous batch waits for a blocked app UI.
+///
+/// Uses unmanaged, nonactivating fixtures, then unblocks and destroys
+/// them.
+fn live_floating_batch_blocked_ui() {
+  floating_move_blocked_ui(true);
+}
+
+/// Probes synchronous band-preserving raises with changing callbacks
+/// suppressed.
+fn live_floating_move_blocked_ui() {
+  floating_move_blocked_ui(false);
+}
+
+/// Runs a blocked UI experiment and cleans up fixtures before asserting.
+fn floating_move_blocked_ui(use_batch: bool) {
+  use std::time::Instant;
+
+  use crate::WindowZOrder;
+
+  // SAFETY: Only reads the desktop's current foreground window.
+  let foreground = unsafe { GetForegroundWindow() };
+  let main_fixture = Fixture::new(
+    w!("GlazeWMFloatingBatchMain"),
+    BLACK_BRUSH,
+    &Rect::from_xy(60, 60, 60, 60),
+    WINDOW_EX_STYLE(0),
+  );
+  NativeWindow::from_handle(main_fixture.0 .0)
+    .set_z_order(&WindowZOrder::Normal)
+    .expect("normal fixture band");
+  let (ready_tx, ready_rx) = mpsc::channel();
+  let (unblock_tx, unblock_rx) = mpsc::channel();
+  let (stop_tx, stop_rx) = mpsc::channel();
+  let app_thread = std::thread::spawn(move || {
+    let fixture = Fixture::new(
+      w!("GlazeWMFloatingBatchBlocked"),
+      WHITE_BRUSH,
+      &Rect::from_xy(60, 60, 60, 60),
+      WINDOW_EX_STYLE(0),
+    );
+    NativeWindow::from_handle(fixture.0 .0)
+      .set_z_order(&WindowZOrder::Normal)
+      .expect("normal blocked fixture band");
+    ready_tx
+      .send(fixture.0 .0)
+      .expect("publish fixture identity");
+    unblock_rx.recv().expect("unblock fixture UI");
+    loop {
+      let mut message = MSG::default();
+      // SAFETY: Pumps only this fixture thread's own live messages.
+      unsafe {
+        while PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE)
+          .as_bool()
+        {
+          let _ = TranslateMessage(&raw const message);
+          DispatchMessageW(&raw const message);
+        }
+      }
+      match stop_rx.recv_timeout(Duration::from_millis(2)) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+      }
+    }
+  });
+  let blocked = ready_rx
+    .recv_timeout(Duration::from_secs(3))
+    .expect("fixture ready");
+  let handles = [main_fixture.0 .0, blocked];
+  let (result_tx, result_rx) = mpsc::channel();
+  let native_worker = std::thread::spawn(move || {
+    let started = Instant::now();
+    let mut initialization_message = MSG::default();
+    // SAFETY: Establishes this worker's GUI queue before using a deferred
+    // batch.
+    unsafe {
+      PeekMessageW(
+        &raw mut initialization_message,
+        None,
+        0,
+        0,
+        windows::Win32::UI::WindowsAndMessaging::PM_NOREMOVE,
+      )
+    };
+    let result = (|| -> windows::core::Result<()> {
+      // SAFETY: The two fixture HWNDs remain alive until this worker
+      // returns; only band-preserving z order changes occur, without
+      // activation.
+      unsafe {
+        if !use_batch {
+          for handle in handles {
+            SetWindowPos(
+              HWND(handle),
+              HWND_TOP,
+              0,
+              0,
+              0,
+              0,
+              SWP_NOMOVE
+                | SWP_NOSIZE
+                | SWP_NOACTIVATE
+                | SWP_NOOWNERZORDER
+                | SWP_NOSENDCHANGING
+                | SWP_NOREDRAW,
+            )?;
+          }
+          return Ok(());
+        }
+        let mut batch = BeginDeferWindowPos(2)
+          .inspect_err(|err| eprintln!("BeginDeferWindowPos: {err}"))?;
+        for handle in handles {
+          use windows::Win32::UI::WindowsAndMessaging::{
+            GetDesktopWindow, GetParent, GetWindowThreadProcessId,
+            IsWindow,
+          };
+          let mut process = 0;
+          eprintln!(
+            "fixture={handle:#x}, valid={}, parent={:?}, desktop={:?}, thread={}, process={}",
+            IsWindow(HWND(handle)).as_bool(),
+            GetParent(HWND(handle)),
+            GetDesktopWindow(),
+            GetWindowThreadProcessId(HWND(handle), Some(&raw mut process)),
+            process
+          );
+          batch = DeferWindowPos(
+            batch,
+            HWND(handle),
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+          )
+          .inspect_err(|err| {
+            eprintln!("DeferWindowPos({handle:#x}): {err}")
+          })?;
+        }
+        EndDeferWindowPos(batch)
+          .inspect_err(|err| eprintln!("EndDeferWindowPos: {err}"))
+      }
+    })();
+    result_tx
+      .send((started.elapsed(), result))
+      .expect("batch result");
+  });
+  let deadline = Instant::now() + Duration::from_secs(2);
+  let early_result = loop {
+    let mut message = MSG::default();
+    // SAFETY: Pumps only the main fixture thread's own messages.
+    unsafe {
+      while PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE).as_bool()
+      {
+        let _ = TranslateMessage(&raw const message);
+        DispatchMessageW(&raw const message);
+      }
+    }
+    match result_rx.recv_timeout(Duration::from_millis(2)) {
+      Ok(result) => break Some(result),
+      Err(mpsc::RecvTimeoutError::Disconnected) => {
+        panic!("native worker disconnected")
+      }
+      Err(mpsc::RecvTimeoutError::Timeout)
+        if Instant::now() >= deadline =>
+      {
+        break None;
+      }
+      Err(mpsc::RecvTimeoutError::Timeout) => {}
+    }
+  };
+  unblock_tx.send(()).expect("release blocked UI");
+  let completed_while_ui_blocked = early_result.is_some();
+  let result = early_result.unwrap_or_else(|| {
+    loop {
+      let mut message = MSG::default();
+      // SAFETY: Dispatches queued work to the main fixture, not other
+      // apps.
+      unsafe {
+        while PeekMessageW(&raw mut message, None, 0, 0, PM_REMOVE)
+          .as_bool()
+        {
+          let _ = TranslateMessage(&raw const message);
+          DispatchMessageW(&raw const message);
+        }
+      }
+      match result_rx.recv_timeout(Duration::from_millis(2)) {
+        Ok(result) => break result,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+          panic!("native worker disconnected")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+      }
+    }
+  });
+  stop_tx.send(()).expect("stop fixture UI");
+  native_worker.join().expect("native worker join");
+  app_thread.join().expect("fixture thread join");
+  result.1.expect("native batch accepted");
+  // SAFETY: Only observes foreground after both worker threads have
+  // stopped.
+  assert_eq!(
+    unsafe { GetForegroundWindow() },
+    foreground,
+    "batch stole foreground"
+  );
+  println!(
+    "z-only synchronous move use_batch={use_batch}, elapsed={:?}, completed_while_ui_blocked={completed_while_ui_blocked}",
+    result.0
+  );
+  if use_batch {
+    assert!(
+      !completed_while_ui_blocked,
+      "negative control unexpectedly stopped waiting for app UI"
+    );
+  } else {
+    assert!(
+      completed_while_ui_blocked,
+      "band-preserving raises waited for a blocked app UI"
+    );
+  }
 }

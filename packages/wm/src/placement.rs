@@ -143,22 +143,19 @@ fn leads_workspace(window: &WindowContainer) -> bool {
 /// workspace.
 fn workspace_peers(window: &WindowContainer) -> Vec<WindowId> {
   let id = window.id();
-  window
-    .workspace()
-    .map(|workspace| {
-      workspace
-        .descendants()
-        .filter_map(|container| container.as_window_container().ok())
-        .filter(|peer| {
-          peer.id() != id && peer.state() != WindowState::Minimized
-        })
-        .map(|peer| {
-          let native_id = peer.native().id();
-          native_id
-        })
-        .collect()
-    })
-    .unwrap_or_default()
+  window.workspace().map_or_default(|workspace| {
+    workspace
+      .descendants()
+      .filter_map(|container| container.as_window_container().ok())
+      .filter(|peer| {
+        peer.id() != id && peer.state() != WindowState::Minimized
+      })
+      .map(|peer| {
+        let native_id = peer.native().id();
+        native_id
+      })
+      .collect()
+  })
 }
 
 /// Resolves the window's requested opacity, before any concealment.
@@ -397,9 +394,27 @@ pub struct PlacementCoordinator {
   batch: u64,
   presented_frame: u64,
   clock_failed: bool,
+  /// Exists only after the opt-in policy submits its first native job.
+  #[cfg(target_os = "windows")]
+  stacking: Option<wm_platform::NativeStackingWorker>,
 }
 
 impl PlacementCoordinator {
+  /// Holds native commits until a serialized stacking job finishes.
+  pub fn stacking_busy(&self) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+      self
+        .stacking
+        .as_ref()
+        .is_some_and(wm_platform::NativeStackingWorker::is_busy)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      false
+    }
+  }
+
   /// Records a real compositor boundary, independent of any motion clock.
   pub fn presented(&mut self, frame: u64) {
     self.presented_frame = self.presented_frame.max(frame);
@@ -454,6 +469,9 @@ impl PlacementCoordinator {
 
   /// Returns the earliest outstanding recovery deadline.
   pub fn deadline(&self, paused: bool) -> Option<Instant> {
+    if self.stacking_busy() {
+      return None;
+    }
     if !paused && (self.layout_dirty || !self.dirty.is_empty()) {
       return Some(Instant::now());
     }
@@ -668,12 +686,137 @@ impl PlacementCoordinator {
   }
 }
 
+/// Detects a tiled peer preceding a floating peer in a native observation.
+#[cfg(target_os = "windows")]
+fn layer_violation(
+  order: &[WindowId],
+  floats: &[WindowId],
+  tiles: &[WindowId],
+) -> bool {
+  order.iter().position(|id| tiles.contains(id)).is_some_and(
+    |first_tile| {
+      order[first_tile + 1..].iter().any(|id| floats.contains(id))
+    },
+  )
+}
+
+/// Observes and submits the opt-in layer only after normal native
+/// reconciliation.
+#[cfg(target_os = "windows")]
+fn apply_floating_preference(state: &mut WmState) -> anyhow::Result<()> {
+  use wm_platform::{
+    floating_raise_plan, native_stacking_context, NativeWindowWindowsExt,
+  };
+  if state.animation_manager.has_presentations() {
+    return Ok(());
+  }
+  let mut actors = Vec::new();
+  let mut groups = Vec::new();
+  for monitor in state.monitors() {
+    let Some(workspace) = monitor.displayed_workspace() else {
+      continue;
+    };
+    let windows = workspace
+      .descendants()
+      .filter_map(|container| container.as_window_container().ok())
+      .filter(|window| window.display_state() == DisplayState::Shown)
+      .collect::<Vec<_>>();
+    if windows.iter().any(|window| {
+      matches!(window.state(), WindowState::Fullscreen(_))
+        && leads_workspace(window)
+    }) {
+      continue;
+    }
+    let participants = windows.iter().filter(|window| {
+      matches!(window.state(), WindowState::Tiling)
+        || matches!(window.state(), WindowState::Floating(floating) if !floating.shown_on_top)
+    }).collect::<Vec<_>>();
+    let mut floats = Vec::new();
+    let mut tiles = Vec::new();
+    let mut sessions = Vec::new();
+    let mut ready = true;
+    for window in participants {
+      let Some(entry) = state.native_sync.windows.get(&window.id()) else {
+        ready = false;
+        break;
+      };
+      if entry.retired
+        || entry.source.is_some()
+        || !entry.frame.settled()
+        || entry.visibility_pending
+        || !entry
+          .visibility
+          .as_ref()
+          .is_some_and(|(visible, _)| *visible)
+      {
+        ready = false;
+        break;
+      }
+      let session = entry.native.stacking_session()?;
+      if !session.stacking_ready()? {
+        ready = false;
+        break;
+      }
+      let native = session.window()?;
+      if !native.has_z_order(&WindowZOrder::Normal, &[]) {
+        continue;
+      }
+      if matches!(window.state(), WindowState::Floating(_)) {
+        floats.push(native.id());
+      } else {
+        tiles.push(native.id());
+      }
+      sessions.push(session);
+    }
+    if !ready || floats.is_empty() || tiles.is_empty() {
+      continue;
+    }
+    let ids = floats.iter().chain(&tiles).copied().collect::<Vec<_>>();
+    let order = state.dispatcher.stacking_order(&ids)?;
+    if order.len() != ids.len() {
+      continue;
+    }
+    if !layer_violation(&order, &floats, &tiles) {
+      continue;
+    }
+    actors.extend(sessions);
+    groups.push((floats, tiles));
+  }
+  if groups.is_empty() {
+    return Ok(());
+  }
+  let context = native_stacking_context()?;
+  if !groups.iter().any(|(floats, tiles)| {
+    floating_raise_plan(&context, floats, tiles)
+      .is_ok_and(|plan| !plan.is_empty())
+  }) {
+    return Ok(());
+  }
+  if state.native_sync.stacking.is_none() {
+    state.native_sync.stacking =
+      Some(wm_platform::NativeStackingWorker::start(
+        state.animation_manager.native_completion_wake(),
+      )?);
+  }
+  if let Some(worker) = &state.native_sync.stacking {
+    worker.submit(actors, groups, context)?;
+  }
+  Ok(())
+}
+
 /// Applies queued state through guarded native sessions.
 #[allow(clippy::too_many_lines)]
 pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
+  if state.native_sync.stacking_busy() {
+    return Ok(());
+  }
+  // A completion-only wake must not resubmit a rejected native preference.
+  #[cfg(target_os = "windows")]
+  let layer_trigger =
+    state.pending_sync.has_changes() || state.native_sync.has_pending();
   let timing = tracing::enabled!(tracing::Level::DEBUG);
   let sync_started = timing.then(Instant::now);
   let layout_changed = std::mem::take(&mut state.native_sync.layout_dirty);
@@ -853,6 +996,12 @@ pub fn platform_sync(
   }
   release_ready(state);
   state.animation_manager.begin_pending();
+  #[cfg(target_os = "windows")]
+  if layer_trigger && config.value.window_behavior.floating_above_tiled {
+    if let Err(error) = apply_floating_preference(state) {
+      tracing::debug!(?error, "Floating preference blocked.");
+    }
+  }
   state.pending_sync.clear();
   if let (Some(started), Some(snapshot), Some(order)) =
     (sync_started, t_snapshot, t_order)
@@ -2061,6 +2210,42 @@ mod tests {
   use wm_common::{FloatingStateConfig, FullscreenStateConfig};
 
   use super::*;
+
+  /// Keeps queued intent and suppresses recovery polling behind native
+  /// work.
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn floating_busy_barrier_preserves_pending_intent() {
+    let mut state = WmState::mock();
+    let config = UserConfig::mock_from_str(
+      "window_behavior:\n  floating_above_tiled: false\n",
+    )
+    .expect("in-memory config");
+    state.pending_sync.queue_focus_change();
+    state.native_sync.layout_dirty = true;
+    state.native_sync.stacking =
+      Some(wm_platform::NativeStackingWorker::mock_busy());
+    assert!(state.native_sync.deadline(false).is_none());
+    platform_sync(&mut state, &config)
+      .expect("barrier precedes layout/native work");
+    assert!(state.pending_sync.needs_focus_update());
+    assert!(state.native_sync.layout_dirty);
+  }
+
+  /// Detects violations without treating missing or empty observations as
+  /// rank.
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn floating_rank_probe_and_default_state() {
+    let float = WindowId(2);
+    let tile = WindowId(1);
+    assert!(layer_violation(&[tile, float], &[float], &[tile]));
+    assert!(!layer_violation(&[float, tile], &[float], &[tile]));
+    assert!(!layer_violation(&[], &[float], &[tile]));
+    let coordinator = PlacementCoordinator::default();
+    assert!(!coordinator.stacking_busy());
+    assert!(coordinator.stacking.is_none());
+  }
 
   /// Builds a fullscreen state with the given always-on-top preference.
   fn fullscreen(shown_on_top: bool) -> WindowState {

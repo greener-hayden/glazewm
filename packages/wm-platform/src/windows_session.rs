@@ -228,6 +228,16 @@ impl NativeSession {
     Ok(())
   }
 
+  /// Checks that a live source has no pending concealment or presentation.
+  pub fn stacking_ready(&self) -> crate::Result<bool> {
+    self.validate()?;
+    Ok(
+      property(&self.window, CHANGES)
+        & (PRESENTED | HIDDEN | CLOAK | PARKED | DECORATED)
+        == 0,
+    )
+  }
+
   /// Returns the guarded native window.
   pub fn window(&self) -> crate::Result<&NativeWindow> {
     self.validate()?;

@@ -118,14 +118,57 @@ impl WmState {
   /// accessibility round-trip in the application observer.
   const FOLLOW_DEBOUNCE: Duration = Duration::from_millis(120);
 
+  /// Creates state with the platform-aware animation manager.
   pub fn new(
     dispatcher: Dispatcher,
     event_tx: mpsc::UnboundedSender<WmEvent>,
     exit_tx: mpsc::UnboundedSender<()>,
   ) -> Self {
+    let animation_manager = AnimationManager::new(&dispatcher);
+    Self::with_animation_manager(
+      dispatcher,
+      animation_manager,
+      event_tx,
+      exit_tx,
+    )
+  }
+
+  /// Creates native-free test state with stopped dispatch and empty
+  /// channels.
+  #[cfg(test)]
+  pub(crate) fn mock() -> Self {
+    Self::mock_with_events().0
+  }
+
+  /// Creates native-free test state with stopped dispatch, and returns
+  /// the receiving end of its event channel.
+  ///
+  /// Events are emitted only after `mark_initialized`.
+  #[cfg(test)]
+  pub(crate) fn mock_with_events(
+  ) -> (Self, mpsc::UnboundedReceiver<WmEvent>) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (exit_tx, _) = mpsc::unbounded_channel();
+    let state = Self::with_animation_manager(
+      Dispatcher::mock(),
+      AnimationManager::mock(),
+      event_tx,
+      exit_tx,
+    );
+
+    (state, event_rx)
+  }
+
+  /// Initializes the shared state independently of animation construction.
+  fn with_animation_manager(
+    dispatcher: Dispatcher,
+    animation_manager: AnimationManager,
+    event_tx: mpsc::UnboundedSender<WmEvent>,
+    exit_tx: mpsc::UnboundedSender<()>,
+  ) -> Self {
     Self {
       root_container: RootContainer::new(),
-      animation_manager: AnimationManager::new(&dispatcher),
+      animation_manager,
       dispatcher,
       pending_sync: PendingSync::default(),
       layout_snapshot: crate::layout_snapshot::LayoutSnapshot::default(),

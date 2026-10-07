@@ -624,6 +624,20 @@ impl Dispatcher {
     platform_impl::focused_window(self)
   }
 
+  /// Observes the front-to-back native stacking order of requested
+  /// windows.
+  ///
+  /// Duplicate IDs are returned once; IDs for windows that no longer exist
+  /// are omitted. An empty result is valid when none of the requested
+  /// windows exists. Returns an error when the platform cannot observe
+  /// order.
+  pub fn stacking_order(
+    &self,
+    ids: &[crate::WindowId],
+  ) -> crate::Result<Vec<crate::WindowId>> {
+    platform_impl::stacking_order(ids, self)
+  }
+
   /// Gets the current cursor position.
   pub fn cursor_position(&self) -> crate::Result<Point> {
     #[cfg(target_os = "macos")]

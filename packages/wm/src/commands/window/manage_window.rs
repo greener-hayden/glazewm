@@ -193,6 +193,7 @@ fn check_is_manageable(
   Ok(Some(native_properties))
 }
 
+/// Acquires the nearest monitor before constructing a checked window.
 fn create_window(
   native_window: NativeWindow,
   native_properties: NativeWindowProperties,
@@ -204,13 +205,34 @@ fn create_window(
     .nearest_monitor(&native_window)
     .context("No nearest monitor.")?;
 
+  create_window_with_checked_monitor(
+    native_window,
+    native_properties,
+    target_parent,
+    &nearest_monitor,
+    state,
+    config,
+  )
+}
+
+/// Constructs and attaches a window from checked properties and monitor.
+///
+/// Native acquisition and manage rules remain the caller's responsibility.
+pub(crate) fn create_window_with_checked_monitor(
+  native_window: NativeWindow,
+  native_properties: NativeWindowProperties,
+  target_parent: Option<Container>,
+  nearest_monitor: &Monitor,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<WindowContainer> {
   let nearest_workspace = nearest_monitor
     .displayed_workspace()
     .context("No nearest workspace.")?;
 
   let gaps_config = config.value.gaps.clone();
   let window_state =
-    window_state_to_create(&native_properties, &nearest_monitor, config)?;
+    window_state_to_create(&native_properties, nearest_monitor, config)?;
 
   // Attach the new window as the first child of the target parent (if
   // provided), otherwise, split the focused tile.

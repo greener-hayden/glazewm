@@ -522,6 +522,16 @@ impl From<NativeWindow> for crate::NativeWindow {
   }
 }
 
+/// Reports native stacking order as unsupported on macOS.
+pub(crate) fn stacking_order(
+  _ids: &[WindowId],
+  _dispatcher: &Dispatcher,
+) -> crate::Result<Vec<WindowId>> {
+  Err(crate::Error::Platform(
+    "Native stacking-order observation is unsupported on macOS.".into(),
+  ))
+}
+
 /// Implements [`Dispatcher::visible_windows`].
 pub(crate) fn visible_windows(
   dispatcher: &Dispatcher,

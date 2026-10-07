@@ -30,40 +30,95 @@ pub fn resolve_lengths(
   mins: &[i32],
   total: i32,
 ) -> Vec<i32> {
-  let total = i64::from(total.max(0));
-  let mins = (0..sizes.len())
-    .map(|index| mins.get(index).copied().unwrap_or(0).max(0))
-    .collect::<Vec<_>>();
-  if mins.iter().map(|value| i64::from(*value)).sum::<i64>() >= total {
-    return mins;
+  if sizes.len() <= 4 {
+    let mut floors = [0; 4];
+    let mut weights = [0.0; 4];
+    let mut pinned = [false; 4];
+    let mut exact = [0.0; 4];
+    let mut order = [0; 4];
+    let count = sizes.len();
+    return resolve_lengths_with_scratch(
+      sizes,
+      mins,
+      total,
+      LengthScratch {
+        mins: &mut floors[..count],
+        weights: &mut weights[..count],
+        pinned: &mut pinned[..count],
+        exact: &mut exact[..count],
+        order: &mut order[..count],
+      },
+    );
   }
-  let weights = sizes
-    .iter()
-    .map(|size| {
-      if size.is_finite() && *size > 0.0 {
-        f64::from(*size)
-      } else {
-        0.0
-      }
-    })
-    .collect::<Vec<_>>();
+  let mut floors = vec![0; sizes.len()];
+  let mut weights = vec![0.0; sizes.len()];
   let mut pinned = vec![false; sizes.len()];
   let mut exact = vec![0.0; sizes.len()];
+  let mut order = vec![0; sizes.len()];
+  resolve_lengths_with_scratch(
+    sizes,
+    mins,
+    total,
+    LengthScratch {
+      mins: &mut floors,
+      weights: &mut weights,
+      pinned: &mut pinned,
+      exact: &mut exact,
+      order: &mut order,
+    },
+  )
+}
+
+/// Borrows per-call solver storage; never survives a layout operation.
+struct LengthScratch<'a> {
+  mins: &'a mut [i32],
+  weights: &'a mut [f64],
+  pinned: &'a mut [bool],
+  exact: &'a mut [f64],
+  order: &'a mut [usize],
+}
+
+/// Uses the same water-filling algorithm with stack or heap work storage.
+fn resolve_lengths_with_scratch(
+  sizes: &[f32],
+  minimums: &[i32],
+  total: i32,
+  scratch: LengthScratch<'_>,
+) -> Vec<i32> {
+  let total = i64::from(total.max(0));
+  let LengthScratch {
+    mins,
+    weights,
+    pinned,
+    exact,
+    order,
+  } = scratch;
+  for (index, size) in sizes.iter().enumerate() {
+    mins[index] = minimums.get(index).copied().unwrap_or(0).max(0);
+    weights[index] = if size.is_finite() && *size > 0.0 {
+      f64::from(*size)
+    } else {
+      0.0
+    };
+  }
+  if mins.iter().map(|value| i64::from(*value)).sum::<i64>() >= total {
+    return mins.to_vec();
+  }
   loop {
     let remaining = total
       - mins
         .iter()
-        .zip(&pinned)
+        .zip(pinned.iter())
         .filter(|(_, pinned)| **pinned)
         .map(|(min, _)| i64::from(*min))
         .sum::<i64>();
     let free = pinned.iter().filter(|pinned| !**pinned).count();
     if free == 0 {
-      return mins;
+      return mins.to_vec();
     }
     let weight = weights
       .iter()
-      .zip(&pinned)
+      .zip(pinned.iter())
       .filter(|(_, pinned)| !**pinned)
       .map(|(weight, _)| *weight)
       .sum::<f64>();
@@ -97,9 +152,14 @@ pub fn resolve_lengths(
     .iter()
     .map(|value| value.floor() as i32)
     .collect::<Vec<_>>();
-  let mut order = (0..sizes.len())
-    .filter(|index| !pinned[*index])
-    .collect::<Vec<_>>();
+  let mut free = 0;
+  for (index, is_pinned) in pinned.iter().enumerate() {
+    if !is_pinned {
+      order[free] = index;
+      free += 1;
+    }
+  }
+  let order = &mut order[..free];
   order.sort_by(|left, right| {
     exact[*right]
       .fract()
@@ -109,7 +169,8 @@ pub fn resolve_lengths(
   let remaining =
     total - lengths.iter().map(|length| i64::from(*length)).sum::<i64>();
   for index in order
-    .into_iter()
+    .iter()
+    .copied()
     .take(usize::try_from(remaining).unwrap_or(0))
   {
     lengths[index] += 1;
@@ -167,6 +228,146 @@ macro_rules! impl_position_getters_as_resizable {
 #[cfg(test)]
 mod tests {
   use super::resolve_lengths;
+
+  /// Frozen pre-optimization solver used only as a differential oracle.
+  fn reference_lengths(
+    sizes: &[f32],
+    mins: &[i32],
+    total: i32,
+  ) -> Vec<i32> {
+    let total = i64::from(total.max(0));
+    let mins = (0..sizes.len())
+      .map(|index| mins.get(index).copied().unwrap_or(0).max(0))
+      .collect::<Vec<_>>();
+    if mins.iter().map(|value| i64::from(*value)).sum::<i64>() >= total {
+      return mins;
+    }
+    let weights = sizes
+      .iter()
+      .map(|size| {
+        if size.is_finite() && *size > 0.0 {
+          f64::from(*size)
+        } else {
+          0.0
+        }
+      })
+      .collect::<Vec<_>>();
+    let mut pinned = vec![false; sizes.len()];
+    let mut exact = vec![0.0; sizes.len()];
+    loop {
+      let remaining = total
+        - mins
+          .iter()
+          .zip(&pinned)
+          .filter(|(_, pinned)| **pinned)
+          .map(|(min, _)| i64::from(*min))
+          .sum::<i64>();
+      let free = pinned.iter().filter(|pinned| !**pinned).count();
+      if free == 0 {
+        return mins;
+      }
+      let weight = weights
+        .iter()
+        .zip(&pinned)
+        .filter(|(_, pinned)| !**pinned)
+        .map(|(weight, _)| *weight)
+        .sum::<f64>();
+      let mut changed = false;
+      for index in 0..sizes.len() {
+        if pinned[index] {
+          exact[index] = f64::from(mins[index]);
+          continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let share = if weight > 0.0 {
+          weights[index] / weight
+        } else {
+          1.0 / free as f64
+        };
+        #[allow(clippy::cast_precision_loss)]
+        {
+          exact[index] = remaining as f64 * share;
+        }
+        if exact[index] < f64::from(mins[index]) {
+          pinned[index] = true;
+          changed = true;
+        }
+      }
+      if !changed {
+        break;
+      }
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let mut lengths = exact
+      .iter()
+      .map(|value| value.floor() as i32)
+      .collect::<Vec<_>>();
+    let mut order = (0..sizes.len())
+      .filter(|index| !pinned[*index])
+      .collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+      exact[*right]
+        .fract()
+        .total_cmp(&exact[*left].fract())
+        .then(left.cmp(right))
+    });
+    let remaining =
+      total - lengths.iter().map(|length| i64::from(*length)).sum::<i64>();
+    for index in order
+      .into_iter()
+      .take(usize::try_from(remaining).unwrap_or(0))
+    {
+      lengths[index] += 1;
+    }
+    lengths
+  }
+
+  /// Preserves the old solver across stack/heap, invalid weights, and
+  /// floors.
+  #[test]
+  fn scratch_solver_matches_reference() {
+    let weights = [
+      f32::NAN,
+      f32::INFINITY,
+      f32::NEG_INFINITY,
+      -1.0,
+      -0.0,
+      0.0,
+      f32::MIN_POSITIVE,
+      0.01,
+      0.25,
+      0.5,
+      1.0,
+      f32::MAX,
+    ];
+    let floors = [i32::MIN, -1, 0, 1, 3, 200, i32::MAX];
+    for count in 0..13usize {
+      for seed in 0..256usize {
+        let mut random = seed;
+        let sizes = (0..count)
+          .map(|_| {
+            random =
+              random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            weights[random % weights.len()]
+          })
+          .collect::<Vec<_>>();
+        let mins = (0..seed % (count + 2))
+          .map(|_| {
+            random =
+              random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            floors[random % floors.len()]
+          })
+          .collect::<Vec<_>>();
+        for total in [-1, 0, 1, 3, 31, 300, i32::MAX] {
+          assert_eq!(
+            resolve_lengths(&sizes, &mins, total),
+            reference_lengths(&sizes, &mins, total),
+            "count={count}, seed={seed}, total={total}"
+          );
+        }
+      }
+    }
+  }
 
   /// Distributes rounding residuals deterministically.
   #[test]

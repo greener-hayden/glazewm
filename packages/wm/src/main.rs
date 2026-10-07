@@ -24,9 +24,9 @@ use wm_common::{AppCommand, InvokeCommand, Verbosity, WmEvent};
 #[cfg(target_os = "macos")]
 use wm_platform::DispatcherExtMacOs;
 use wm_platform::{
-  Dispatcher, DisplayListener, EventLoop, KeybindingListener,
-  MouseEventKind, MouseListener, PlatformEvent, SingleInstance,
-  WindowListener,
+  DeadlineTimer, Dispatcher, DisplayListener, EventLoop,
+  KeybindingListener, MouseEventKind, MouseListener, PlatformEvent,
+  SingleInstance, WindowListener,
 };
 
 use crate::{
@@ -159,6 +159,10 @@ async fn start_wm(
     }
   }
 
+  // Created before any state is populated, so an early `?` here cannot
+  // skip the WM's cleanup.
+  let mut placement_timer = DeadlineTimer::new()?;
+
   // Parse and validate user config.
   let mut config = UserConfig::new(config_path)?;
 
@@ -228,8 +232,7 @@ async fn start_wm(
     );
     let topology_deadline = topology.deadline();
     let follow_deadline = wm.state.pending_follow_deadline();
-    let placement_deadline =
-      wm.state.native_sync.deadline(wm.state.is_paused);
+    placement_timer.set(wm.state.native_sync.deadline(wm.state.is_paused));
 
     let res = tokio::select! {
       _ = &mut ctrl_c => {
@@ -271,7 +274,7 @@ async fn start_wm(
         tracing::debug!("Received keyboard event: {:?}", event);
         wm.process_event(PlatformEvent::Keybinding(event), &mut config)
       }
-      () = wait_until(placement_deadline) => {
+      () = placement_timer.fired() => {
         wm.recover_placement(&config, SyncTrigger::Deadline)
       },
       _ = cleanup_interval.tick() => {

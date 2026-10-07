@@ -7,6 +7,7 @@ mod animation_window;
 // LINT: See `lib.rs`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod companion;
+mod deadline_timer;
 mod dispatcher;
 mod display;
 mod display_listener;
@@ -44,6 +45,7 @@ mod window_liveness;
 mod windows_session;
 
 pub use animation_window::*;
+pub use deadline_timer::*;
 pub use dispatcher::*;
 pub use display::*;
 pub use display_listener::*;

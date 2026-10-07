@@ -7,6 +7,7 @@ mod animation_window;
 // compiles everywhere so it stays testable.
 #[allow(dead_code)]
 mod companion;
+mod deadline_timer;
 mod dispatcher;
 mod display;
 mod display_listener;
@@ -49,6 +50,7 @@ pub mod test_utils;
 
 pub use animation_window::*;
 pub use companion::COMPANION_MARGIN_PX;
+pub use deadline_timer::*;
 pub use dispatcher::*;
 pub use display::*;
 pub use display_listener::*;

@@ -1024,6 +1024,11 @@ impl PlacementCoordinator {
     }
   }
 
+  /// Whether native focus is still waiting to be applied to a window.
+  pub fn has_pending_focus(&self) -> bool {
+    self.focus.is_some()
+  }
+
   /// Whether a commit has been asked for since the last sync.
   ///
   /// Only requests count: a layout redraw or a window queued for fresh

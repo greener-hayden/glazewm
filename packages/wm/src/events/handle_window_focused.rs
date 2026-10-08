@@ -1,6 +1,10 @@
+use std::time::Duration;
+
 use anyhow::Context;
 use tracing::info;
-use wm_common::{DisplayState, HideMethod, WindowRuleEvent, WmEvent};
+use wm_common::{
+  DisplayState, HideMethod, WindowRuleEvent, WindowState, WmEvent,
+};
 use wm_platform::NativeWindow;
 
 use crate::{
@@ -8,6 +12,7 @@ use crate::{
     container::set_focused_descendant, window::run_window_rules,
     workspace::focus_workspace,
   },
+  events::handle_window_minimize_ended,
   models::WorkspaceTarget,
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
@@ -19,6 +24,16 @@ pub fn handle_window_focused(
   state: &mut WmState,
   config: &mut UserConfig,
 ) -> anyhow::Result<()> {
+  // Windows can report a restored window's activation before its
+  // `MinimizeEnded` event. Settle the state first; otherwise the sync
+  // between the two events minimizes the window again.
+  if state
+    .window_from_native(native_window)
+    .is_some_and(|window| window.state() == WindowState::Minimized)
+  {
+    handle_window_minimize_ended(native_window, state, config)?;
+  }
+
   let found_window = state.window_from_native(native_window);
   let focused_container =
     state.focused_container().context("No focused container.")?;
@@ -126,11 +141,31 @@ pub fn handle_window_focused(
   Ok(())
 }
 
-/// Returns true if focus should be reassigned to the WM's focus container.
-fn should_override_focus(state: &WmState) -> bool {
-  let has_recent_unmanage = state
-    .unmanaged_or_minimized_timestamp
-    .is_some_and(|time| time.elapsed().as_millis() < 100);
+/// How long after a close or minimize the OS focus pick is always
+/// overridden.
+const OVERRIDE_FOCUS_WINDOW: Duration = Duration::from_millis(100);
 
-  has_recent_unmanage && !state.is_focus_synced
+/// Upper bound on overriding while the WM's own native focus change is
+/// still queued behind a blocker (e.g. a minimize in flight).
+const OVERRIDE_FOCUS_PENDING_LIMIT: Duration = Duration::from_millis(1000);
+
+/// Returns true if focus should be reassigned to the WM's focus container.
+///
+/// The OS picks its own window after a close or minimize. That event can
+/// arrive after the fixed window while the WM's native focus change is
+/// still pending, and adopting it would bounce focus from the OS pick
+/// back to the WM's target.
+fn should_override_focus(state: &WmState) -> bool {
+  let Some(elapsed) = state
+    .unmanaged_or_minimized_timestamp
+    .map(|time| time.elapsed())
+  else {
+    return false;
+  };
+
+  let is_recent = elapsed < OVERRIDE_FOCUS_WINDOW
+    || (elapsed < OVERRIDE_FOCUS_PENDING_LIMIT
+      && state.native_sync.has_pending_focus());
+
+  is_recent && !state.is_focus_synced
 }

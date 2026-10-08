@@ -36,6 +36,20 @@ pub fn handle_window_moved_or_resized(
   let found_window = state.window_from_native(native_window);
 
   if let Some(window) = found_window {
+    // Windows can report a restore's motion before its `MinimizeEnded`
+    // event. Settle the state first; otherwise the sync between the two
+    // events minimizes the window again.
+    #[cfg(target_os = "windows")]
+    if window.state() == WindowState::Minimized
+      && !window.native().is_minimized().unwrap_or(true)
+    {
+      return crate::events::handle_window_minimize_ended(
+        native_window,
+        state,
+        config,
+      );
+    }
+
     // The frame clock reconciles a window whose presentation it drives.
     // Native motion echoes each of its own writes, and queueing a commit
     // for each echo doubled the commits per frame. A tick is also what

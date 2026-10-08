@@ -230,6 +230,13 @@ impl MotionPreparation {
 #[derive(Default)]
 pub struct SourceLease {
   pub restoring: bool,
+  /// Whether a parked source has been sent to its destination while its
+  /// cover is still moving, because the cover now stands over it.
+  ///
+  /// The application then lays out at its new size during the last of
+  /// the motion instead of after it. Cleared with `restoring` when a new
+  /// motion takes the source over.
+  pub landing: bool,
 }
 
 #[cfg(test)]

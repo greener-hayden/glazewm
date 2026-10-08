@@ -16,6 +16,33 @@ const MAX_ATTEMPTS: u8 = 3;
 /// this bound.
 const APPLY_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How long a frame that used up its attempts rests before it is tried
+/// again.
+///
+/// An application that is busy drops writes it would otherwise take:
+/// Teams has been seen to answer nothing for seconds and then carry on.
+/// Giving up for good after three quick attempts leaves such a window
+/// wherever it stood, over its neighbours. The rest is long enough for a
+/// stall to pass, and for an application that really refuses a frame to
+/// have had its minimum size learned.
+const REST: Duration = Duration::from_secs(2);
+
+/// How many times a failed frame is tried again after resting. Bounded,
+/// so an application that insists on its own frame is not fought forever.
+const MAX_RESTS: u8 = 1;
+
+/// Furthest a window's right or bottom edge may stand from the one asked
+/// for, in pixels, and still count as the application rounding the size
+/// rather than refusing it.
+///
+/// Some applications do not take every size. A terminal keeps whole rows
+/// of text: kitty at full height on a 1200px display keeps its height
+/// when asked for 8px less, and takes 16px less. Such a window never
+/// matches its frame however often it is asked, so it is accepted where
+/// it stands. The bound is a row of large text; past it the window is
+/// refusing the size, which is what a minimum size looks like.
+pub const ROUNDING_SLACK: u32 = 24;
+
 /// A frame write the application has not been observed to apply.
 #[derive(Clone, Debug)]
 struct UnappliedWrite {
@@ -147,6 +174,19 @@ pub struct FrameReconciler {
   /// Survives `restart`: a retarget does not recall a write already
   /// queued on the application.
   unapplied: Option<UnappliedWrite>,
+  /// A frame accepted in place of the desired one, because the
+  /// application rounded the size it was asked for. See `ROUNDING_SLACK`.
+  rounded: Option<Rect>,
+  /// The state the window was last observed in.
+  ///
+  /// Survives `restart`, unlike `previous`: a new target says nothing
+  /// about the window's state.
+  last_state: Option<NativeState>,
+  /// When the frame used up its attempts, while it can still be tried
+  /// again after `REST`.
+  failed_at: Option<Instant>,
+  /// How many times the frame has been tried again after resting.
+  rests: u8,
 }
 
 impl FrameReconciler {
@@ -165,6 +205,7 @@ impl FrameReconciler {
       ReconcilePhase::Accepted => {
         self.accepted_at.map(|at| at + RETRY_WAIT)
       }
+      ReconcilePhase::Failed => self.failed_at.map(|at| at + REST),
       _ => None,
     }
   }
@@ -180,6 +221,10 @@ impl FrameReconciler {
       previous: None,
       stable_since: None,
       unapplied: None,
+      rounded: None,
+      last_state: None,
+      failed_at: None,
+      rests: 0,
     }
   }
 
@@ -201,6 +246,9 @@ impl FrameReconciler {
     self.accepted_frame_write = false;
     self.previous = None;
     self.stable_since = None;
+    self.rounded = None;
+    self.failed_at = None;
+    self.rests = 0;
   }
 
   /// Whether a request is still awaiting its outcome.
@@ -231,6 +279,30 @@ impl FrameReconciler {
   /// The state the window was last observed in, if it was observed.
   pub fn observed_state(&self) -> Option<NativeState> {
     self.previous.as_ref().map(|observed| observed.state)
+  }
+
+  /// The state the window was last observed in under any target, if it
+  /// ever was.
+  ///
+  /// For a pass that does not act on the state and so need not read it,
+  /// such as one over a window behind its overlay or under a drag.
+  pub fn last_state(&self) -> Option<NativeState> {
+    self.last_state
+  }
+
+  /// The state to assume for a window whose frame write is neither
+  /// confirmed nor due to be issued again at `now`.
+  ///
+  /// A frame write cannot change the state, so the one last observed
+  /// stands and need not be read. `None` once the write is confirmed or
+  /// its retry is due, when the state is read afresh.
+  pub fn awaited_state(&self, now: Instant) -> Option<NativeState> {
+    (self.frame_write_accepted()
+      && self
+        .accepted_at
+        .is_some_and(|at| now.saturating_duration_since(at) < RETRY_WAIT))
+    .then(|| self.observed_state())
+    .flatten()
   }
 
   /// Cancels pending mutations during user control.
@@ -295,8 +367,17 @@ impl FrameReconciler {
   }
 
   /// Terminates failed requests without declaring convergence.
+  ///
+  /// A request the platform rejected outright is not tried again after a
+  /// rest; that is for attempts an application did not act on.
   pub fn failed(&mut self) {
     self.phase = ReconcilePhase::Failed;
+    self.failed_at = None;
+  }
+
+  /// Whether the frame has failed and waits to be tried again.
+  pub fn resting(&self) -> bool {
+    self.phase == ReconcilePhase::Failed && self.failed_at.is_some()
   }
 
   /// Accepts an observation without issuing another native request.
@@ -320,6 +401,7 @@ impl FrameReconciler {
     {
       self.unapplied = None;
     }
+    self.last_state = Some(observed.state);
     if self.previous.as_ref() != Some(observed) {
       self.previous = Some(observed.clone());
       self.stable_since = Some(now);
@@ -338,6 +420,16 @@ impl FrameReconciler {
     now: Instant,
   ) -> Option<NativeRequest> {
     self.observe(observed, now);
+    // A failed frame gets its attempts back once it has rested.
+    if self.phase == ReconcilePhase::Failed
+      && self.failed_at.is_some_and(|at| now >= at + REST)
+    {
+      self.phase = ReconcilePhase::Pending;
+      self.attempts = 0;
+      self.accepted_at = None;
+      self.failed_at = None;
+      self.rests += 1;
+    }
     if matches!(
       self.phase,
       ReconcilePhase::Failed | ReconcilePhase::Suspended
@@ -356,6 +448,14 @@ impl FrameReconciler {
     {
       return None;
     }
+    // The application has had a full wait to take the last write and
+    // stands a rounding away from it. Asking again gets the same answer.
+    if self.accepted_at.is_some() && self.arrived(observed) {
+      self.rounded = Some(observed.rect.clone());
+      self.phase = ReconcilePhase::Converged;
+      self.accepted_at = None;
+      return None;
+    }
     // Keep at most one frame write queued on the application. The next
     // write carries the latest target, so skipped frames cost smoothness
     // on a slow application, never time.
@@ -368,6 +468,7 @@ impl FrameReconciler {
     }
     if self.attempts >= MAX_ATTEMPTS {
       self.phase = ReconcilePhase::Failed;
+      self.failed_at = (self.rests < MAX_RESTS).then_some(now);
       return None;
     }
     mutation.map(|mutation| NativeRequest {
@@ -379,6 +480,33 @@ impl FrameReconciler {
   /// Checks fresh state without advancing operations.
   pub fn converged(&self, observed: &ObservedFrame) -> bool {
     self.mutation(observed).is_none()
+  }
+
+  /// Whether the window stands where it was asked to, at the size asked
+  /// for or a rounding away from it (see `ROUNDING_SLACK`).
+  ///
+  /// Holds only once a frame has been written for the current target, so
+  /// a window that merely starts near its target does not count. Unlike
+  /// `converged`, this does not wait for an exact match that a rounding
+  /// application never gives. A parked target has to match exactly.
+  pub fn arrived(&self, observed: &ObservedFrame) -> bool {
+    self.attempts > 0
+      && self.in_place(observed)
+      && self.desired.parking_clamp.is_none()
+      && self.desired.rect.right.abs_diff(observed.rect.right)
+        <= ROUNDING_SLACK
+      && self.desired.rect.bottom.abs_diff(observed.rect.bottom)
+        <= ROUNDING_SLACK
+  }
+
+  /// Whether the window is in the normal state it was asked for, with
+  /// its top-left corner where its frame puts it, whatever its size.
+  pub fn in_place(&self, observed: &ObservedFrame) -> bool {
+    self.desired.state == NativeState::Normal
+      && observed.state == NativeState::Normal
+      && self.desired.dpi == observed.dpi
+      && self.desired.rect.left.abs_diff(observed.rect.left) <= 1
+      && self.desired.rect.top.abs_diff(observed.rect.top) <= 1
   }
 
   /// Chooses state before dependent geometry.
@@ -425,7 +553,10 @@ impl FrameReconciler {
           Some(clamp) => {
             parked_frames_match(&self.desired.rect, &observed.rect, clamp)
           }
-          None => frames_match(&self.desired.rect, &observed.rect),
+          None => {
+            frames_match(&self.desired.rect, &observed.rect)
+              || self.rounded.as_ref() == Some(&observed.rect)
+          }
         };
         (!placed || self.desired.dpi != observed.dpi)
           .then(|| NativeMutation::Frame(self.desired.rect.clone()))
@@ -466,7 +597,14 @@ impl FrameReconciler {
         {
           minimum
         }
-        None if actual > desired + 1 => actual,
+        // A miss within the slack is a rounded size, not a floor: the
+        // window takes smaller sizes than the one it kept.
+        None
+          if actual > desired
+            && actual.abs_diff(desired) > ROUNDING_SLACK =>
+        {
+          actual
+        }
         _ => 0,
       };
     let floor = (
@@ -877,7 +1015,49 @@ mod tests {
     }
     assert_eq!(writes, MAX_ATTEMPTS);
     assert_eq!(sync.phase, ReconcilePhase::Failed);
+
+    // It rests, and is owed one more round when the rest is over.
+    let failed_at = now + RETRY_WAIT * u32::from(MAX_ATTEMPTS + 1);
+    assert!(sync.resting());
+    assert_eq!(sync.deadline(), Some(failed_at + REST));
+    assert!(sync.next(&observed, failed_at + REST / 2).is_none());
+
+    let mut writes = 0;
+    for step in 0..=MAX_ATTEMPTS + 1 {
+      let at = failed_at + REST + RETRY_WAIT * u32::from(step);
+      if let Some(request) = sync.next(&observed, at) {
+        sync.accepted(&request, at);
+        writes += 1;
+      }
+    }
+    assert_eq!(writes, MAX_ATTEMPTS);
+
+    // After that it has failed for good.
+    assert_eq!(sync.phase, ReconcilePhase::Failed);
+    assert!(!sync.resting());
     assert_eq!(sync.deadline(), None);
+    assert!(sync.next(&observed, failed_at + REST * 4).is_none());
+  }
+
+  /// A window that an application placed late, after its frame failed,
+  /// converges without another write once it stands where it should.
+  #[test]
+  fn a_failed_frame_converges_if_the_window_arrives_late() {
+    let (mut sync, mut observed) = fixture();
+    let target = observed.rect.clone();
+    observed.rect.right += 100;
+    let now = Instant::now();
+    for step in 0..=MAX_ATTEMPTS {
+      let at = now + RETRY_WAIT * u32::from(step);
+      if let Some(request) = sync.next(&observed, at) {
+        sync.accepted(&request, at);
+      }
+    }
+    assert_eq!(sync.phase, ReconcilePhase::Failed);
+
+    observed.rect = target;
+    assert!(sync.next(&observed, now + REST * 2).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
   }
 
   /// Never positions natively minimized windows.
@@ -920,6 +1100,117 @@ mod tests {
     assert!(sync.converged(&observed));
   }
 
+  /// Writes a frame for `observed` at `now` and returns the request's
+  /// outcome as the window server reports it straight after.
+  fn write(
+    sync: &mut FrameReconciler,
+    observed: &ObservedFrame,
+    now: Instant,
+  ) {
+    let request = sync.next(observed, now).expect("Frame request.");
+    sync.accepted(&request, now);
+    sync.observe(observed, now);
+  }
+
+  /// A window that keeps 8px of height it was asked to give up, as kitty
+  /// does at full height, stands for its frame after one retry wait.
+  #[test]
+  fn accepts_a_rounded_size_after_the_retry_wait() {
+    let (mut sync, mut observed) = fixture();
+    observed.rect.bottom += 8;
+    let now = Instant::now();
+    write(&mut sync, &observed, now);
+    assert_eq!(sync.phase, ReconcilePhase::Accepted);
+    assert!(sync.arrived(&observed));
+
+    // Before the wait is over the application may still be laying out.
+    assert!(sync.next(&observed, now + RETRY_WAIT / 2).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Accepted);
+
+    assert!(sync.next(&observed, now + RETRY_WAIT).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+    assert!(sync.converged(&observed));
+
+    // Only the frame it answered with is accepted, not any near one.
+    observed.rect.bottom += 8;
+    assert!(!sync.converged(&observed));
+  }
+
+  /// A window that starts near its target has not been asked yet.
+  #[test]
+  fn writes_before_accepting_a_near_frame() {
+    let (mut sync, mut observed) = fixture();
+    observed.rect.right += 8;
+    assert!(!sync.arrived(&observed));
+    assert!(sync.next(&observed, Instant::now()).is_some());
+  }
+
+  /// A window that drifts after converging is asked again, even within
+  /// the slack, rather than accepted where it drifted to.
+  #[test]
+  fn writes_again_for_drift_within_the_slack() {
+    let (mut sync, mut observed) = fixture();
+    observed.rect.right += 100;
+    let now = Instant::now();
+    write(&mut sync, &observed, now);
+    observed.rect.right -= 100;
+    sync.observe(&observed, now);
+    assert_eq!(sync.phase, ReconcilePhase::Converged);
+
+    observed.rect.right += 8;
+    assert!(sync.next(&observed, now + RETRY_WAIT * 4).is_some());
+  }
+
+  /// Past the slack the window is refusing, and is asked again.
+  #[test]
+  fn retries_a_miss_past_the_slack() {
+    let (mut sync, mut observed) = fixture();
+    observed.rect.bottom += 100;
+    let now = Instant::now();
+    write(&mut sync, &observed, now);
+    assert!(!sync.arrived(&observed));
+    assert!(sync.next(&observed, now + RETRY_WAIT).is_some());
+  }
+
+  /// A window out of place has not arrived, whatever its size.
+  #[test]
+  fn has_not_arrived_out_of_place() {
+    let (mut sync, mut observed) = fixture();
+    observed.rect = observed.rect.translate_to_coordinates(500, 400);
+    write(&mut sync, &observed, Instant::now());
+    assert!(!sync.in_place(&observed));
+    assert!(!sync.arrived(&observed));
+  }
+
+  /// A new target forgets the last observation but not the state seen.
+  #[test]
+  fn keeps_the_last_state_across_a_restart() {
+    let (mut sync, observed) = fixture();
+    assert_eq!(sync.last_state(), None);
+
+    sync.observe(&observed, Instant::now());
+    sync.suspend();
+    assert_eq!(sync.observed_state(), None);
+    assert_eq!(sync.last_state(), Some(NativeState::Normal));
+  }
+
+  /// The state is not read again while a frame write is outstanding.
+  #[test]
+  fn assumes_the_state_while_a_frame_write_is_outstanding() {
+    let (mut sync, mut observed) = fixture();
+    let now = Instant::now();
+    assert_eq!(sync.awaited_state(now), None);
+
+    observed.rect.left += 100;
+    write(&mut sync, &observed, now);
+    assert_eq!(sync.awaited_state(now), Some(NativeState::Normal));
+    assert_eq!(sync.awaited_state(now + RETRY_WAIT), None);
+
+    observed.rect.left -= 100;
+    sync.observe(&observed, now);
+    assert_eq!(sync.awaited_state(now), None);
+  }
+
   /// Suspends all mutations during interactive control.
   #[test]
   fn cancels_for_drag() {
@@ -951,6 +1242,24 @@ mod tests {
     assert_eq!(sync.constraint(&observed, Some((700, 300)), at), None);
     observed.dpi = 144;
     assert_eq!(sync.constraint(&observed, Some((500, 300)), at), None);
+  }
+
+  /// A window that keeps a few pixels and is also out of place fails,
+  /// but the pixels it kept are a rounded size and not a floor.
+  #[test]
+  fn does_not_learn_a_floor_from_a_rounded_size() {
+    let (mut sync, mut observed) = fixture();
+    observed.rect = Rect::from_xy(40, 20, 400, 308);
+    let now = Instant::now();
+    for step in 0..MAX_ATTEMPTS {
+      let at = now + RETRY_WAIT * u32::from(step);
+      let request = sync.next(&observed, at).expect("Retry request.");
+      sync.accepted(&request, at);
+    }
+    let at = now + RETRY_WAIT * 4;
+    assert!(sync.next(&observed, at).is_none());
+    assert_eq!(sync.phase, ReconcilePhase::Failed);
+    assert_eq!(sync.constraint(&observed, None, at), None);
   }
 
   /// Creates a target parked below a 1080px display, with its clamp.

@@ -20,7 +20,10 @@ use crate::{
   animation_manager::{
     AnimationPlan, AnimationTrigger, MotionStart, WindowChange,
   },
-  models::{Container, Monitor, NativeMonitorProperties, WindowContainer},
+  models::{
+    Container, MinSizeSource, Monitor, NativeMonitorProperties,
+    WindowContainer,
+  },
   native_reconciler::{
     DesiredFrame, FrameReconciler, NativeMutation, NativeState,
     ObservePlan, ObservedFrame, ReconcilePhase,
@@ -298,8 +301,13 @@ fn reconcile_candidates(
         workspace: window.workspace().context("No workspace.")?.id(),
         retired: entry.is_some_and(|entry| entry.retired),
         redraw: redraw.contains(&id),
+        // A failed frame that rests is owed a pass when its rest is
+        // over, which its deadline starts. It is not settling: the
+        // window is the user's to move meanwhile.
         pending: entry.is_some_and(|entry| {
-          entry.settling() || entry.visibility_pending
+          entry.settling()
+            || entry.visibility_pending
+            || entry.frame.resting()
         }),
         dirty: dirty.contains(&id),
         planned: plans.contains_key(&id),
@@ -461,11 +469,30 @@ const COMPANION_HANDOVER: Duration = Duration::from_millis(50);
 /// tick arrives.
 const COMPANION_POLL: Duration = Duration::from_millis(4);
 
+/// Longest a still overlay stands in for a window that is in place but
+/// has not taken the size it was asked for.
+///
+/// The destination frame is written when the motion ends, so until the
+/// application has laid out at the new size its window shows the old
+/// one. That takes kitty 30 to 60ms and a browser 40 to 100ms. Past this
+/// the window is shown as it is: it is slow, or it will not take the
+/// size, and a late resize of a live window reads better than a picture
+/// of it that no longer answers.
+///
+/// The limit is checked once per pass, and a pass of several windows
+/// takes up to 50ms, so with the frame the overlay takes to retire this
+/// keeps a handover under 150ms.
+const HANDOVER_LIMIT: Duration = Duration::from_millis(75);
+
 /// Holds an overlay until its source is composed again.
 #[derive(Clone, Copy, Debug)]
 struct RetireFence {
   /// The overlay retires only after a compositor frame later than this.
-  after: u64,
+  /// `None` for a source that stood drawn before it was released.
+  after: Option<u64>,
+  /// Whether companions have to be seen revealed before the overlay
+  /// retires.
+  awaits_companions: bool,
   /// When the source was restored, which starts the companion hold.
   since: Instant,
   /// The compositor frame current when the companions were first seen
@@ -481,10 +508,25 @@ impl RetireFence {
   /// Creates a fence for a source restored at `since`.
   fn new(after: u64, since: Instant) -> Self {
     Self {
-      after,
+      after: Some(after),
+      awaits_companions: true,
       since,
       revealed_at: None,
     }
+  }
+
+  /// Marks the fence as having no companion to wait for, so the overlay
+  /// retires as soon as the source is composed.
+  fn without_companions(mut self) -> Self {
+    self.awaits_companions = false;
+    self
+  }
+
+  /// Marks the source as already drawn where it stands, so the fence
+  /// waits for no compositor frame on its account.
+  fn already_composed(mut self) -> Self {
+    self.after = None;
+    self
   }
 
   /// Whether the overlay may retire.
@@ -499,10 +541,10 @@ impl RetireFence {
     now: Instant,
     revealed: impl FnOnce() -> bool,
   ) -> bool {
-    if compositor_frame <= self.after {
+    if self.after.is_some_and(|after| compositor_frame <= after) {
       return false;
     }
-    if now >= self.since + COMPANION_HANDOVER {
+    if !self.awaits_companions || now >= self.since + COMPANION_HANDOVER {
       return true;
     }
     if let Some(frame) = self.revealed_at {
@@ -521,7 +563,7 @@ impl RetireFence {
   /// saw the companions revealed. Between the two, and past the hold, it
   /// is rechecked by `recheck_at` instead.
   fn frame_gate(&self, from: u64) -> Option<u64> {
-    [Some(self.after), self.revealed_at]
+    [self.after, self.revealed_at]
       .into_iter()
       .flatten()
       .filter(|gate| *gate >= from)
@@ -539,7 +581,9 @@ impl RetireFence {
     compositor_frame: u64,
     now: Instant,
   ) -> Option<Instant> {
-    (compositor_frame > self.after)
+    self
+      .after
+      .is_none_or(|after| compositor_frame > after)
       .then(|| (now + COMPANION_POLL).min(self.since + COMPANION_HANDOVER))
   }
 }
@@ -588,8 +632,59 @@ struct ManagedWindow {
   /// When the reveal of the source began waiting for its cover to show
   /// where the source now stands. Bounded by `PREPARATION_LIMIT`.
   cover_hold: Option<Instant>,
+  /// The handover in progress, timed for the `handover` perf line.
+  handover: Option<Handover>,
   /// Native work queued on worker threads, and what waits on it.
   shell: ShellState,
+}
+
+/// Times one handover: from the end of a motion, through the release of
+/// the source, to the retirement of its overlay.
+///
+/// This is the time a still overlay stands in for a window that has
+/// finished moving, which no single pass measures.
+#[derive(Debug)]
+struct Handover {
+  /// When the motion ended and the source began restoring.
+  since: Instant,
+  /// Passes made while the source was restoring.
+  passes: u32,
+  /// Frame writes issued while the source was restoring.
+  writes: u32,
+  /// When the source was released, and the phase its frame had reached.
+  released: Option<(Instant, ReconcilePhase)>,
+}
+
+impl Handover {
+  /// Starts timing a handover that began at `since`.
+  fn new(since: Instant) -> Self {
+    Self {
+      since,
+      passes: 0,
+      writes: 0,
+      released: None,
+    }
+  }
+
+  /// Logs the handover, ending at `now` with the overlay gone.
+  ///
+  /// Always at `INFO`: one line per animated window, and the fast ones
+  /// are what a slow one is judged against.
+  fn report(&self, id: &Uuid, app: &str, now: Instant) {
+    let (released, phase) =
+      self.released.unwrap_or((now, ReconcilePhase::Pending));
+    perf::emit(
+      true,
+      format_args!(
+        "handover window={id} app={app} release_ms={:.1} retire_ms={:.1} \
+         passes={} writes={} frame={phase:?}",
+        perf::millis(released.saturating_duration_since(self.since)),
+        perf::millis(now.saturating_duration_since(self.since)),
+        self.passes,
+        self.writes,
+      ),
+    );
+  }
 }
 
 /// Native work queued on worker threads for one window.
@@ -1187,6 +1282,12 @@ impl PlacementCoordinator {
       .then(|| Instant::now() + Duration::from_millis(250));
   }
 
+  /// Where a managed window stands now, read without asking its
+  /// application. `None` for a window that is not managed, or is gone.
+  pub fn observed_frame(&self, id: Uuid) -> Option<Rect> {
+    self.windows.get(&id)?.native.observed_frame().ok()
+  }
+
   /// Reports geometry currently owned by reconciliation.
   pub fn owns_geometry(&self, id: Uuid) -> bool {
     self.windows.get(&id).is_some_and(ManagedWindow::settling)
@@ -1748,6 +1849,15 @@ pub fn platform_sync(
   }
   release_ready(state);
   state.animation_manager.begin_pending();
+  // A motion launched here has had no pass to schedule its landing.
+  for (id, entry) in &mut state.native_sync.windows {
+    if let Some(at) =
+      landing_deadline(entry, id, Instant::now(), &state.animation_manager)
+    {
+      entry.retry_at =
+        Some(entry.retry_at.map_or(at, |retry| retry.min(at)));
+    }
+  }
   #[cfg(target_os = "windows")]
   if layer_trigger && config.value.window_behavior.floating_above_tiled {
     if let Err(error) = apply_floating_preference(state) {
@@ -2247,7 +2357,9 @@ fn reconcile_frame(
     entry.frame.apply(&request, now, |mutation| {
       match mutation {
         NativeMutation::Frame(rect) => {
-          entry.native.set_frame_on_display(rect, &monitor)?;
+          entry
+            .native
+            .set_frame_from(rect, &monitor, &observed.rect)?;
           placed(rect);
         }
         NativeMutation::Restore(rect) => entry.native.restore(rect)?,
@@ -2654,6 +2766,50 @@ fn settle_decoration(
   Ok(fence.recheck_at(compositor_frame, now))
 }
 
+/// Whether a source that has stood under covers since its motion began
+/// is where it should be, beneath a cover that has all but stopped.
+///
+/// The rest of the motion is a spring settling too slowly to see, and
+/// the application has had the whole motion to lay out. Handing over now
+/// spares a still picture standing in for a window that is ready.
+fn settled(
+  entry: &ManagedWindow,
+  id: &Uuid,
+  observed: &ObservedFrame,
+  now: Instant,
+  animations: &crate::animation_manager::AnimationManager,
+) -> bool {
+  entry
+    .source
+    .as_ref()
+    .is_some_and(|source| source.landing && !source.restoring)
+    && animations.settled_at(id).is_some_and(|at| now >= at)
+    && (entry.frame.converged(observed) || entry.frame.arrived(observed))
+}
+
+/// When a concealed source next needs a pass that nothing else starts:
+/// to be sent to its destination, if it is parked and its cover is about
+/// to stand over it, or to be handed over, if it waits under covers for
+/// its cover to all but stop. `None` otherwise.
+fn landing_deadline(
+  entry: &ManagedWindow,
+  id: &Uuid,
+  now: Instant,
+  animations: &crate::animation_manager::AnimationManager,
+) -> Option<Instant> {
+  let source = entry.source.as_ref().filter(|source| !source.restoring)?;
+  if !entry.native.uses_parking() {
+    return None;
+  }
+  if source.landing {
+    // Once this has passed, the frame's own passes or the end of the
+    // motion hand the window over.
+    animations.settled_at(id).filter(|at| *at > now)
+  } else {
+    animations.landing_at(id)
+  }
+}
+
 fn begin_handoff(
   entry: &mut ManagedWindow,
   id: &Uuid,
@@ -2668,6 +2824,9 @@ fn begin_handoff(
   entry.cancelled = false;
   state.animation_manager.finish_animation(id)?;
   if let Some(source) = &mut entry.source {
+    if !source.restoring {
+      entry.handover = Some(Handover::new(now));
+    }
     source.restoring = true;
   } else if state.animation_manager.has_overlay(id) {
     entry
@@ -2788,9 +2947,10 @@ fn reconcile_window(
         }
       };
     let conceal = native.conceal_method();
-    let source = native
-      .opening_concealed()
-      .then_some(SourceLease { restoring: true });
+    let source = native.opening_concealed().then_some(SourceLease {
+      restoring: true,
+      landing: false,
+    });
     slot.insert(ManagedWindow {
       native,
       frame: FrameReconciler::new(desired),
@@ -2812,6 +2972,7 @@ fn reconcile_window(
       retired: false,
       recovery_at: None,
       cover_hold: None,
+      handover: None,
       shell: ShellState::default(),
     });
   }
@@ -2864,9 +3025,43 @@ fn reconcile_managed(
   let id = window.id();
   let monitor = owner.native_properties();
   let mut timer = PassTimer::start();
-  entry.native.validate()?;
   entry.retry_at = None;
-  let mut observed = observe(&entry.native)?;
+  // While a frame write is outstanding the application is laying out,
+  // and a read that asks it waits for that to end, holding up every
+  // window after this one. Geometry alone is read until the write is
+  // confirmed or due again, from the list the pass shares; a window that
+  // is gone fails that read too.
+  // Nor is the application asked while its window has an overlay: one
+  // being prepared, one it stands behind, or one that is only left to
+  // retire. Those passes come once a frame, and each would otherwise
+  // queue behind the layout the motion or its handover started, or stall
+  // a whole batch behind one application that is slow to answer. A new
+  // plan reads the state afresh.
+  //
+  // The same holds for a window the user is dragging, whose frame this
+  // pass does not write. Its application is busy resizing, and a pass
+  // that waits for it holds back the very move events the drag is
+  // followed by.
+  let covered = plan.is_none()
+    && (dragging
+      || entry.motion.is_some()
+      || entry.source.is_some()
+      || entry.retire_after.is_some());
+  let awaited = entry
+    .frame
+    .awaited_state(now)
+    .or_else(|| covered.then(|| entry.frame.last_state()).flatten())
+    .filter(|_| PlacementSession::STATE_READS_ASK_APP);
+  let mut observed = if let Some(state) = awaited {
+    ObservedFrame {
+      rect: entry.native.observed_frame_in(on_screen)?,
+      dpi: entry.native.dpi()?,
+      state,
+    }
+  } else {
+    entry.native.validate()?;
+    observe(&entry.native)?
+  };
   timer.mark("observe");
   // A cancellation raised before this commit (invalidation, a lost clock,
   // a failed launch) ends the motion it was raised against. The plan this
@@ -2927,11 +3122,13 @@ fn reconcile_managed(
       // A source still concealed behind its cover has nothing to wait for,
       // so a retarget continues the motion at once. One being restored may
       // already show; its cover holds until it is concealed again.
-      let start = if entry
-        .source
-        .as_ref()
-        .is_some_and(|source| !source.restoring)
-      {
+      // Nor does one already sent to its destination: it shows wherever
+      // its cover no longer stands.
+      // Unless covers hide it there, and where the new motion ends.
+      let covered = state.animation_manager.is_covered(&id);
+      let start = if entry.source.as_ref().is_some_and(|source| {
+        !source.restoring && (!source.landing || covered)
+      }) {
         MotionStart::Immediate
       } else {
         MotionStart::Held
@@ -2988,8 +3185,10 @@ fn reconcile_managed(
             )
           });
           entry.retire_after = None;
+          entry.handover = None;
           if let Some(source) = &mut entry.source {
             source.restoring = false;
+            source.landing = false;
           }
           tracing::debug!(window = %id, trigger = ?plan.trigger, covered, ?start, prepare_us, "Presentation overlay prepared.");
         }
@@ -3047,6 +3246,7 @@ fn reconcile_managed(
       .and_then(MotionOwner::preparation)
       .is_some_and(|motion| now >= motion.deadline)
     || state.animation_manager.is_complete(&id)
+    || settled(entry, &id, &observed, now, &state.animation_manager)
     || entry.cancelled
   {
     begin_handoff(entry, &id, state, sampled_frame, now)?;
@@ -3076,8 +3276,34 @@ fn reconcile_managed(
     && native_state != NativeState::Minimized
     && (entry.native.uses_parking()
       || *hide_method == HideMethod::PlaceInCorner);
-  let parked =
-    hidden_parking || (suppressing && entry.native.uses_parking());
+  // A source that would be parked is instead sent to its destination
+  // where that is hidden: at once under covers over where it stands and
+  // where it is going, so the application has the whole motion to lay
+  // out, or else once its cover stands over the destination. Other
+  // sources are concealed where they stand and need no such step.
+  if suppressing && entry.native.uses_parking() {
+    let covered = state.animation_manager.is_covered(&id);
+    let landed = covered
+      || state
+        .animation_manager
+        .landing_at(&id)
+        .is_some_and(|at| now >= at);
+    if let Some(source) = entry
+      .source
+      .as_mut()
+      .filter(|source| landed && !source.landing)
+    {
+      // The covers go up before the write that moves the window.
+      if covered {
+        state.animation_manager.show_covers(&id);
+      }
+      source.landing = true;
+    }
+  }
+  let landing = suppressing
+    && entry.source.as_ref().is_some_and(|source| source.landing);
+  let parked = hidden_parking
+    || (suppressing && entry.native.uses_parking() && !landing);
   // Visible geometry the real window follows instead of its tile: its own
   // native motion, a cover that holds it in place, or, for a move held
   // behind a cover, where that cover ends. Holding it there lets the
@@ -3126,6 +3352,15 @@ fn reconcile_managed(
     entry.frame.suspend();
   } else if entry.frame.phase == ReconcilePhase::Suspended {
     entry.frame.restart();
+  }
+  // A covered window that has reached its destination has left where it
+  // stood, so the covers there have nothing left to hide. Kept longer,
+  // they would hide a window that took its place and was handed over
+  // first.
+  if landing
+    && (entry.frame.converged(&observed) || entry.frame.arrived(&observed))
+  {
+    state.animation_manager.uncover_origin(&id);
   }
   timer.mark("desired");
 
@@ -3201,14 +3436,19 @@ fn reconcile_managed(
   timer.mark("conceal");
   if !retaining_source && !dragging && conceal_gate.permits_write() {
     let animations = &mut state.animation_manager;
+    let mut writes = 0;
     observed = reconcile_frame(
       entry,
       now,
       OBSERVATION_HOLDS_THROUGH_PASS.then_some(observed),
       |rect| {
+        writes += 1;
         animations.draw_decoration(&id, rect);
       },
     )?;
+    if let Some(handover) = &mut entry.handover {
+      handover.writes += writes;
+    }
   } else if retaining_source {
     entry.frame.observe(&observed, now);
   }
@@ -3227,11 +3467,10 @@ fn reconcile_managed(
       && visible
       && matches!(window.state(), WindowState::Tiling)
     {
-      if let Some(mut minimum) = entry.frame.constraint(
-        &observed,
-        entry.native.minimum_size()?,
-        now,
-      ) {
+      let hint = entry.native.minimum_size()?;
+      if let Some(mut minimum) =
+        entry.frame.constraint(&observed, hint, now)
+      {
         let tile = state.layout_snapshot.rect(id)?;
         if minimum.0 > 0 {
           minimum.0 = (minimum.0 - (target.width() - tile.width())).max(0);
@@ -3240,16 +3479,28 @@ fn reconcile_managed(
           minimum.1 =
             (minimum.1 - (target.height() - tile.height())).max(0);
         }
-        if window.native_properties().min_size != Some(minimum) {
+        // Without a hint the floor is only what the window was seen to
+        // keep, which a resize the user asks for re-tests.
+        let source = if hint.is_some() {
+          MinSizeSource::Reported
+        } else {
+          MinSizeSource::Inferred
+        };
+        let properties = window.native_properties();
+        if (properties.min_size, properties.min_size_source)
+          != (Some(minimum), source)
+        {
           tracing::warn!(
             window = %id,
             ?minimum,
+            ?source,
             observed = ?observed.rect,
             desired = ?entry.frame.desired.rect,
             "Learned size floor."
           );
           window.update_native_properties(|properties| {
             properties.min_size = Some(minimum);
+            properties.min_size_source = source;
           });
           state.native_sync.layout_dirty = true;
         }
@@ -3311,10 +3562,12 @@ fn reconcile_managed(
     // The source counts as concealed only once its concealment landed.
     // A queued cloak or style change is not yet concealing it, and a slide
     // started now would show the source and its cover together.
+    // A source under covers is out of sight wherever it stands, so its
+    // motion need not wait for it to get anywhere.
     motion.observe(
       entry.frame.generation,
       suppressing
-        && converged
+        && (converged || landing)
         && !entry.visibility_pending
         && !awaiting_conceal,
       sampled_frame,
@@ -3322,6 +3575,18 @@ fn reconcile_managed(
   }
   let restoring =
     entry.source.as_ref().is_some_and(|source| source.restoring);
+  if restoring {
+    if let Some(handover) = &mut entry.handover {
+      handover.passes += 1;
+    }
+    tracing::debug!(
+      window = %id,
+      phase = ?entry.frame.phase,
+      observed = ?observed.rect,
+      desired = ?entry.frame.desired.rect,
+      "Restoring source."
+    );
+  }
   // Failed restoration cannot relinquish a source that is still parked.
   // The retained native session will retry recovery at its own deadline.
   if restoring
@@ -3340,10 +3605,20 @@ fn reconcile_managed(
   if native_state == NativeState::Minimized && converged {
     entry.visibility_pending = false;
   }
+  // A window that rounds its size never converges, and one that is slow
+  // to lay out converges late. Either is shown once it stands in place:
+  // at once within a rounding of its size, else at `HANDOVER_LIMIT`.
+  let overdue = entry
+    .handover
+    .as_ref()
+    .is_some_and(|handover| now >= handover.since + HANDOVER_LIMIT)
+    && entry.frame.in_place(&observed);
   let mut revealing = restoring
     && (converged
       || dragging
-      || entry.frame.phase == ReconcilePhase::Failed)
+      || entry.frame.phase == ReconcilePhase::Failed
+      || entry.frame.arrived(&observed)
+      || overdue)
     && !entry.visibility_pending;
   if !revealing {
     entry.cover_hold = None;
@@ -3357,7 +3632,7 @@ fn reconcile_managed(
     if visible && native_state != NativeState::Minimized {
       state
         .animation_manager
-        .place_overlay(&id, &entry.native.window()?.frame()?)?;
+        .place_overlay(&id, &entry.native.shown_frame(&observed.rect)?)?;
     }
     // The cover was only queued to stand here. The source stays
     // concealed until it does, and the retry deadline below keeps the
@@ -3402,10 +3677,30 @@ fn reconcile_managed(
       // Preparation can fail after concealing but before creating an
       // overlay. There is then nothing to retire and no running frame
       // clock to acknowledge a retirement fence.
-      entry.retire_after = state
-        .animation_manager
-        .has_overlay(&id)
-        .then(|| RetireFence::new(sampled_frame, now));
+      entry.retire_after =
+        state.animation_manager.has_overlay(&id).then(|| {
+          let mut fence = RetireFence::new(sampled_frame, now);
+          if !PlacementSession::RELEASE_IS_COMPOSED_LATER {
+            fence = fence.already_composed();
+          }
+          if !state.animation_manager.awaits_companions(&id) {
+            fence = fence.without_companions();
+          }
+          fence
+        });
+      if let Some(handover) = &mut entry.handover {
+        handover.released = Some((Instant::now(), entry.frame.phase));
+      }
+      // Without an overlay there is no retirement to wait for.
+      if entry.retire_after.is_none() {
+        if let Some(handover) = entry.handover.take() {
+          handover.report(
+            &id,
+            &window.native_properties().process_name,
+            Instant::now(),
+          );
+        }
+      }
       tracing::debug!(window = %id, "Presentation source restored.");
     }
   }
@@ -3429,6 +3724,13 @@ fn reconcile_managed(
       state.animation_manager.retire_overlay(&id)?;
       entry.retire_after = None;
       state.native_sync.overlay_retired(id);
+      if let Some(handover) = entry.handover.take() {
+        handover.report(
+          &id,
+          &window.native_properties().process_name,
+          Instant::now(),
+        );
+      }
     } else if let Some(at) = fence.recheck_at(compositor_frame, now) {
       companion_recheck = Some(
         companion_recheck.map_or(at, |recheck: Instant| recheck.min(at)),
@@ -3437,6 +3739,14 @@ fn reconcile_managed(
   }
   if entry.visibility_pending || (restoring && entry.source.is_some()) {
     entry.retry_at = Some(now + Duration::from_millis(250));
+  }
+  // Nothing else starts a pass while a cover moves, so the landing of
+  // its source is a deadline.
+  if let Some(at) =
+    landing_deadline(entry, &id, now, &state.animation_manager)
+  {
+    entry.retry_at =
+      Some(entry.retry_at.map_or(at, |retry| retry.min(at)));
   }
   // The frame clock can stop once nothing changes on screen; the recovery
   // deadline ends the hold regardless.
@@ -4424,6 +4734,36 @@ mod tests {
     );
   }
 
+  /// A source that stood drawn before its release needs no frame, so
+  /// its overlay waits only for companions, and for nothing without any.
+  #[test]
+  fn retire_fence_for_a_composed_source_skips_the_frame() {
+    let since = Instant::now();
+    let mut fence = RetireFence::new(10, since)
+      .already_composed()
+      .without_companions();
+    assert!(fence.due(10, since, || panic!("no companion to look for")));
+
+    let mut fence = RetireFence::new(10, since).already_composed();
+    assert_eq!(fence.recheck_at(10, since), Some(since + COMPANION_POLL));
+    assert!(!fence.due(10, since, || false));
+    assert!(!fence.due(10, since, || true));
+    assert!(fence.due(11, since, || panic!("reveal already recorded")));
+
+    let mut fence = RetireFence::new(10, since).already_composed();
+    assert!(fence.due(10, since + COMPANION_HANDOVER, || false));
+  }
+
+  /// With no companion to wait for, the overlay retires on the first
+  /// frame composed after the source was released.
+  #[test]
+  fn retire_fence_without_companions_waits_one_frame() {
+    let since = Instant::now();
+    let mut fence = RetireFence::new(10, since).without_companions();
+    assert!(!fence.due(10, since, || panic!("no companion to look for")));
+    assert!(fence.due(11, since, || panic!("no companion to look for")));
+  }
+
   /// The fence waits for composition, then for companions, then gives
   /// up on them at the cap.
   #[test]
@@ -4840,8 +5180,14 @@ mod tick_due_tests {
                   },
                   source: match source {
                     0 => None,
-                    1 => Some(SourceLease { restoring: false }),
-                    _ => Some(SourceLease { restoring: true }),
+                    1 => Some(SourceLease {
+                      restoring: false,
+                      landing: false,
+                    }),
+                    _ => Some(SourceLease {
+                      restoring: true,
+                      landing: false,
+                    }),
                   },
                   retire_after: (retire > 0).then_some(fence),
                   decoration: match decoration {

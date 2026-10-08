@@ -14,9 +14,9 @@ use wm_platform::{Display, NativeWindow, Rect, RectDelta};
 use crate::{
   commands::container::attach_container,
   models::{
-    Monitor, NativeMonitorProperties, NativeWindowProperties,
-    NonTilingWindow, SplitContainer, TilingContainer, TilingWindow,
-    Workspace,
+    MinSizeSource, Monitor, NativeMonitorProperties,
+    NativeWindowProperties, NonTilingWindow, SplitContainer,
+    TilingContainer, TilingWindow, Workspace,
   },
   traits::TilingSizeGetters,
   wm_state::WmState,
@@ -177,6 +177,7 @@ impl NativeWindowProperties {
     #[builder(default = false)] is_maximized: bool,
     #[builder(default = true)] is_resizable: bool,
     min_size: Option<(i32, i32)>,
+    #[builder(default)] min_size_source: MinSizeSource,
   ) -> Self {
     Self {
       title,
@@ -187,6 +188,7 @@ impl NativeWindowProperties {
       is_maximized,
       is_resizable,
       min_size,
+      min_size_source,
       #[cfg(target_os = "macos")]
       bundle_id: None,
       #[cfg(target_os = "windows")]

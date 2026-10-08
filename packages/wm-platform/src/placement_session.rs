@@ -84,6 +84,17 @@ impl PlacementSession {
   /// - macOS: `false`; the platform exposes no z-order.
   pub const HAS_NATIVE_Z_ORDER: bool = cfg!(target_os = "windows");
 
+  /// Whether a source released from behind its overlay reaches the
+  /// screen only in a compositor frame after its release.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: `true`; the release lifts a cloak or an alpha, which is
+  ///   drawn in a later frame.
+  /// - macOS: `false`; the source is hidden by where it is parked, and
+  ///   stands drawn at its frame before it is released.
+  pub const RELEASE_IS_COMPOSED_LATER: bool = cfg!(target_os = "windows");
+
   /// Whether reading the minimized/maximized state asks the window's
   /// application.
   ///
@@ -269,6 +280,57 @@ impl PlacementSession {
       minimized,
       maximized,
     })
+  }
+
+  /// Observes the native rectangle as `windows` lists it, so that the
+  /// windows of one pass share a single window-server round trip.
+  ///
+  /// The list is a snapshot taken at its first use. The rectangle is as
+  /// old as that, which suits waiting for a window to arrive; read
+  /// [`Self::observed_frame`] where the current one is needed.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: same as [`Self::observed_frame`]; `windows` holds nothing.
+  /// - macOS: a window that is not listed (off screen, or gone) is read on
+  ///   its own, which fails for one that is gone.
+  pub fn observed_frame_in(
+    &self,
+    windows: &crate::OnScreenWindows,
+  ) -> crate::Result<Rect> {
+    #[cfg(target_os = "windows")]
+    {
+      let _ = windows;
+      self.observed_frame()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      match windows.bounds(self.native.id()) {
+        Some(rect) => Ok(rect),
+        None => self.observed_frame(),
+      }
+    }
+  }
+
+  /// The frame the window shows at, given the frame it was just observed
+  /// at with [`Self::observed_frame`].
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: reads the frame without its invisible resize borders.
+  /// - macOS: `observed` itself, with no further read. The window has no
+  ///   such borders, and asking its application would wait behind whatever
+  ///   the application is doing.
+  pub fn shown_frame(&self, observed: &Rect) -> crate::Result<Rect> {
+    #[cfg(target_os = "windows")]
+    {
+      let _ = observed;
+      self.window()?.frame()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      Ok(observed.clone())
+    }
   }
 
   /// Observes native visibility, including Windows compositor cloaking.
@@ -880,6 +942,32 @@ impl PlacementSession {
     display: &Rect,
   ) -> crate::Result<()> {
     self.window()?.set_frame_on_display(rect, display)
+  }
+
+  /// Requests a native frame for a window just observed at `observed`
+  /// (see [`Self::observed_frame`]), on the display with bounds
+  /// `display`.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: same as [`Self::set_frame_on_display`].
+  /// - macOS: does not ask the application for its current frame, which
+  ///   would wait behind whatever it is doing; `observed` stands in.
+  pub fn set_frame_from(
+    &self,
+    rect: &Rect,
+    display: &Rect,
+    observed: &Rect,
+  ) -> crate::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+      let _ = observed;
+      self.set_frame_on_display(rect, display)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      self.native.inner.set_frame_from(rect, display, observed)
+    }
   }
 
   /// Changes an accessibility boolean on the owning application thread.

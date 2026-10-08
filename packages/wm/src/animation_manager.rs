@@ -37,6 +37,39 @@ use crate::{
 /// distortion.
 const OPEN_START_SCALE: f32 = 0.94;
 
+/// Furthest an edge of a moving overlay may stand from its target, in
+/// pixels, for the real window to be placed beneath it.
+///
+/// A spring spends the last of its settle time creeping over the final
+/// pixels: one that travels 1000px in a 200ms spring is within 8px some
+/// 100ms before it settles, and looks still for most of that. A window
+/// placed under the overlay then shows at most this much of an edge,
+/// for the few frames the overlay takes to close the distance.
+const LANDING_DISTANCE: u32 = 8;
+
+/// Furthest an edge of a moving overlay may stand from its target, in
+/// pixels, for the motion to count as over where the real window stands
+/// ready beneath it.
+///
+/// A spring keeps moving long after it looks still: one that travels
+/// 1000px in a 200ms spring is within 3px about 70ms before it settles.
+/// Showing the real window then, rather than a still picture of it for
+/// those 70ms, moves the picture by less than the difference between it
+/// and the window.
+const SETTLED_DISTANCE: u32 = 3;
+
+/// How far a cover reaches past the frame it hides, in pixels.
+///
+/// Far enough to hide a border ring drawn around the window, which
+/// reaches a few pixels out, and no further than half the gap that
+/// tiles usually keep between them, so that it never hides the edge of
+/// a neighbour.
+const COVER_MARGIN_PX: i32 = 8;
+
+/// Most a fading overlay may differ from its final opacity for the real
+/// window to be placed beneath it, so the window does not show through.
+const LANDING_OPACITY: f32 = 0.02;
+
 /// Distinct steps of an 8-bit alpha channel.
 ///
 /// A spring measures opacity in these steps, so its 0.5 px settle
@@ -319,6 +352,33 @@ impl SpringMotion {
   }
 }
 
+/// Where the real window is kept while its cover moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourcePlacement {
+  /// Concealed the platform's usual way until the motion ends.
+  Concealed,
+
+  /// Held where the cover stands until the motion ends. A window fading
+  /// out to a hidden workspace would otherwise move to its new tile
+  /// under the cover, and a live thumbnail would stretch it to the old
+  /// frame.
+  Held,
+
+  /// Sent to its destination once the cover stands over it, ahead of
+  /// the end of the motion. See `AnimationManager::landing_at`.
+  ///
+  /// Only for a window that is being moved. One that has just opened is
+  /// still being placed by its own application, which puts a new window
+  /// back where it last stood, and every such move costs one of the few
+  /// corrections a target allows.
+  LandsEarly,
+
+  /// Sent to its destination as the motion starts, hidden by covers
+  /// over where it stands and where it is going. See
+  /// `AnimationManager::is_covered`.
+  Covered,
+}
+
 /// Prepared geometry and effect, independent of motion and overlay
 /// lifetime.
 #[derive(Clone, Debug)]
@@ -345,11 +405,8 @@ struct AnimationSpec {
   /// incoming one before vanishing.
   is_slide: bool,
 
-  /// Whether the real window stays where the cover stands until motion
-  /// ends. A window fading out to a hidden workspace would otherwise move
-  /// to its new tile under the cover, and a live thumbnail would stretch
-  /// it to the old frame.
-  holds_source: bool,
+  /// Where the real window is kept while its cover moves.
+  source: SourcePlacement,
 
   /// Start and target opacity for the animation, or `None` if no opacity
   /// animation is active.
@@ -394,7 +451,7 @@ impl AnimationSpec {
       start_rect,
       target_rect,
       is_slide,
-      holds_source: false,
+      source: SourcePlacement::Concealed,
       start_opacity,
       target_opacity,
     }
@@ -419,6 +476,40 @@ impl AnimationSpec {
   /// edge is within 0.5 px of its target and nearly at rest.
   fn is_complete(&self, elapsed: Duration) -> bool {
     elapsed >= self.duration
+  }
+
+  /// Time from the start of the motion after which the overlay stays
+  /// within `distance` pixels of its target on every edge and within
+  /// `LANDING_OPACITY` of its final opacity.
+  ///
+  /// Sampled back from the end of the motion, so a spring that
+  /// overshoots counts only once it has come back for good.
+  fn within_after(&self, distance: u32) -> Duration {
+    const STEP: Duration = Duration::from_millis(4);
+
+    let target = edges(&self.target_rect);
+    let landed = |elapsed: Duration| {
+      edges(&self.rect_at(elapsed))
+        .iter()
+        .zip(target)
+        .all(|(edge, target)| edge.abs_diff(target) <= distance)
+        && self
+          .opacity_at(elapsed)
+          .zip(self.target_opacity.as_ref())
+          .is_none_or(|(opacity, target)| {
+            (opacity.0 - target.0).abs() <= LANDING_OPACITY
+          })
+    };
+
+    let mut after = self.duration;
+    while !after.is_zero() {
+      let earlier = after.saturating_sub(STEP);
+      if !landed(earlier) {
+        break;
+      }
+      after = earlier;
+    }
+    after
   }
 
   /// Returns the smallest rect enclosing every frame of the motion.
@@ -754,7 +845,7 @@ impl AnimationManager {
     self
       .animations
       .get(id)
-      .filter(|spec| spec.holds_source)
+      .filter(|spec| spec.source == SourcePlacement::Held)
       .map(|spec| spec.target_rect.clone())
   }
 
@@ -1080,6 +1171,71 @@ impl AnimationManager {
       .windows
       .get(id)
       .is_none_or(|overlay| overlay.window.companions_revealed(windows))
+  }
+
+  /// Whether covers stand over where a window is and where it is going,
+  /// so that it can be sent to its destination at once, unseen.
+  pub fn is_covered(&self, id: &Uuid) -> bool {
+    self
+      .animations
+      .get(id)
+      .is_some_and(|spec| spec.source == SourcePlacement::Covered)
+  }
+
+  /// Puts a window's covers on screen. Does nothing without any.
+  pub fn show_covers(&self, id: &Uuid) {
+    if let Some(overlay) = self.windows.get(id) {
+      overlay.window.show_covers();
+    }
+  }
+
+  /// Removes the covers over where a window stood before it was sent to
+  /// its destination. Does nothing without any.
+  pub fn uncover_origin(&mut self, id: &Uuid) {
+    if let Some(overlay) = self.windows.get_mut(id) {
+      overlay.window.uncover_origin();
+    }
+  }
+
+  /// When the cover of a running motion comes to stand over its target
+  /// for good, so that a real window placed there is hidden beneath it.
+  ///
+  /// `None` for a window without a running cover motion, and for any
+  /// motion but that of a window being moved without covers (see
+  /// `SourcePlacement::LandsEarly`).
+  pub fn landing_at(&self, id: &Uuid) -> Option<Instant> {
+    let spec = self.animations.get(id)?;
+    if !matches!(spec.target, MotionTarget::Overlay)
+      || spec.source != SourcePlacement::LandsEarly
+    {
+      return None;
+    }
+    let motion = self.running.get(id)?;
+    Some(motion.started + spec.within_after(LANDING_DISTANCE))
+  }
+
+  /// When the cover of a running motion all but stops over its target,
+  /// for a window that has stood ready beneath covers since the motion
+  /// began. The rest of the motion is too small to see, so the window
+  /// can be shown from then on.
+  ///
+  /// `None` for a window without a running motion, or without covers.
+  pub fn settled_at(&self, id: &Uuid) -> Option<Instant> {
+    let spec = self.animations.get(id)?;
+    if spec.source != SourcePlacement::Covered {
+      return None;
+    }
+    let motion = self.running.get(id)?;
+    Some(motion.started + spec.within_after(SETTLED_DISTANCE))
+  }
+
+  /// Whether a window's overlay may draw companions that have to show
+  /// themselves again before it retires. `false` without an overlay.
+  pub fn awaits_companions(&self, id: &Uuid) -> bool {
+    self
+      .windows
+      .get(id)
+      .is_some_and(|overlay| overlay.window.awaits_companions())
   }
 
   /// Takes failed launches or updates for native recovery.
@@ -1576,7 +1732,6 @@ impl AnimationManager {
       plan.trigger.is_slide(),
       velocity,
     );
-    animation.holds_source = plan.trigger == AnimationTrigger::WindowSent;
 
     // On macOS, windows cannot span across multiple displays when
     // "Displays have separate Spaces" is enabled. Attempting to position a
@@ -1678,6 +1833,14 @@ impl AnimationManager {
       );
     }
 
+    animation.source = Self::place_source(
+      plan.trigger,
+      self.animations.get(&window.id()).map(|spec| spec.source),
+      self.windows.get_mut(&window.id()),
+      (window, &animation.target_rect),
+      (context, dispatcher),
+    );
+
     self.running.remove(&window.id());
     self.pending_starts.retain(|id| *id != window.id());
     self.failed_updates.remove(&window.id());
@@ -1687,6 +1850,48 @@ impl AnimationManager {
     }
     self.update_clock();
     Ok(start)
+  }
+
+  /// Decides where a window is kept while its cover moves.
+  ///
+  /// A moved window is covered where it stands and where it is going,
+  /// so it can leave for `target` as the motion starts and lay out there
+  /// unseen. A cover that was `previous`ly covered and is retargeted in
+  /// flight already covers where its window stands. Where the covers
+  /// cannot be made, the window lands early instead.
+  fn place_source(
+    trigger: AnimationTrigger,
+    previous: Option<SourcePlacement>,
+    overlay: Option<&mut Overlay>,
+    (window, target): (&WindowContainer, &Rect),
+    (context, dispatcher): (&AnimationContext, &Dispatcher),
+  ) -> SourcePlacement {
+    match trigger {
+      AnimationTrigger::WindowSent => return SourcePlacement::Held,
+      AnimationTrigger::WindowMoved => {}
+      _ => return SourcePlacement::Concealed,
+    }
+    let Some(overlay) = overlay else {
+      return SourcePlacement::LandsEarly;
+    };
+
+    let destination = target.inset(-COVER_MARGIN_PX);
+    let origin = (previous != Some(SourcePlacement::Covered))
+      .then(|| window.native_properties().frame.inset(-COVER_MARGIN_PX));
+
+    match overlay.window.cover(
+      &destination,
+      origin.as_ref(),
+      context,
+      dispatcher,
+    ) {
+      Ok(true) => SourcePlacement::Covered,
+      Ok(false) => SourcePlacement::LandsEarly,
+      Err(err) => {
+        tracing::warn!("Failed to cover window: {err}");
+        SourcePlacement::LandsEarly
+      }
+    }
   }
 
   /// Starts a prepared motion at once, without waiting for its batch.
@@ -2089,6 +2294,76 @@ mod tests {
     assert!(frames.iter().all(|(_, opacity)| opacity.is_none()));
 
     assert!(test_spec().keyframes().is_none());
+  }
+
+  /// A spring like the configured window move stands within the landing
+  /// distance well before it settles, and stays there.
+  #[test]
+  fn spring_lands_before_it_settles() {
+    let effect = spring_effect(200, 0.05);
+    let spec = AnimationSpec::new(
+      Rect::from_xy(0, 0, 900, 1100),
+      Rect::from_xy(1000, 500, 1800, 550),
+      None,
+      &effect,
+      false,
+      [0.0; 4],
+    );
+
+    let landing = spec.within_after(LANDING_DISTANCE);
+    assert!(
+      landing + Duration::from_millis(30) < spec.duration,
+      "landing {landing:?} of {:?}",
+      spec.duration
+    );
+
+    let mut elapsed = landing;
+    while elapsed <= spec.duration {
+      let rect = spec.rect_at(elapsed);
+      for (edge, target) in
+        edges(&rect).into_iter().zip(edges(&spec.target_rect))
+      {
+        assert!(edge.abs_diff(target) <= LANDING_DISTANCE, "{rect:?}");
+      }
+      elapsed += Duration::from_millis(1);
+    }
+
+    // One step earlier it is still further out.
+    let before =
+      spec.rect_at(landing.saturating_sub(Duration::from_millis(4)));
+    assert!(edges(&before)
+      .into_iter()
+      .zip(edges(&spec.target_rect))
+      .any(|(edge, target)| edge.abs_diff(target) > LANDING_DISTANCE));
+  }
+
+  /// A motion that goes nowhere has landed from the start.
+  #[test]
+  fn still_motion_has_landed_at_once() {
+    let rect = Rect::from_xy(0, 0, 400, 300);
+    let spec = AnimationSpec::new(
+      rect.clone(),
+      rect,
+      None,
+      &spring_effect(200, 0.05),
+      false,
+      [0.0; 4],
+    );
+
+    assert_eq!(spec.within_after(LANDING_DISTANCE), Duration::ZERO);
+
+    // A tighter distance is reached later, and never after the end.
+    let moving = AnimationSpec::new(
+      Rect::from_xy(0, 0, 400, 300),
+      Rect::from_xy(1000, 0, 400, 300),
+      None,
+      &spring_effect(200, 0.05),
+      false,
+      [0.0; 4],
+    );
+    let settled = moving.within_after(SETTLED_DISTANCE);
+    assert!(moving.within_after(LANDING_DISTANCE) < settled);
+    assert!(settled + Duration::from_millis(30) < moving.duration);
   }
 
   /// A spring runs until it settles and then lands exactly.

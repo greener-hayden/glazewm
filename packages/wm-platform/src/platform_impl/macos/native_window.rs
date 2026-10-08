@@ -355,7 +355,24 @@ impl NativeWindow {
   ///   refused is corrected by the caller's next request, once the window
   ///   is fully on one display.
   pub(crate) fn set_frame(&self, rect: &Rect) -> crate::Result<()> {
-    self.write_frame(rect, None)
+    self.write_frame(rect, None, None)
+  }
+
+  /// Writes `rect` as [`Self::set_frame_on_display`] does, taking the
+  /// window's current frame from `current` instead of asking its
+  /// application for it.
+  ///
+  /// That read waits behind whatever the application is doing, on the
+  /// thread every other window's calls share. `current` is only used to
+  /// choose between a bare move and a staged resize, so one a few
+  /// milliseconds old costs at worst a write that the caller repeats.
+  pub(crate) fn set_frame_from(
+    &self,
+    rect: &Rect,
+    display: &Rect,
+    current: &Rect,
+  ) -> crate::Result<()> {
+    self.write_frame(rect, Some(display), Some(current))
   }
 
   /// Implements [`NativeWindow::set_frame_on_display`].
@@ -364,7 +381,7 @@ impl NativeWindow {
     rect: &Rect,
     display: &Rect,
   ) -> crate::Result<()> {
-    self.write_frame(rect, Some(display))
+    self.write_frame(rect, Some(display), None)
   }
 
   /// Writes `rect`, staging the window onto a display first if needed.
@@ -373,17 +390,25 @@ impl NativeWindow {
   /// when it wholly contains `rect`; otherwise (or when `None`) the
   /// display is looked up by walking every screen. A bare move needs no
   /// display.
+  ///
+  /// `known` is the window's current frame where the caller has it; it
+  /// is read from the application otherwise.
   fn write_frame(
     &self,
     rect: &Rect,
     display: Option<&Rect>,
+    known: Option<&Rect>,
   ) -> crate::Result<()> {
     let rect = rect.clone();
     let display = display.cloned();
+    let known = known.cloned();
     let dispatcher = self.application.dispatcher.clone();
 
     self.with_enhanced_ui_disabled(move |el| -> crate::Result<()> {
-      let current = read_frame(el)?;
+      let current = match known {
+        Some(current) => current,
+        None => read_frame(el)?,
+      };
 
       let is_same_size = current.width() == rect.width()
         && current.height() == rect.height();
@@ -402,16 +427,32 @@ impl NativeWindow {
         &dispatcher,
       )?;
 
-      // The application applies these in order, so the size lands while
-      // the window is staged and the move follows it.
+      // The application applies these in order. A window that is not
+      // on the display is staged onto it first. From there it shrinks
+      // where it stands, moves, and only then grows: at every step it
+      // lies within the rect it came from or the one it is going to, so
+      // it never crosses a display edge, which would lose the size, and
+      // never shows outside whatever covers those two rects.
       with_deferred_writes(el, || {
+        let (mut width, mut height) = (current.width(), current.height());
         if !display.contains_rect(&current) {
           let staging = staging_origin(&current, &rect, &display);
           delivered(write_position(el, staging.x, staging.y))?;
         }
 
-        delivered(write_size(el, rect.width(), rect.height()))?;
-        delivered(write_position(el, rect.x(), rect.y()))
+        let shrunk = (width.min(rect.width()), height.min(rect.height()));
+        if shrunk != (width, height) {
+          delivered(write_size(el, shrunk.0, shrunk.1))?;
+          (width, height) = shrunk;
+        }
+
+        delivered(write_position(el, rect.x(), rect.y()))?;
+
+        if (width, height) != (rect.width(), rect.height()) {
+          delivered(write_size(el, rect.width(), rect.height()))?;
+        }
+
+        Ok(())
       })
     })
   }

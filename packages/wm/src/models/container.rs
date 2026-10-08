@@ -15,8 +15,9 @@ use wm_platform::{Direction, NativeWindow, Rect, RectDelta};
 #[allow(clippy::wildcard_imports)]
 use crate::{
   models::{
-    Monitor, MonitorMetrics, NativeWindowProperties, NonTilingWindow,
-    RootContainer, SplitContainer, TilingWindow, Workspace,
+    MinSizeSource, Monitor, MonitorMetrics, NativeWindowProperties,
+    NonTilingWindow, RootContainer, SplitContainer, TilingWindow,
+    Workspace,
   },
   traits::*,
   user_config::UserConfig,
@@ -169,6 +170,48 @@ impl TilingContainer {
         split_min_length(split, is_horizontal, metrics)
       }
     }
+  }
+
+  /// Forgets the inferred floor along an axis of every window in this
+  /// container, so that the next layout asks each for less again.
+  ///
+  /// A floor that the application reported is kept, as is the floor
+  /// along the other axis. A window that still refuses the smaller frame
+  /// has its floor learned again.
+  ///
+  /// Returns whether any floor was forgotten, in which case the layout
+  /// has changed.
+  pub fn release_inferred_floors(&self, is_horizontal: bool) -> bool {
+    let mut released = false;
+
+    for container in self.self_and_descendants() {
+      let Some(window) = container.as_tiling_window() else {
+        continue;
+      };
+
+      window.update_native_properties(|properties| {
+        let Some((width, height)) = properties.min_size else {
+          return;
+        };
+
+        let floor = if is_horizontal { width } else { height };
+        if properties.min_size_source == MinSizeSource::Reported
+          || floor == 0
+        {
+          return;
+        }
+
+        let min_size = if is_horizontal {
+          (0, height)
+        } else {
+          (width, 0)
+        };
+        properties.min_size = (min_size != (0, 0)).then_some(min_size);
+        released = true;
+      });
+    }
+
+    released
   }
 }
 

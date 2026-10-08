@@ -1,4 +1,10 @@
-use std::{sync::OnceLock, time::Duration};
+use std::{
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+  },
+  time::{Duration, Instant},
+};
 
 use block2::RcBlock;
 use objc2::{
@@ -14,8 +20,8 @@ use objc2_core_foundation::{
 };
 #[allow(deprecated)]
 use objc2_core_graphics::{
-  kCGWindowBounds, kCGWindowNumber, kCGWindowOwnerName, CGImage,
-  CGRectMakeWithDictionaryRepresentation, CGWindowImageOption,
+  kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerName,
+  CGImage, CGRectMakeWithDictionaryRepresentation, CGWindowImageOption,
   CGWindowListCopyWindowInfo, CGWindowListCreateImage,
   CGWindowListCreateImageFromArray, CGWindowListOption,
 };
@@ -111,16 +117,235 @@ impl OnScreenWindows {
   fn listed(&self) -> Option<&[ListedWindow]> {
     self.listed.get_or_init(on_screen_windows).as_deref()
   }
+
+  /// Bounds of the window `id` in the list, taking the list if this is
+  /// the first use. `None` for a window that is not listed.
+  pub(crate) fn bounds(&self, id: WindowId) -> Option<Rect> {
+    self
+      .listed()?
+      .iter()
+      .find(|window| window.id == id.0)
+      .map(|window| window.bounds.clone())
+  }
+}
+
+/// How long a picture of the desktop is used before it is taken again.
+///
+/// The desktop seldom changes, and a stale picture shows for one motion
+/// at most: every use that finds it old has it retaken off-thread.
+const DESKTOP_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// A picture of one display's desktop: its wallpaper and whatever else
+/// the system draws beneath every application's windows.
+struct DesktopImage {
+  /// Bounds of the display, in screen coordinates.
+  bounds: Rect,
+  image: CFRetained<CGImage>,
+}
+
+// SAFETY: A `CGImage` is immutable once created, and Core Foundation
+// reference counting is thread-safe.
+unsafe impl Send for DesktopImage {}
+
+/// Pictures of every display's desktop, kept so that covering part of
+/// the screen costs no capture at the moment it is needed.
+///
+/// A capture takes about 20ms whatever its size, which is longer than a
+/// frame, so it is never taken on the way to a motion: `refresh` runs
+/// off-thread and `crop` uses what is there.
+#[derive(Default)]
+pub(crate) struct DesktopCache {
+  /// The pictures, and when they were taken.
+  displays: Mutex<(Vec<DesktopImage>, Option<Instant>)>,
+  /// Whether a refresh is under way.
+  refreshing: AtomicBool,
+}
+
+impl DesktopCache {
+  /// The desktop beneath `rect`, cut from the picture of the display
+  /// most of it lies on, with the part of `rect` that is on that display.
+  ///
+  /// `None` when `rect` is on no display that has been captured.
+  fn crop(&self, rect: &Rect) -> Option<(Rect, CFRetained<CGImage>)> {
+    let displays = self.displays.lock().ok()?;
+    let display = displays
+      .0
+      .iter()
+      .max_by_key(|display| display.bounds.intersection_area(rect))?;
+
+    let rect = Rect::from_ltrb(
+      rect.left.max(display.bounds.left),
+      rect.top.max(display.bounds.top),
+      rect.right.min(display.bounds.right),
+      rect.bottom.min(display.bounds.bottom),
+    );
+    if rect.width() <= 0 || rect.height() <= 0 {
+      return None;
+    }
+
+    // The picture is at the display's backing scale.
+    #[allow(clippy::cast_precision_loss)]
+    let scale = CGImage::width(Some(&display.image)) as f64
+      / f64::from(display.bounds.width());
+
+    let image = CGImage::with_image_in_rect(
+      Some(&display.image),
+      CGRect::new(
+        CGPoint {
+          x: f64::from(rect.x() - display.bounds.x()) * scale,
+          y: f64::from(rect.y() - display.bounds.y()) * scale,
+        },
+        CGSize {
+          width: f64::from(rect.width()) * scale,
+          height: f64::from(rect.height()) * scale,
+        },
+      ),
+    )?;
+
+    Some((rect, image))
+  }
+
+  /// Takes the pictures again on another thread, if they are missing or
+  /// older than `DESKTOP_MAX_AGE` and no refresh is already running.
+  fn refresh_if_stale(self: &Arc<Self>) {
+    let fresh = self.displays.lock().is_ok_and(|displays| {
+      displays
+        .1
+        .is_some_and(|taken| taken.elapsed() < DESKTOP_MAX_AGE)
+    });
+    if fresh || self.refreshing.swap(true, Ordering::AcqRel) {
+      return;
+    }
+
+    let cache = Arc::clone(self);
+    std::thread::spawn(move || {
+      let images = capture_desktops();
+      if let Ok(mut displays) = cache.displays.lock() {
+        *displays = (images, Some(Instant::now()));
+      }
+      cache.refreshing.store(false, Ordering::Release);
+    });
+  }
+}
+
+/// Captures the desktop of every display, without any application's
+/// windows.
+///
+/// Returns nothing when the window server cannot list its windows.
+#[allow(deprecated)]
+fn capture_desktops() -> Vec<DesktopImage> {
+  let Some(windows) =
+    CGWindowListCopyWindowInfo(CGWindowListOption::OptionOnScreenOnly, 0)
+  else {
+    return Vec::new();
+  };
+  // SAFETY: Window services returns dictionaries with string keys and
+  // Core Foundation values, retaining all of those objects.
+  let windows =
+    unsafe { windows.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+
+  // The desktop is every window on a layer beneath the normal one. Each
+  // spans its display, so their bounds are also the displays'.
+  let mut ids = Vec::new();
+  let mut displays = Vec::<Rect>::new();
+  for info in windows.iter() {
+    // SAFETY: The framework provides these immutable dictionary keys.
+    let (number, layer, bounds) =
+      unsafe { (kCGWindowNumber, kCGWindowLayer, kCGWindowBounds) };
+    let number_of = |key| {
+      info
+        .get(key)
+        .and_then(|value| value.downcast_ref::<CFNumber>()?.as_i64())
+    };
+    let (Some(id), Some(layer)) = (number_of(number), number_of(layer))
+    else {
+      continue;
+    };
+    if layer >= 0 {
+      continue;
+    }
+    let Some(dictionary) = info.get(bounds) else {
+      continue;
+    };
+    let Some(dictionary) = dictionary.downcast_ref::<CFDictionary>()
+    else {
+      continue;
+    };
+    let mut rect = CGRect::ZERO;
+    // SAFETY: The checked dictionary is retained and `rect` is a live
+    // output rectangle for the duration of this synchronous call.
+    if !unsafe {
+      CGRectMakeWithDictionaryRepresentation(
+        Some(dictionary),
+        &raw mut rect,
+      )
+    } {
+      continue;
+    }
+
+    // LINT: A window ID is an unsigned 32-bit value.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    ids.push(id as usize as *const std::ffi::c_void);
+    let rect = Rect::from(rect);
+    if !displays.contains(&rect) {
+      displays.push(rect);
+    }
+  }
+
+  let Ok(count) = isize::try_from(ids.len()) else {
+    return Vec::new();
+  };
+  // SAFETY: `ids` holds `count` values and outlives the call. Null
+  // callbacks make the array store them as plain values, with nothing
+  // to retain or release.
+  let Some(array) = (unsafe {
+    CFArray::new(None, ids.as_mut_ptr(), count, std::ptr::null())
+  }) else {
+    return Vec::new();
+  };
+
+  displays
+    .into_iter()
+    .filter_map(|bounds| {
+      NativeCallStats::record(NativeCall::ScreenCapture);
+      // SAFETY: `array` holds window IDs, as the call documents.
+      let image = unsafe {
+        CGWindowListCreateImageFromArray(
+          bounds.clone().into(),
+          &array,
+          // The cover stands still beside real windows, so it has to be
+          // as sharp as they are.
+          CGWindowImageOption::BestResolution,
+        )
+      }?;
+      Some(DesktopImage { bounds, image })
+    })
+    .collect()
 }
 
 /// Platform-specific implementation of [`AnimationContext`].
-pub(crate) struct AnimationContext;
+pub(crate) struct AnimationContext {
+  /// Pictures of the desktop, for covers.
+  desktop: Arc<DesktopCache>,
+}
 
 impl AnimationContext {
   /// Implements [`AnimationContext::new`].
   #[allow(clippy::unnecessary_wraps)]
   pub(crate) fn new(_dispatcher: &Dispatcher) -> crate::Result<Self> {
-    Ok(Self)
+    let desktop = Arc::new(DesktopCache::default());
+    // Taken now, so the first motion already has them.
+    desktop.refresh_if_stale();
+    Ok(Self { desktop })
+  }
+
+  /// A context that has captured no desktop and so makes no covers, for
+  /// tests that count native calls.
+  #[cfg(test)]
+  pub(crate) fn without_desktop() -> Self {
+    Self {
+      desktop: Arc::default(),
+    }
   }
 
   /// Implements [`AnimationContext::capture_frame`].
@@ -176,10 +401,69 @@ impl Drop for OverlayViews {
   }
 }
 
+/// The image layer of an overlay, kept so that any thread can hide it.
+///
+/// Closing the overlay's window has to wait its turn on the main thread,
+/// which also carries every accessibility call and so stands still
+/// whenever an application is slow to answer one. Hiding the layer waits
+/// for nothing.
+struct ImageLayer(Retained<CALayer>);
+
+// SAFETY: Core Animation lets any thread set a layer's properties, and
+// applies them when that thread commits its transaction. Only `hide`
+// uses the layer from off the main thread. Releasing the reference is
+// safe from any thread.
+unsafe impl Send for ImageLayer {}
+
+// SAFETY: A shared reference reaches only `hide`, which is safe from
+// several threads at once for the reason above.
+unsafe impl Sync for ImageLayer {}
+
+impl ImageLayer {
+  /// Takes the image off the screen, from whichever thread calls.
+  fn hide(&self) {
+    self.set_hidden(true);
+  }
+
+  /// Puts the image on the screen, from whichever thread calls.
+  fn show(&self) {
+    self.set_hidden(false);
+  }
+
+  /// Hides or shows the image, from whichever thread calls.
+  fn set_hidden(&self, hidden: bool) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    self.0.setHidden(hidden);
+    CATransaction::commit();
+    // A thread without a run loop commits nothing until it is flushed.
+    CATransaction::flush();
+  }
+}
+
+/// A picture of the desktop standing over part of the screen, one level
+/// beneath the overlays, so that a real window can be moved and resized
+/// under it unseen.
+struct Cover {
+  views: ThreadBound<OverlayViews>,
+  image: ImageLayer,
+}
+
 /// Platform-specific implementation of [`AnimationWindow`].
 pub(crate) struct AnimationWindow {
   /// `None` once destroyed.
   views: Option<ThreadBound<OverlayViews>>,
+
+  /// The image the window shows. `None` once destroyed.
+  image: Option<ImageLayer>,
+
+  /// Cover over where the real window is going. Stays until the overlay
+  /// is destroyed.
+  destination_cover: Option<Cover>,
+
+  /// Covers over where the real window stood when it was sent on its
+  /// way. Removed by `uncover_origin` once the window has left.
+  origin_covers: Vec<Cover>,
 
   /// Frame of the `AnimationWindow` (in CG coordinates).
   outer_rect: Rect,
@@ -206,7 +490,8 @@ impl AnimationWindow {
     opacity: Option<OpacityValue>,
     dispatcher: &Dispatcher,
   ) -> crate::Result<Self> {
-    type DispatchResult = crate::Result<ThreadBound<OverlayViews>>;
+    type DispatchResult =
+      crate::Result<(ThreadBound<OverlayViews>, ImageLayer)>;
 
     let captured = capture.frame;
     let extent = captured.extent.clone();
@@ -217,96 +502,105 @@ impl AnimationWindow {
     // main thread.
     let display_height = primary_display_height();
 
-    let views = dispatcher.dispatch_sync(|| -> DispatchResult {
-      // SAFETY: `Dispatcher::dispatch_sync` runs on the main thread.
-      let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let (views, image) =
+      dispatcher.dispatch_sync(|| -> DispatchResult {
+        // SAFETY: `Dispatcher::dispatch_sync` runs on the main thread.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
-      let ns_window = unsafe {
-        NSWindow::initWithContentRect_styleMask_backing_defer(
-          NSWindow::alloc(mtm),
-          // `NSWindow` expects AppKit coordinates (bottom-left origin).
-          outer_rect.flip_y(display_height).into(),
-          NSWindowStyleMask::Borderless,
-          NSBackingStoreType::Buffered,
-          false,
-        )
-      };
+        let ns_window = unsafe {
+          NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            // `NSWindow` expects AppKit coordinates (bottom-left origin).
+            outer_rect.flip_y(display_height).into(),
+            NSWindowStyleMask::Borderless,
+            NSBackingStoreType::Buffered,
+            false,
+          )
+        };
 
-      ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
-      ns_window.setOpaque(false);
-      ns_window.setIgnoresMouseEvents(true);
+        ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+        ns_window.setOpaque(false);
+        ns_window.setIgnoresMouseEvents(true);
 
-      // Disable AppKit's default open/close animations.
-      ns_window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+        // Disable AppKit's default open/close animations.
+        ns_window.setAnimationBehavior(NSWindowAnimationBehavior::None);
 
-      // SAFETY: `NSWindow` is normally released on close, but when the
-      // `Retained<NSWindow>` field is dropped, it will also send a
-      // release call and segfault.
-      unsafe { ns_window.setReleasedWhenClosed(false) };
+        // SAFETY: `NSWindow` is normally released on close, but when the
+        // `Retained<NSWindow>` field is dropped, it will also send a
+        // release call and segfault.
+        unsafe { ns_window.setReleasedWhenClosed(false) };
 
-      let content_view =
-        ns_window.contentView().ok_or(crate::Error::Platform(
-          "NSWindow must have a content view.".to_string(),
-        ))?;
+        let content_view =
+          ns_window.contentView().ok_or(crate::Error::Platform(
+            "NSWindow must have a content view.".to_string(),
+          ))?;
 
-      content_view.setWantsLayer(true);
+        content_view.setWantsLayer(true);
 
-      let root_layer =
-        content_view.layer().ok_or(crate::Error::Platform(
-          "Layer must exist after `setWantsLayer`.".to_string(),
-        ))?;
+        let root_layer =
+          content_view.layer().ok_or(crate::Error::Platform(
+            "Layer must exist after `setWantsLayer`.".to_string(),
+          ))?;
 
-      // The root layer fills the content view, so a sublayer is needed
-      // to animate within it.
-      let layer = CALayer::new();
+        // The root layer fills the content view, so a sublayer is needed
+        // to animate within it.
+        let layer = CALayer::new();
 
-      // SAFETY: `CGImageRef` is accepted by `CALayer::contents`.
-      unsafe {
-        layer.setContents(Some(
-          &*std::ptr::from_ref::<CGImage>(&captured.cg_image)
-            .cast::<AnyObject>(),
-        ));
-      };
+        // SAFETY: `CGImageRef` is accepted by `CALayer::contents`.
+        unsafe {
+          layer.setContents(Some(
+            &*std::ptr::from_ref::<CGImage>(&captured.cg_image)
+              .cast::<AnyObject>(),
+          ));
+        };
 
-      // Left at the default scale of 1: the capture is taken at
-      // logical resolution, so one image pixel is one point. Matching
-      // the display's backing scale here would make the layer treat
-      // the image as 2x and draw it at half size.
+        // Left at the default scale of 1: the capture is taken at
+        // logical resolution, so one image pixel is one point. Matching
+        // the display's backing scale here would make the layer treat
+        // the image as 2x and draw it at half size.
 
-      CATransaction::begin();
-      CATransaction::setDisableActions(true);
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
 
-      Self::update_layer(
-        &layer,
-        inner_rect,
-        outer_rect,
-        layer_extent.as_ref(),
-        opacity.as_ref(),
-      );
-      CATransaction::commit();
+        Self::update_layer(
+          &layer,
+          inner_rect,
+          outer_rect,
+          layer_extent.as_ref(),
+          opacity.as_ref(),
+        );
+        CATransaction::commit();
 
-      root_layer.addSublayer(&layer);
+        root_layer.addSublayer(&layer);
 
-      // Ordering is relative to another process's window, which AppKit
-      // does not guarantee. Without a level of its own the overlay
-      // stays at the normal level and can land behind whatever else is
-      // on screen, so the tween plays invisibly and reads as a snap.
-      ns_window.setLevel(NSFloatingWindowLevel);
+        // Ordering is relative to another process's window, which AppKit
+        // does not guarantee. Without a level of its own the overlay
+        // stays at the normal level and can land behind whatever else is
+        // on screen, so the tween plays invisibly and reads as a snap.
+        ns_window.setLevel(NSFloatingWindowLevel);
 
-      #[allow(clippy::cast_possible_wrap)]
-      ns_window.orderWindow_relativeTo(
-        NSWindowOrderingMode::Above,
-        window.id().0 as isize,
-      );
+        #[allow(clippy::cast_possible_wrap)]
+        ns_window.orderWindow_relativeTo(
+          NSWindowOrderingMode::Above,
+          window.id().0 as isize,
+        );
 
-      Ok(ThreadBound::new(
-        OverlayViews { ns_window, layer },
-        dispatcher.clone(),
-      ))
-    })??;
+        let image = ImageLayer(layer.clone());
+
+        Ok((
+          ThreadBound::new(
+            OverlayViews { ns_window, layer },
+            dispatcher.clone(),
+          ),
+          image,
+        ))
+      })??;
 
     Ok(Self {
       views: Some(views),
+      image: Some(image),
+      destination_cover: None,
+      origin_covers: Vec::new(),
       display_height,
       outer_rect: outer_rect.clone(),
       extent,
@@ -631,13 +925,163 @@ impl AnimationWindow {
     })
   }
 
+  /// Implements [`AnimationWindow::cover`].
+  ///
+  /// Each cover is its own window, as a window cannot span displays. The
+  /// covers are made hidden; `show_covers` puts them on screen. Makes
+  /// none unless every rect can be covered. A rect is covered where it
+  /// lies on its display. A destination cover from an earlier call
+  /// stands over where the window is now, so it becomes an origin cover.
+  pub(crate) fn cover(
+    &mut self,
+    destination: &Rect,
+    origin: Option<&Rect>,
+    context: &AnimationContext,
+    dispatcher: &Dispatcher,
+  ) -> crate::Result<bool> {
+    context.desktop.refresh_if_stale();
+
+    let Some(destination) = context.desktop.crop(destination) else {
+      return Ok(false);
+    };
+    let origin = match origin {
+      Some(origin) => match context.desktop.crop(origin) {
+        Some(patch) => Some(patch),
+        None => return Ok(false),
+      },
+      None => None,
+    };
+
+    let destination = self.make_cover(destination, dispatcher)?;
+    let origin = origin
+      .map(|patch| self.make_cover(patch, dispatcher))
+      .transpose()?;
+
+    self
+      .origin_covers
+      .extend(self.destination_cover.replace(destination));
+    self.origin_covers.extend(origin);
+
+    Ok(true)
+  }
+
+  /// Makes a hidden cover showing `image` over `rect`.
+  fn make_cover(
+    &self,
+    (rect, image): (Rect, CFRetained<CGImage>),
+    dispatcher: &Dispatcher,
+  ) -> crate::Result<Cover> {
+    let display_height = self.display_height;
+    dispatcher.dispatch_sync(|| -> crate::Result<Cover> {
+      // SAFETY: `Dispatcher::dispatch_sync` runs on the main thread.
+      let mtm = unsafe { MainThreadMarker::new_unchecked() };
+
+      let ns_window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+          NSWindow::alloc(mtm),
+          rect.flip_y(display_height).into(),
+          NSWindowStyleMask::Borderless,
+          NSBackingStoreType::Buffered,
+          false,
+        )
+      };
+
+      // Not opaque, though its image is: an opaque window would count
+      // as hiding the application's window beneath it, and an
+      // application that knows it is hidden stops drawing.
+      ns_window.setBackgroundColor(Some(&NSColor::clearColor()));
+      ns_window.setOpaque(false);
+      ns_window.setIgnoresMouseEvents(true);
+      ns_window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+
+      // SAFETY: As for the overlay's window: the `Retained` field
+      // releases it, so closing must not.
+      unsafe { ns_window.setReleasedWhenClosed(false) };
+
+      let content_view =
+        ns_window.contentView().ok_or(crate::Error::Platform(
+          "NSWindow must have a content view.".to_string(),
+        ))?;
+      content_view.setWantsLayer(true);
+      let root_layer =
+        content_view.layer().ok_or(crate::Error::Platform(
+          "Layer must exist after `setWantsLayer`.".to_string(),
+        ))?;
+
+      let layer = CALayer::new();
+      // SAFETY: `CGImageRef` is accepted by `CALayer::contents`.
+      unsafe {
+        layer.setContents(Some(
+          &*std::ptr::from_ref::<CGImage>(&image).cast::<AnyObject>(),
+        ));
+      };
+
+      CATransaction::begin();
+      CATransaction::setDisableActions(true);
+      layer.setFrame(CGRect::new(
+        CGPoint::ZERO,
+        CGSize {
+          width: f64::from(rect.width()),
+          height: f64::from(rect.height()),
+        },
+      ));
+      layer.setHidden(true);
+      CATransaction::commit();
+      root_layer.addSublayer(&layer);
+
+      // Above every application's window and beneath the overlays.
+      ns_window.setLevel(NSFloatingWindowLevel - 1);
+      ns_window.orderFrontRegardless();
+
+      let image = ImageLayer(layer.clone());
+      Ok(Cover {
+        views: ThreadBound::new(
+          OverlayViews { ns_window, layer },
+          dispatcher.clone(),
+        ),
+        image,
+      })
+    })?
+  }
+
+  /// Implements [`AnimationWindow::show_covers`].
+  pub(crate) fn show_covers(&self) {
+    for cover in self.destination_cover.iter().chain(&self.origin_covers) {
+      cover.image.show();
+    }
+  }
+
+  /// Implements [`AnimationWindow::uncover_origin`].
+  pub(crate) fn uncover_origin(&mut self) {
+    for cover in self.origin_covers.drain(..) {
+      cover.image.hide();
+      cover.views.drop_async();
+    }
+  }
+
+  /// Whether companions were captured into this image.
+  pub(crate) fn has_companions(&self) -> bool {
+    self.extent.is_some()
+  }
+
   /// Implements [`AnimationWindow::destroy`].
   ///
-  /// Queues the close and release for the main thread and returns without
-  /// waiting for it, so a failure to close is not reported. Destroying an
-  /// overlay that is already destroyed does nothing.
+  /// Hides the image at once, then queues the close and release for the
+  /// main thread and returns without waiting for it, so a failure to
+  /// close is not reported. The overlay is off the screen from the first
+  /// step, however long the main thread takes to reach the second.
+  /// Destroying an overlay that is already destroyed does nothing.
   #[allow(clippy::unnecessary_wraps)]
   pub(crate) fn destroy(&mut self) -> crate::Result<()> {
+    if let Some(image) = self.image.take() {
+      image.hide();
+    }
+    self.uncover_origin();
+    if let Some(cover) = self.destination_cover.take() {
+      cover.image.hide();
+      cover.views.drop_async();
+    }
+
     if let Some(views) = self.views.take() {
       views.drop_async();
     }

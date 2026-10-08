@@ -13,7 +13,7 @@ use crate::{
   events::update_floating_window_position,
   models::{
     DirectionContainer, NonTilingWindow, SplitContainer, TilingContainer,
-    WindowContainer,
+    TilingWindow, WindowContainer,
   },
   traits::{
     CommonGetters, PositionGetters, TilingDirectionGetters, WindowGetters,
@@ -120,7 +120,7 @@ pub fn handle_window_moved_or_resized_end(
         window.as_window_container()?
       );
 
-      let frame = window.native_properties().frame;
+      let frame = drag_end_frame(window, state);
 
       // Update the window's size based on the new frame position. This
       // means we use the actual window dimensions as the source of truth.
@@ -165,6 +165,26 @@ pub fn handle_window_moved_or_resized_end(
   }
 
   Ok(())
+}
+
+/// The frame a dragged tiling window ended on, which is also cached as
+/// the window's frame.
+///
+/// The cached frame is from the last move event handled, and an
+/// application busy resizing its window delivers those late. The window
+/// server has where the drag really ended; the cached frame stands in
+/// when it cannot be asked.
+fn drag_end_frame(window: &TilingWindow, state: &WmState) -> Rect {
+  let frame = state
+    .native_sync
+    .observed_frame(window.id())
+    .unwrap_or_else(|| window.native_properties().frame);
+
+  window.update_native_properties(|properties| {
+    properties.frame = frame.clone();
+  });
+
+  frame
 }
 
 /// Handles transition from temporary floating window to tiling window on

@@ -27,6 +27,13 @@ impl OnScreenWindows {
   pub fn new() -> Self {
     Self::default()
   }
+
+  /// Bounds of the window `id` as this snapshot lists it, taking the
+  /// list if this is the first use. `None` for a window not listed.
+  #[cfg(target_os = "macos")]
+  pub(crate) fn bounds(&self, id: crate::WindowId) -> Option<Rect> {
+    self.inner.bounds(id)
+  }
 }
 
 /// Shared context used by [`AnimationWindow`] instances. Holds GPU
@@ -539,6 +546,84 @@ impl AnimationWindow {
     self.inner.companions_revealed(&windows.inner)
   }
 
+  /// Makes covers over `destination` and `origin`, where the real window
+  /// is going and where it stands: pictures of the desktop there,
+  /// standing above every application's window and beneath the overlays,
+  /// so that the real window can be moved and resized under them unseen.
+  /// They are made hidden and shown by [`Self::show_covers`]. The origin
+  /// cover goes with [`Self::uncover_origin`], the destination cover
+  /// with the overlay.
+  ///
+  /// Pass no `origin` when a cover from an earlier call already stands
+  /// over the window.
+  ///
+  /// Returns whether the covers were made. `false` leaves the window to
+  /// be concealed some other way.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: `false` when the desktop beneath either rect has not been
+  ///   captured. A rect is covered where it lies on its display.
+  /// - Windows: always `false`; a source is concealed where it stands, so
+  ///   nothing needs covering.
+  pub fn cover(
+    &mut self,
+    destination: &Rect,
+    origin: Option<&Rect>,
+    context: &AnimationContext,
+    dispatcher: &Dispatcher,
+  ) -> crate::Result<bool> {
+    #[cfg(target_os = "windows")]
+    {
+      let _ = (destination, origin, context, dispatcher);
+      Ok(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+      self
+        .inner
+        .cover(destination, origin, &context.inner, dispatcher)
+    }
+  }
+
+  /// Removes the covers over where the real window stood, leaving the
+  /// one over where it is going. Does nothing without any.
+  ///
+  /// Call once the window has left for its destination. Until then
+  /// these covers hide it; after, they would hide whatever takes its
+  /// place, such as a window that swapped with it and was handed over
+  /// first.
+  pub fn uncover_origin(&mut self) {
+    #[cfg(target_os = "macos")]
+    self.inner.uncover_origin();
+  }
+
+  /// Puts the covers made by [`Self::cover`] on screen. Does nothing
+  /// without any.
+  pub fn show_covers(&self) {
+    #[cfg(target_os = "macos")]
+    self.inner.show_covers();
+  }
+
+  /// Whether the overlay may draw companions that have to show
+  /// themselves again before it is destroyed.
+  ///
+  /// # Platform-specific
+  ///
+  /// - macOS: whether companions were captured into the source's image.
+  /// - Windows: always `true`; companions are tracked live.
+  #[must_use]
+  pub fn awaits_companions(&self) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+      true
+    }
+    #[cfg(target_os = "macos")]
+    {
+      self.inner.has_companions()
+    }
+  }
+
   /// Destroys the window and releases GPU resources.
   pub fn destroy(&mut self) -> crate::Result<()> {
     self.inner.destroy()
@@ -731,7 +816,7 @@ mod tests {
     const WINDOWS: usize = 8;
 
     let context = AnimationContext {
-      inner: platform_impl::AnimationContext,
+      inner: platform_impl::AnimationContext::without_desktop(),
     };
     // Ids no window has: each capture fails after its companion search,
     // which is the part under test.

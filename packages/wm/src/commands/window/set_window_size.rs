@@ -164,8 +164,8 @@ fn set_tiling_window_size(
 
 /// Updates either the width or height of a tiling window.
 ///
-/// Resolves the context itself unless given one. Returns whether a tiling
-/// size was changed.
+/// Resolves the context itself unless given one. Returns whether the
+/// layout changed: a tiling size was set, or a floor was forgotten.
 fn set_tiling_window_length(
   window: &TilingWindow,
   target_length: &LengthValue,
@@ -202,27 +202,45 @@ fn set_tiling_window_length(
       return Ok(false);
     }
 
+    let requested_px = target_length.to_px(parent_length, None);
+
     // A sibling pinned to its floor cannot give the space up, and the
     // window cannot take less than its own; asking would only be undone.
-    let siblings_floor = container_to_resize
-      .tiling_siblings()
-      .map(|sibling| sibling.min_length(is_width_resize))
-      .sum::<i32>();
+    let (mut floor, mut ceiling) =
+      length_limits(&container_to_resize, parent_length, is_width_resize);
 
-    let floor = container_to_resize.min_length(is_width_resize);
-    let ceiling = (parent_length - siblings_floor).max(floor);
-    let target_px = target_length
-      .to_px(parent_length, None)
-      .clamp(floor, ceiling);
+    // That holds for a floor the application reported. An inferred one
+    // is re-tested instead, so the limits are taken again without it.
+    let released = release_floors_in_the_way(
+      &container_to_resize,
+      requested_px,
+      floor,
+      ceiling,
+      is_width_resize,
+    );
+
+    if released {
+      (floor, ceiling) = length_limits(
+        &container_to_resize,
+        parent_length,
+        is_width_resize,
+      );
+    }
+
+    let target_px = requested_px.clamp(floor, ceiling);
 
     // Convert the target length to a tiling size.
     let tiling_size =
       LengthValue::from_px(target_px).to_percentage(parent_length);
 
     // Skip the resize if the window is already at the target size.
-    if container_to_resize.tiling_size() - tiling_size != 0. {
+    let resized = container_to_resize.tiling_size() - tiling_size != 0.;
+    if resized {
       resize_tiling_container(&container_to_resize, tiling_size);
+    }
 
+    // A released floor moves the layout even where no tiling size does.
+    if resized || released {
       state
         .pending_sync
         .queue_containers_to_redraw(parent.tiling_children());
@@ -231,6 +249,53 @@ fn set_tiling_window_length(
   }
 
   Ok(false)
+}
+
+/// The shortest and longest that `container` can be along an axis, in
+/// pixels, given its own floor and the floors of its siblings.
+fn length_limits(
+  container: &TilingContainer,
+  parent_length: i32,
+  is_width_resize: bool,
+) -> (i32, i32) {
+  let siblings_floor = container
+    .tiling_siblings()
+    .map(|sibling| sibling.min_length(is_width_resize))
+    .sum::<i32>();
+
+  let floor = container.min_length(is_width_resize);
+  (floor, (parent_length - siblings_floor).max(floor))
+}
+
+/// Forgets the inferred floors that keep `container` from the length
+/// asked for: its own when asked for less than `floor`, its siblings'
+/// when asked for more than `ceiling`.
+///
+/// An inferred floor can be wrong, and it cannot be disproved from
+/// outside, since the layout never asks a window for less than its
+/// floor. The user asking is the reason to ask the window again. A
+/// request within the limits leaves every floor alone.
+///
+/// Returns whether any floor was forgotten.
+fn release_floors_in_the_way(
+  container: &TilingContainer,
+  requested_px: i32,
+  floor: i32,
+  ceiling: i32,
+  is_width_resize: bool,
+) -> bool {
+  if requested_px < floor {
+    container.release_inferred_floors(is_width_resize)
+  } else if requested_px > ceiling {
+    // Every sibling is asked, so this cannot stop at the first.
+    let mut released = false;
+    for sibling in container.tiling_siblings() {
+      released |= sibling.release_inferred_floors(is_width_resize);
+    }
+    released
+  } else {
+    false
+  }
 }
 
 fn set_floating_window_size(
@@ -296,22 +361,29 @@ mod tests {
   use crate::{
     commands::window::resize_window,
     layout_snapshot::tests::{reference_min_length, reference_to_rect},
-    models::{Monitor, SplitContainer, Workspace},
+    models::{MinSizeSource, Monitor, SplitContainer, Workspace},
     test_utils::{attach_monitor, mock_state},
   };
 
   /// A horizontal workspace holding window `a` and a vertical split of
   /// `b` and a horizontal split of `c` and `d`, with 10px inner gaps and a
-  /// floor on every window. Keeps the two windows that tests resize.
+  /// floor on every window. Keeps the windows that tests resize or read.
   struct Fixture {
     state: WmState,
     _events: UnboundedReceiver<WmEvent>,
     b: TilingWindow,
+    c: TilingWindow,
     d: TilingWindow,
   }
 
   impl Fixture {
+    /// The fixture with floors that the applications reported.
     fn new() -> Self {
+      Self::with_floors(MinSizeSource::Reported)
+    }
+
+    /// The fixture with every floor known from `source`.
+    fn with_floors(source: MinSizeSource) -> Self {
       let gaps = GapsConfig {
         inner_gap: LengthValue::from_px(10),
         ..GapsConfig::default()
@@ -320,6 +392,7 @@ mod tests {
         let window = TilingWindow::mock().gaps_config(gaps.clone()).call();
         window.update_native_properties(|properties| {
           properties.min_size = Some(floor);
+          properties.min_size_source = source;
         });
         window
       };
@@ -351,6 +424,7 @@ mod tests {
         state,
         _events: events,
         b,
+        c,
         d,
       }
     }
@@ -618,5 +692,56 @@ mod tests {
     let sizes =
       resize_both(|f| &f.d, Some(LengthValue::from_px(5000)), None);
     assert_close(&sizes, &CAPPED);
+  }
+
+  /// Resizes `d`'s width in a fixture whose floors are all inferred.
+  fn resize_d_with_inferred_floors(width_px: i32) -> Fixture {
+    let mut fixture = Fixture::with_floors(MinSizeSource::Inferred);
+    resize_window(
+      &fixture.d.clone().into(),
+      Some(LengthValue::from_px(width_px)),
+      None,
+      &mut fixture.state,
+    )
+    .expect("Resize.");
+
+    fixture
+  }
+
+  /// The same request as `growth_stops_at_the_sibling_floor`. `c`'s
+  /// width floor is forgotten, so `d` takes all but the minimum tile;
+  /// `c`'s height floor is not in the way and stays.
+  #[test]
+  fn growth_past_an_inferred_sibling_floor_releases_it() {
+    let fixture = resize_d_with_inferred_floors(5000);
+
+    assert_eq!(fixture.c.min_size(), Some((0, 150)));
+    assert_eq!(fixture.d.min_size(), Some((150, 100)));
+    assert_close(&fixture.sizes(), &[0.5, 0.5, 0.5, 0.5, 0.01, 0.99]);
+  }
+
+  /// `d` -400px wide: 12px of 825px, under its own 150px floor, which is
+  /// forgotten. 12 / 825 for `d`, the rest for `c`.
+  #[test]
+  fn shrinking_below_an_own_inferred_floor_releases_it() {
+    let fixture = resize_d_with_inferred_floors(-400);
+
+    assert_eq!(fixture.d.min_size(), Some((0, 100)));
+    assert_eq!(fixture.c.min_size(), Some((300, 150)));
+    assert_close(
+      &fixture.sizes(),
+      &[0.5, 0.5, 0.5, 0.5, 0.985_454_56, 0.014_545_455],
+    );
+  }
+
+  /// A request that fits within the floors has no reason to re-test
+  /// them.
+  #[test]
+  fn a_request_within_inferred_floors_keeps_them() {
+    let fixture = resize_d_with_inferred_floors(60);
+
+    assert_eq!(fixture.c.min_size(), Some((300, 150)));
+    assert_eq!(fixture.d.min_size(), Some((150, 100)));
+    assert_close(&fixture.sizes(), &WIDTH_ONLY);
   }
 }

@@ -5,10 +5,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![warn(clippy::all, clippy::pedantic)]
 
+use std::time::{Duration, Instant};
+
 use anyhow::Context;
 use wm_common::{ClientResponseData, ContainerDto, WindowDto, WmEvent};
 use wm_ipc_client::IpcClient;
 use wm_platform::recover_owned_windows;
+
+/// How long window recovery is retried after the WM exits unexpectedly.
+///
+/// Some failures never clear, such as a window that cannot reach its
+/// exact frame. Without a limit the watcher would run forever, and keep
+/// acting on windows that a relaunched WM has since claimed.
+const RECOVERY_LIMIT: Duration = Duration::from_secs(10);
+
+/// Pause between two attempts at window recovery.
+const RECOVERY_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,9 +49,16 @@ async fn main() -> anyhow::Result<()> {
         err
       );
 
+      let started = Instant::now();
+
       while let Err(err) = recover_owned_windows() {
+        if started.elapsed() >= RECOVERY_LIMIT {
+          tracing::error!("Gave up on window recovery: {err}");
+          break;
+        }
+
         tracing::warn!("Window recovery pending: {err}");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(RECOVERY_INTERVAL).await;
       }
     }
   }

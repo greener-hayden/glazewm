@@ -1,3 +1,8 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::{
   sync::{
     atomic::{AtomicBool, Ordering},
@@ -10,7 +15,7 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::{
-  kCFRunLoopDefaultMode, CFRetained, CFRunLoop, CFRunLoopSource,
+  kCFRunLoopCommonModes, CFRetained, CFRunLoop, CFRunLoopSource,
   CFRunLoopSourceContext,
 };
 
@@ -215,7 +220,11 @@ impl EventLoop {
     let run_loop =
       CFRunLoop::current().ok_or(crate::Error::EventLoopStopped)?;
 
-    run_loop.add_source(Some(&source), unsafe { kCFRunLoopDefaultMode });
+    // The common modes, not only the default one. While a menu or an
+    // alert is open the run loop is in a tracking or modal mode, and a
+    // source of the default mode alone is not serviced: every dispatch
+    // would then wait out its timeout and fail.
+    run_loop.add_source(Some(&source), unsafe { kCFRunLoopCommonModes });
 
     Ok(EventLoopSource {
       dispatch_tx,

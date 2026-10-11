@@ -176,6 +176,17 @@ pub trait WindowGetters: CommonGetters {
   /// Reads the cached value without cloning the rest of the properties.
   fn min_size(&self) -> Option<(i32, i32)>;
 
+  /// Frame the window was last seen at.
+  ///
+  /// Copies one rectangle, unlike `native_properties` which clones its
+  /// strings too.
+  fn native_frame(&self) -> Rect;
+
+  /// Whether the window was last seen maximized.
+  ///
+  /// Reads the cached value without cloning the rest of the properties.
+  fn is_native_maximized(&self) -> bool;
+
   /// Updates the cached native window properties using a closure.
   fn update_native_properties<F>(&self, updater: F)
   where
@@ -286,6 +297,14 @@ macro_rules! impl_window_getters {
 
       fn min_size(&self) -> Option<(i32, i32)> {
         self.0.borrow().native_properties.min_size
+      }
+
+      fn native_frame(&self) -> Rect {
+        self.0.borrow().native_properties.frame.clone()
+      }
+
+      fn is_native_maximized(&self) -> bool {
+        self.0.borrow().native_properties.is_maximized
       }
 
       fn update_native_properties<F>(&self, updater: F)

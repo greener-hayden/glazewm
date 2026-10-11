@@ -95,3 +95,16 @@ unsafe extern "C" {
   /// batched changes in a single frame.
   pub(crate) fn SLSReenableUpdate(cid: SLSConnectionID) -> CGError;
 }
+
+/// `QOS_CLASS_USER_INTERACTIVE` from `<sys/qos.h>`.
+pub(crate) const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+unsafe extern "C" {
+  /// Sets the quality-of-service class of the calling thread.
+  ///
+  /// Returns 0 on success, and an `errno` value otherwise.
+  pub(crate) fn pthread_set_qos_class_self_np(
+    qos_class: u32,
+    relative_priority: i32,
+  ) -> i32;
+}

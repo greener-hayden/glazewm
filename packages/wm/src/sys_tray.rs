@@ -2,7 +2,7 @@ use std::{
   fmt::{self, Display},
   path::Path,
   str::FromStr,
-  sync::{Arc, Mutex},
+  sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use anyhow::Context;
@@ -64,6 +64,14 @@ pub struct SystemTray {
   _tray_icon: ThreadBound<TrayIcon>,
 }
 
+/// Locks `mutex`, taking its value even if a holder panicked.
+///
+/// The mutexes here each guard one flag, which is valid whatever its
+/// holder was doing, so a poisoned lock is no reason to panic as well.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+  mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl SystemTray {
   /// Install the system tray on the main thread after the run loop starts.
   pub fn new(
@@ -92,14 +100,15 @@ impl SystemTray {
         .unwrap_or(false),
     ));
 
+    // A tray icon that cannot be created is returned as an error. A
+    // panic here would unwind the event loop's thread.
     let tray_icon = dispatcher.dispatch_sync(|| {
       let tray_icon = Self::create_tray_icon(
-        *animations_enabled.lock().unwrap(),
-        *run_on_startup_enabled.lock().unwrap(),
-      )
-      .unwrap();
-      ThreadBound::new(tray_icon, dispatcher.clone())
-    })?;
+        *lock(&animations_enabled),
+        *lock(&run_on_startup_enabled),
+      )?;
+      anyhow::Ok(ThreadBound::new(tray_icon, dispatcher.clone()))
+    })??;
 
     // Spawn thread to handle tray menu events.
     let config_path = config_path.to_owned();
@@ -249,14 +258,13 @@ impl SystemTray {
       }
       #[cfg(target_os = "windows")]
       TrayMenuId::ToggleWindowAnimations => {
-        let mut animations_enabled = animations_enabled.lock().unwrap();
+        let mut animations_enabled = lock(animations_enabled);
         dispatcher.set_window_animations_enabled(!*animations_enabled)?;
         *animations_enabled = !*animations_enabled;
         Ok(())
       }
       TrayMenuId::RunOnStartup => {
-        let mut run_on_startup_enabled =
-          run_on_startup_enabled.lock().unwrap();
+        let mut run_on_startup_enabled = lock(run_on_startup_enabled);
 
         if *run_on_startup_enabled {
           auto_launch_instance()?.disable()?;

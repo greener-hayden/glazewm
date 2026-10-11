@@ -260,12 +260,17 @@ impl UserConfig {
     window: &WindowContainer,
     event: &WindowRuleEvent,
   ) -> Vec<WindowRuleConfig> {
-    let window_title = window.native_properties().title;
+    // Cloned once each. `native_properties` and `done_window_rules`
+    // both clone all that they return, and the filter below runs once
+    // per rule.
+    let properties = window.native_properties();
+    let window_title = properties.title;
     #[cfg(target_os = "windows")]
-    let window_class = window.native_properties().class_name;
+    let window_class = properties.class_name;
     #[cfg(target_os = "macos")]
-    let window_bundle_id = window.native_properties().bundle_id;
-    let window_process = window.native_properties().process_name;
+    let window_bundle_id = properties.bundle_id;
+    let window_process = properties.process_name;
+    let done_window_rules = window.done_window_rules();
 
     let pending_window_rules = self
       .window_rules_by_event
@@ -274,7 +279,7 @@ impl UserConfig {
       .iter()
       .filter(|rule| {
         // Skip if window has already ran the rule.
-        if window.done_window_rules().contains(rule) {
+        if done_window_rules.contains(rule) {
           return false;
         }
 

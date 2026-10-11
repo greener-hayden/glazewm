@@ -878,6 +878,16 @@ fn put_property(
   Ok(())
 }
 
+/// Records `result`'s error in `failure` unless one is already there.
+fn keep_first(
+  failure: &mut Option<crate::Error>,
+  result: crate::Result<()>,
+) {
+  if let Err(err) = result {
+    failure.get_or_insert(err);
+  }
+}
+
 /// Reads the home rect recorded before parking.
 fn parked_home(
   window: &NativeWindow,
@@ -891,6 +901,42 @@ fn parked_home(
   Ok(Some(Rect::from_ltrb(left?, top?, right?, bottom?)))
 }
 
+/// Removes the recovery record of a window whose changes are undone.
+///
+/// Looks once more for a change that landed while the record was being
+/// removed, and undoes it.
+fn forget_recovery(
+  window: &NativeWindow,
+  changes: isize,
+) -> crate::Result<()> {
+  for key in FRAME.into_iter().chain([CHANGES, OWNER]) {
+    if property(window, key) != 0 {
+      // SAFETY: Removes only our named properties.
+      unsafe {
+        RemovePropW(window.hwnd(), key)?;
+      }
+    }
+  }
+  // A worker's call that was already running when the caller's checks
+  // ran may have landed since. Its own ownership check fails now that the
+  // record is gone, so it undoes itself; this look catches one that
+  // landed before its check. Best effort: nothing is left to retry with.
+  if changes & CLOAK != 0 && window.inner.is_cloaked().unwrap_or(false) {
+    if let Err(err) = window.set_cloaked(false) {
+      tracing::warn!("Late cloak could not be undone: {err}");
+    }
+  }
+  // Not for an application that has stopped answering: removing the bit
+  // would wait on it.
+  if changes & ALPHA != 0
+    && window.has_window_style_ex(WS_EX_LAYERED)
+    && !window.inner.is_hung()
+  {
+    window.remove_window_style_ex(WS_EX_LAYERED);
+  }
+  Ok(())
+}
+
 /// Restores exclusively tagged WM changes.
 ///
 /// Concealment is lifted before placement settles. Placement writes are
@@ -898,6 +944,10 @@ fn parked_home(
 /// frame; returning early with the window still cloaked or transparent
 /// strands it invisible whenever no caller retries. A misplaced window
 /// is recoverable by the user, an unseen one is not.
+///
+/// For the same reason every step that makes the window visible runs
+/// whatever the steps before it did. The first failure is returned once
+/// they have all run, which keeps the recovery record for a retry.
 ///
 /// With `queued`, removing the layered bit does not wait on the
 /// application; see `NativeSession::release_queued`.
@@ -909,75 +959,142 @@ fn recover_window(
     return Ok(Recovery::Complete);
   }
   let changes = property(window, CHANGES);
+  let mut failure = None;
   // Start the move first, so concealment lifts over a travelling window.
-  let home = parked_home(window, changes)?;
+  let home = parked_home(window, changes).unwrap_or_else(|err| {
+    keep_first(&mut failure, Err(err));
+    None
+  });
   if let Some(target) = &home {
-    if window.frame_with_shadows()? != *target {
-      window.set_frame(target)?;
-    }
+    keep_first(
+      &mut failure,
+      window.frame_with_shadows().and_then(|frame| {
+        if frame == *target {
+          Ok(())
+        } else {
+          window.set_frame(target)
+        }
+      }),
+    );
   }
-  if changes & CLOAK != 0 && window.inner.is_cloaked()? {
-    window.set_cloaked(false)?;
+  // A state that cannot be read is taken as still concealed: one
+  // needless reveal is harmless, and a skipped one strands the window.
+  if changes & CLOAK != 0 && window.inner.is_cloaked().unwrap_or(true) {
+    keep_first(&mut failure, window.set_cloaked(false));
   }
-  if changes & HIDDEN != 0 && !window.is_visible()? {
-    window.show()?;
+  if changes & HIDDEN != 0 && !window.is_visible().unwrap_or(false) {
+    keep_first(&mut failure, window.show());
   }
   if changes & ALPHA != 0 {
     match queued {
       Some(QueuedRemoval { session, done })
-        if window.has_window_style_ex(WS_EX_LAYERED) =>
+        if failure.is_none()
+          && window.has_window_style_ex(WS_EX_LAYERED) =>
       {
         // Reveal now; the bit follows. The record stays until it does.
         session.apply_alpha(u8::MAX);
         session.queue_layer_with(false, u8::MAX, true, Some(done))?;
         return Ok(Recovery::Queued);
       }
+      // An earlier step failed, so the record has to stay for a retry
+      // and nothing is queued that would complete it. The window is
+      // still revealed.
+      Some(QueuedRemoval { session, .. })
+        if window.has_window_style_ex(WS_EX_LAYERED) =>
+      {
+        session.apply_alpha(u8::MAX);
+      }
       Some(_) => {}
+      // Removing the bit waits on the window's application. One that
+      // has stopped answering would hold this thread, which is the WM's
+      // when a window is released. The window is made opaque instead,
+      // which waits on nothing, and the record is kept for a retry.
+      None if window.inner.is_hung() => {
+        if window.has_window_style_ex(WS_EX_LAYERED) {
+          keep_first(
+            &mut failure,
+            window.inner.set_layered_alpha(u8::MAX),
+          );
+        }
+        keep_first(
+          &mut failure,
+          Err(crate::Error::Platform(
+            "Application is not responding; opacity restoration waits."
+              .into(),
+          )),
+        );
+      }
       None => {
         window.remove_window_style_ex(WS_EX_LAYERED);
         if window.has_window_style_ex(WS_EX_LAYERED) {
-          return Err(crate::Error::Platform(
-            "Opacity restoration failed.".into(),
-          ));
+          keep_first(
+            &mut failure,
+            Err(crate::Error::Platform(
+              "Opacity restoration failed.".into(),
+            )),
+          );
         }
       }
     }
   }
   if changes & TITLE != 0 {
-    window.set_title_bar_visibility(changes & ORIGINAL_TITLE != 0)?;
+    keep_first(
+      &mut failure,
+      window.set_title_bar_visibility(changes & ORIGINAL_TITLE != 0),
+    );
   }
-  // Retain the recovery record until the window reaches its home.
+  if let Some(err) = failure {
+    return Err(err);
+  }
+  // Retain the recovery record until the window reaches its home, or as
+  // near to it as an application that rounds its size gets.
   if let Some(target) = &home {
-    if window.frame_with_shadows()? != *target {
+    if !window.frame_with_shadows()?.is_at_with_size_within(
+      target,
+      crate::placement_session::RECOVERY_SLACK,
+    ) {
       return Err(crate::Error::Platform(
         "Window recovery pending.".into(),
       ));
     }
   }
-  for key in FRAME.into_iter().chain([CHANGES, OWNER]) {
-    // SAFETY: Removes only our named properties.
-    if property(window, key) != 0 {
-      unsafe {
-        RemovePropW(window.hwnd(), key)?;
-      }
-    }
-  }
-  // A worker's call that was already running when the checks above ran
-  // may have landed since. Its own ownership check fails now that the
-  // record is gone, so it undoes itself; this look catches one that
-  // landed before its check. Best effort: nothing is left to retry with.
-  if changes & CLOAK != 0 && window.inner.is_cloaked().unwrap_or(false) {
-    if let Err(err) = window.set_cloaked(false) {
-      tracing::warn!("Late cloak could not be undone: {err}");
-    }
-  }
-  if changes & ALPHA != 0 && window.has_window_style_ex(WS_EX_LAYERED) {
-    window.remove_window_style_ex(WS_EX_LAYERED);
-  }
+  forget_recovery(window, changes)?;
   Ok(Recovery::Complete)
 }
 
+/// Lifts the concealment of a window that the WM owns, without waiting
+/// on the window's application.
+///
+/// Only the shell and the system are called. Best effort: failures are
+/// logged, and `recover_window` repeats these steps and reports them.
+fn reveal_window(window: &NativeWindow) {
+  if property(window, OWNER) == 0 {
+    return;
+  }
+  let changes = property(window, CHANGES);
+  if changes & CLOAK != 0 && window.inner.is_cloaked().unwrap_or(true) {
+    if let Err(err) = window.set_cloaked(false) {
+      tracing::debug!("Early uncloak failed: {err}");
+    }
+  }
+  if changes & HIDDEN != 0 && !window.is_visible().unwrap_or(false) {
+    if let Err(err) = window.show() {
+      tracing::debug!("Early show failed: {err}");
+    }
+  }
+  if changes & ALPHA != 0 && window.has_window_style_ex(WS_EX_LAYERED) {
+    if let Err(err) = window.inner.set_layered_alpha(u8::MAX) {
+      tracing::debug!("Early opacity restore failed: {err}");
+    }
+  }
+}
+
 /// Recovers windows missed by IPC delivery.
+///
+/// Every owned window is revealed first, and only then is each restored
+/// in full. The full restore changes a window style, which waits on the
+/// window's application, so one hung application would otherwise keep
+/// every window after it hidden.
 pub fn recover_owned_windows() -> crate::Result<()> {
   /// Collects handles without mutating windows.
   unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> BOOL {
@@ -994,6 +1111,9 @@ pub fn recover_owned_windows() -> crate::Result<()> {
       Some(collect),
       LPARAM(std::ptr::from_mut(&mut handles) as isize),
     )?;
+  }
+  for &handle in &handles {
+    reveal_window(&NativeWindow::from_handle(handle));
   }
   let mut failure = None;
   for handle in handles {

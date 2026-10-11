@@ -25,6 +25,10 @@ pub fn reload_config(
   // Re-evaluate user config file and set its values in state.
   config.reload()?;
 
+  // Before the rules run, so that the styling they ask for is not
+  // forgotten with the old config's.
+  state.native_sync.forget_styling();
+
   // Re-run window rules on all active windows.
   for window in state.windows() {
     window.set_done_window_rules(Vec::new());

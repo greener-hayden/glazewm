@@ -1559,8 +1559,7 @@ impl AnimationManager {
 
     if window.native_properties().is_minimized
       || matches!(window.state(), WindowState::Fullscreen(_))
-      || (window.native_properties().is_maximized
-        && cfg!(target_os = "macos"))
+      || (window.is_native_maximized() && cfg!(target_os = "macos"))
       || (!self.is_animating(&window.id())
         && starts_at_corner
         && !is_slide)
@@ -1616,7 +1615,7 @@ impl AnimationManager {
 
         // If the window is mid-animation, compare the previous animation
         // target to the new target.
-        let frame = window.native_properties().frame;
+        let frame = window.native_frame();
         let prev_rect = self
           .animations
           .get(&window.id())
@@ -1722,7 +1721,7 @@ impl AnimationManager {
     let (presented_rect, velocity) = self.cover_motion(&window.id())?;
     let start_rect = presented_rect
       .or_else(|| plan.path.start.clone())
-      .unwrap_or_else(|| window.native_properties().frame.clone());
+      .unwrap_or_else(|| window.native_frame());
 
     let mut animation = AnimationSpec::new(
       start_rect,
@@ -1877,7 +1876,7 @@ impl AnimationManager {
 
     let destination = target.inset(-COVER_MARGIN_PX);
     let origin = (previous != Some(SourcePlacement::Covered))
-      .then(|| window.native_properties().frame.inset(-COVER_MARGIN_PX));
+      .then(|| window.native_frame().inset(-COVER_MARGIN_PX));
 
     match overlay.window.cover(
       &destination,
@@ -2005,6 +2004,15 @@ impl AnimationManager {
     self.update_clock();
   }
 
+  /// Forgets a clock that reported itself unavailable.
+  ///
+  /// Such a clock's thread has exited. Kept, it would still look like a
+  /// running clock of its rate, and the next animation at that rate
+  /// would start without anything to tick it.
+  pub fn clock_stopped(&mut self) {
+    self.clock = None;
+  }
+
   /// Keeps compositor signals alive while any overlay awaits handoff.
   ///
   /// A companion overlay counts too: its reveal hold waits on compositor
@@ -2017,6 +2025,9 @@ impl AnimationManager {
   /// burst of duplicate frames.
   ///
   /// Called on animation start and completion.
+  ///
+  /// A clock that reported itself unavailable must be forgotten first
+  /// with `clock_stopped`, or it counts as running here.
   fn update_clock(&mut self) {
     let Some(frame_rate) = self
       .windows

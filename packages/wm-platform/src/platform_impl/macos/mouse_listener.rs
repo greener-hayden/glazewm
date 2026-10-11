@@ -1,3 +1,8 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::{
   cell::Cell,
   os::raw::c_void,
@@ -175,7 +180,10 @@ impl MouseListener {
       CGEvent::tap_create(
         CGEventTapLocation::AnnotatedSessionEventTap,
         CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::Default,
+        // The callback never changes or drops an event. An active tap
+        // makes the window server wait on it for every event all the
+        // same, and a listen-only tap does not.
+        CGEventTapOptions::ListenOnly,
         mask,
         Some(Self::mouse_event_callback),
         callback_data_ptr as *mut c_void,

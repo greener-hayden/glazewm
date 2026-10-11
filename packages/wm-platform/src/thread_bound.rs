@@ -56,6 +56,9 @@ pub struct ThreadBound<T> {
 // SAFETY: Access to the inner value is only exposed on the event loop
 // thread.
 unsafe impl<T> Send for ThreadBound<T> {}
+
+// SAFETY: As for `Send`: a shared reference from another thread cannot
+// reach the inner value either.
 unsafe impl<T> Sync for ThreadBound<T> {}
 
 impl<T> ThreadBound<T> {

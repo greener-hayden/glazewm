@@ -29,6 +29,11 @@
 //! running them. A large wait means the loop was busy; a large run means
 //! the closure itself is slow.
 //!
+//! `placed` is logged once per window, when its frame first matches its
+//! tile with nothing concealing it. Its `ms=` runs from the first pass
+//! that took the window on, so it is the time a new window takes to
+//! settle. Every window is logged at startup too.
+//!
 //! Native overlay creation (`overlay_new`) logs under the same target,
 //! at `INFO` once it takes [`SLOW_CALL`] or longer, with the cost of each
 //! step. Shell cloak calls run on a worker and are not timed here.

@@ -146,8 +146,15 @@ pub trait CommonGetters {
   fn child_focus_order(&self) -> Box<dyn Iterator<Item = Container> + '_> {
     let child_focus_order = self.borrow_child_focus_order();
 
+    let mut index = 0;
+
+    // The position is kept between calls. Starting over on each call
+    // yields the first child forever, and a search that skips it never
+    // ends.
     Box::new(std::iter::from_fn(move || {
-      for child_id in child_focus_order.iter() {
+      while let Some(child_id) = child_focus_order.get(index) {
+        index += 1;
+
         if let Some(child) = self.child_by_id(child_id) {
           return Some(child);
         }
@@ -405,4 +412,58 @@ macro_rules! impl_common_getters {
       }
     }
   };
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::{
+    commands::container::attach_container,
+    models::{NonTilingWindow, TilingWindow, Workspace},
+  };
+
+  /// The iterator used to yield its first child forever, so a search
+  /// that skipped that child never returned.
+  #[test]
+  fn child_focus_order_yields_each_child_once() {
+    let workspace: Container = Workspace::mock().call().into();
+    let tiling: Container = TilingWindow::mock().call().into();
+    let floating: Container = NonTilingWindow::mock().call().into();
+
+    attach_container(&tiling, &workspace, None).unwrap();
+    attach_container(&floating, &workspace, None).unwrap();
+
+    let ids = workspace
+      .child_focus_order()
+      .map(|child| child.id())
+      .collect::<Vec<_>>();
+
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&tiling.id()));
+    assert!(ids.contains(&floating.id()));
+  }
+
+  /// A floating window focused last must not hide the tiling child
+  /// behind it.
+  #[test]
+  fn a_search_of_the_focus_order_passes_a_non_tiling_child() {
+    let workspace: Container = Workspace::mock().call().into();
+    let tiling: Container = TilingWindow::mock().call().into();
+    let floating: Container = NonTilingWindow::mock().call().into();
+
+    attach_container(&tiling, &workspace, None).unwrap();
+    attach_container(&floating, &workspace, None).unwrap();
+    workspace
+      .borrow_child_focus_order_mut()
+      .retain(|id| *id != floating.id());
+    workspace
+      .borrow_child_focus_order_mut()
+      .push_front(floating.id());
+
+    let found = workspace
+      .child_focus_order()
+      .find_map(|child| child.as_tiling_container().ok());
+
+    assert_eq!(found.map(|found| found.id()), Some(tiling.id()));
+  }
 }

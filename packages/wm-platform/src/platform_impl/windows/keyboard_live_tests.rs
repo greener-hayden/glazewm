@@ -120,8 +120,8 @@ impl Observer {
         },
       },
     });
-    // SAFETY: Injects only the tagged test key.
     assert_eq!(
+      // SAFETY: Injects only the tagged test key.
       unsafe {
         SendInput(
           &inputs,

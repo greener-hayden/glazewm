@@ -14,7 +14,7 @@ use crate::{
     container::{flatten_split_container, move_container_within_tree},
     window::update_window_state,
   },
-  events::handle_window_moved_or_resized_end,
+  events::{apply_dragged_edges, handle_window_moved_or_resized_end},
   models::{Monitor, NonTilingWindow, WindowContainer},
   traits::{CommonGetters, WindowGetters},
   user_config::UserConfig,
@@ -58,10 +58,19 @@ pub fn handle_window_moved_or_resized(
     // platform animates for itself, a tick reconciles only when
     // `PlacementCoordinator::tick_due` finds work, and an unconfirmed
     // write is one of the things that makes it due.
-    if !state.animation_manager.drives_frames(&window.id()) {
+    //
+    // A window the user is dragging is not reconciled either, unless a
+    // presentation still owns its geometry: its frame is suspended, so a
+    // pass per move event would write nothing. The event that ends the
+    // drag queues its own pass below.
+    let observes = !state.animation_manager.drives_frames(&window.id());
+    let is_dragging = !state.is_paused && window.active_drag().is_some();
+    if observes
+      && (!is_dragging || state.native_sync.owns_geometry(window.id()))
+    {
       state.native_sync.observe(window.id());
     }
-    let old_frame_position = window.native_properties().frame;
+    let old_frame_position = window.native_frame();
 
     // On macOS every native read is a hop to the main thread and a round
     // trip to the application, and a window echoes each of our own writes
@@ -109,13 +118,16 @@ pub fn handle_window_moved_or_resized(
       };
 
       if is_drag_end {
+        if observes {
+          state.native_sync.observe(window.id());
+        }
         return handle_window_moved_or_resized_end(&window, state, config);
       }
 
       return update_drag_state(&window, &frame_position, state, config);
     }
 
-    let old_is_maximized = window.native_properties().is_maximized;
+    let old_is_maximized = window.is_native_maximized();
     #[cfg(target_os = "macos")]
     let is_maximized = try_warn!(native_state.is_maximized);
     #[cfg(target_os = "windows")]
@@ -275,8 +287,8 @@ pub fn handle_window_moved_or_resized(
     // shown/hidden events in this mode, update `DisplayState` based on
     // whether the window has been moved to the monitor's bottom corner.
     if config.value.general.hide_method == HideMethod::PlaceInCorner {
-      let is_in_corner = window
-        .is_in_corner(&nearest_monitor.native_properties().working_area);
+      let is_in_corner =
+        window.is_in_corner(&nearest_monitor.working_area());
 
       // TODO: Consider redrawing if hidden and should be shown, or if
       // shown and should be hidden.
@@ -527,11 +539,34 @@ fn update_drag_state(
     is_move
   };
 
+  // A resize moves the neighbour across the dragged edge as the drag
+  // runs, so the two tiles stay side by side under the cursor. Without
+  // this they overlap or pull apart until the release.
+  //
+  // The dragged window is not written: its frame is suspended for the
+  // drag, and the user holds it. The neighbours cut to their frames,
+  // since an animation per move event would trail behind the cursor.
+  if !is_move {
+    if let WindowContainer::TilingWindow(tiling_window) = window {
+      apply_dragged_edges(
+        tiling_window,
+        &active_drag.initial_position,
+        frame_position,
+        state,
+      )?;
+      if state.pending_sync.has_changes() {
+        state.pending_sync.set_skip_animations(true);
+      }
+    }
+
+    return Ok(());
+  }
+
   // Transition window to be floating while it's being dragged, but only
   // after it has been moved at least 10px from its initial position. The
   // 10px threshold is to account for small movements that may be
   // accidental.
-  if is_move && !matches!(window.state(), WindowState::Floating(_)) {
+  if !matches!(window.state(), WindowState::Floating(_)) {
     let move_distance = frame_position
       .center_point()
       .distance_between(&active_drag.initial_position.center_point());
@@ -607,7 +642,7 @@ fn release_disproved_floor(
   frame: &Rect,
   state: &mut WmState,
 ) {
-  let Some((width, height)) = window.native_properties().min_size else {
+  let Some((width, height)) = window.min_size() else {
     return;
   };
 

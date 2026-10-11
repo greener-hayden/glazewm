@@ -42,6 +42,16 @@ pub enum ConcealMethod {
   Park,
 }
 
+/// Furthest a recovered window's width or height may be from its home
+/// frame, in pixels, and still count as recovered.
+///
+/// Some applications round the size they are asked for; a terminal keeps
+/// whole rows of text. Such a window never matches its home frame
+/// exactly, and a recovery that waits for an exact match retries without
+/// end. The bound is a row of large text, the same one the frame
+/// reconciler uses.
+pub(crate) const RECOVERY_SLACK: i32 = 24;
+
 /// One reading of a window's native geometry and state.
 ///
 /// Returned by [`PlacementSession::observe`].
@@ -330,6 +340,27 @@ impl PlacementSession {
     #[cfg(target_os = "macos")]
     {
       Ok(observed.clone())
+    }
+  }
+
+  /// The frame the window shows at now, read without asking its
+  /// application.
+  ///
+  /// This is the rectangle the layout works in. Use it wherever a frame
+  /// becomes a tile size; [`Self::observed_frame`] is wider on Windows.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: the frame without its invisible resize borders.
+  /// - macOS: the window server's bounds for the window.
+  pub fn visible_frame(&self) -> crate::Result<Rect> {
+    #[cfg(target_os = "windows")]
+    {
+      self.window()?.frame()
+    }
+    #[cfg(target_os = "macos")]
+    {
+      self.observed_frame()
     }
   }
 
@@ -865,7 +896,10 @@ impl PlacementSession {
       self.validate()?;
       let target = self.recovery_frame.borrow().clone();
       if let Some(target) = target {
-        if self.observed_frame()? != target {
+        if !self
+          .observed_frame()?
+          .is_at_with_size_within(&target, RECOVERY_SLACK)
+        {
           self.native.set_frame(&target)?;
           return Err(crate::Error::Platform(
             "Window recovery pending.".into(),

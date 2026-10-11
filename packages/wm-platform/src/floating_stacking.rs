@@ -303,6 +303,9 @@ fn apply(job: &StackingJob) -> crate::Result<()> {
       // geometry, visibility, or owner repositioning is requested.
       #[cfg(test)]
       eprintln!("floating: raise {id:?}");
+      // SAFETY: Both handles are passed by value, and the system rejects
+      // one that no longer names a window. No memory of ours is read or
+      // written.
       unsafe {
         SetWindowPos(
           HWND(id.0),

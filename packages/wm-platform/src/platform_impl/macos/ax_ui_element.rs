@@ -1,3 +1,8 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::ptr::{self, NonNull};
 
 use objc2_application_services::{

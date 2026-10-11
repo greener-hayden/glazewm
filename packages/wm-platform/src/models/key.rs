@@ -232,7 +232,11 @@ impl Key {
         .next()
         .ok_or_else(|| KeyParseError::UnknownKey(key_str.to_string()))?;
 
+      // SAFETY: Takes a thread identifier by value; 0 names the calling
+      // thread.
       let layout = unsafe { GetKeyboardLayout(0) };
+      // SAFETY: Takes a character and a layout handle by value, and the
+      // handle was just returned by the system.
       let vk_code = unsafe { VkKeyScanExW(utf16_key, layout) };
 
       if vk_code == -1 {

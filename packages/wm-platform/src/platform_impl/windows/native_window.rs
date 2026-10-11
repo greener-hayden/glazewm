@@ -1,3 +1,8 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::collections::HashSet;
 
 use tracing::warn;
@@ -29,8 +34,8 @@ use windows::{
         EnumWindows, GetAncestor, GetClassNameW, GetDesktopWindow,
         GetForegroundWindow, GetLayeredWindowAttributes, GetShellWindow,
         GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-        IsWindowVisible, IsZoomed, SendNotifyMessageW,
+        GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow,
+        IsIconic, IsWindow, IsWindowVisible, IsZoomed, SendNotifyMessageW,
         SetForegroundWindow, SetLayeredWindowAttributes,
         SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
         ShowWindowAsync, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, GWL_STYLE,
@@ -547,11 +552,10 @@ impl NativeWindow {
         })?;
 
         // Ref: https://github.com/Ciantic/AltTabAccessor/issues/1#issuecomment-1426877843
-        unsafe { view.set_cloak(1, if cloaked { 2 } else { 0 }) }
-          .ok()
-          .map_err(|_| {
-            crate::Error::Platform("Failed to cloak window.".to_string())
-          })
+        // The error keeps its code, which `with_retry` reads.
+        unsafe { view.set_cloak(1, if cloaked { 2 } else { 0 }) }.ok()?;
+
+        Ok(())
       })
     })
   }
@@ -608,6 +612,18 @@ impl NativeWindow {
         Ok(())
       })
     })
+  }
+
+  /// Whether the window's application has stopped answering messages.
+  ///
+  /// A call that sends the window a message, such as a style change,
+  /// does not return for as long as that lasts. Check this first on a
+  /// thread that must not block. The application can still stop
+  /// answering between the check and the call.
+  pub(crate) fn is_hung(&self) -> bool {
+    // SAFETY: The handle is passed by value, and the system rejects one
+    // that no longer names a window.
+    unsafe { IsHungAppWindow(self.hwnd()) }.as_bool()
   }
 
   /// Implements [`NativeWindowWindowsExt::add_window_style_ex`].
@@ -721,6 +737,14 @@ impl NativeWindow {
     };
 
     if new_style != style {
+      // The style change is sent to the window and waits for its
+      // application, however long that takes.
+      if self.is_hung() {
+        return Err(crate::Error::Platform(
+          "Application is not responding; title bar left as it is.".into(),
+        ));
+      }
+
       unsafe {
         SetWindowLongPtrW(self.hwnd(), GWL_STYLE, new_style);
         SetWindowPos(

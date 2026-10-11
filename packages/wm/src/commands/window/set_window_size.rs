@@ -10,6 +10,7 @@ use crate::{
   },
   traits::{
     CommonGetters, PositionGetters, TilingSizeGetters, WindowGetters,
+    MIN_TILING_SIZE,
   },
   wm_state::WmState,
 };
@@ -67,6 +68,32 @@ impl ResizeContext {
       sibling_count: window.tiling_sibling_count(),
     })
   }
+
+  /// Length of the parent along an axis that its tiling children share
+  /// out, in pixels. This is the parent's length without its gaps.
+  fn parent_length(&self, is_width_resize: bool) -> anyhow::Result<i32> {
+    let (horizontal_gap, vertical_gap) =
+      self.container_to_resize.inner_gaps()?;
+
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let gaps = self.sibling_count as i32;
+
+    Ok(if is_width_resize {
+      self.parent_rect.width() - horizontal_gap * gaps
+    } else {
+      self.parent_rect.height() - vertical_gap * gaps
+    })
+  }
+}
+
+/// Edge of a tiling window that a resize moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+  /// The left edge of a width, or the top edge of a height.
+  Start,
+
+  /// The right edge of a width, or the bottom edge of a height.
+  End,
 }
 
 /// Contexts that a caller has already resolved for each axis.
@@ -180,22 +207,13 @@ fn set_tiling_window_length(
     None => ResizeContext::resolve(window, is_width_resize)?,
   };
 
-  if let Some(ResizeContext {
-    container_to_resize,
-    parent,
-    parent_rect,
-    sibling_count,
-  }) = context
-  {
-    let (horizontal_gap, vertical_gap) =
-      container_to_resize.inner_gaps()?;
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let parent_length = if is_width_resize {
-      parent_rect.width() - horizontal_gap * sibling_count as i32
-    } else {
-      parent_rect.height() - vertical_gap * sibling_count as i32
-    };
+  if let Some(context) = context {
+    let parent_length = context.parent_length(is_width_resize)?;
+    let ResizeContext {
+      container_to_resize,
+      parent,
+      ..
+    } = context;
 
     // Without room to resize into, a pixel length has no percentage.
     if parent_length <= 0 {
@@ -249,6 +267,115 @@ fn set_tiling_window_length(
   }
 
   Ok(false)
+}
+
+/// Sets the length of a tiling window along one axis by moving one edge.
+///
+/// Only the neighbour across `edge` gives up or takes the space, so every
+/// other edge in the row stays where it is. This is what dragging an edge
+/// shows the user, where `set_window_size` shares the change out among
+/// all siblings.
+///
+/// The length is clamped to the floors of the window and the neighbour.
+/// Without a neighbour across `edge`, such as at the end of a row, the
+/// change is shared out as `set_window_size` does.
+pub fn set_tiling_window_edge(
+  window: &TilingWindow,
+  target_px: i32,
+  is_width_resize: bool,
+  edge: ResizeEdge,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  let Some(context) = ResizeContext::resolve(window, is_width_resize)?
+  else {
+    return Ok(());
+  };
+
+  let container = context.container_to_resize.clone();
+  let neighbour = match edge {
+    ResizeEdge::Start => container
+      .prev_siblings()
+      .find_map(|sibling| sibling.as_tiling_container().ok()),
+    ResizeEdge::End => container
+      .next_siblings()
+      .find_map(|sibling| sibling.as_tiling_container().ok()),
+  };
+
+  let Some(neighbour) = neighbour else {
+    set_tiling_window_length(
+      window,
+      &LengthValue::from_px(target_px),
+      is_width_resize,
+      Some(context),
+      state,
+    )?;
+    return Ok(());
+  };
+
+  let parent_length = context.parent_length(is_width_resize)?;
+
+  // The two tiles trade space, so their sizes keep this sum.
+  let pair_size = container.tiling_size() + neighbour.tiling_size();
+
+  // Without room to resize into, or for both tiles to keep a usable
+  // size, there is nothing to trade.
+  if parent_length <= 0
+    || !pair_size.is_finite()
+    || pair_size < 2. * MIN_TILING_SIZE
+  {
+    return Ok(());
+  }
+
+  #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+  let limits = || {
+    let floor = container.min_length(is_width_resize);
+    let pair_px = (pair_size * parent_length as f32) as i32;
+
+    (
+      floor,
+      (pair_px - neighbour.min_length(is_width_resize)).max(floor),
+    )
+  };
+
+  let (mut floor, mut ceiling) = limits();
+
+  // An inferred floor in the way is re-tested, as in
+  // `release_floors_in_the_way`. Only the neighbour's floor can be, since
+  // no other sibling gives up space here.
+  let released = if target_px < floor {
+    container.release_inferred_floors(is_width_resize)
+  } else if target_px > ceiling {
+    neighbour.release_inferred_floors(is_width_resize)
+  } else {
+    false
+  };
+
+  if released {
+    (floor, ceiling) = limits();
+  }
+
+  let tiling_size = LengthValue::from_px(target_px.clamp(floor, ceiling))
+    .to_percentage(parent_length)
+    .clamp(MIN_TILING_SIZE, pair_size - MIN_TILING_SIZE);
+
+  // A change of under half a pixel moves nothing on screen.
+  #[allow(clippy::cast_precision_loss)]
+  let half_pixel = 0.5 / parent_length as f32;
+  let resized =
+    (container.tiling_size() - tiling_size).abs() >= half_pixel;
+
+  if resized {
+    container.set_tiling_size(tiling_size);
+    neighbour.set_tiling_size(pair_size - tiling_size);
+  }
+
+  if resized || released {
+    state
+      .pending_sync
+      .queue_containers_to_redraw(context.parent.tiling_children());
+  }
+
+  Ok(())
 }
 
 /// The shortest and longest that `container` can be along an axis, in
@@ -743,5 +870,169 @@ mod tests {
     assert_eq!(fixture.c.min_size(), Some((300, 150)));
     assert_eq!(fixture.d.min_size(), Some((150, 100)));
     assert_close(&fixture.sizes(), &WIDTH_ONLY);
+  }
+
+  /// Three windows in a row on a gapless 1680px workspace, 560px each.
+  /// The third window can be given a reported width floor.
+  fn row_of_three(
+    third_floor: Option<i32>,
+  ) -> (WmState, UnboundedReceiver<WmEvent>, [TilingWindow; 3]) {
+    let windows = [(); 3].map(|()| TilingWindow::mock().call());
+
+    if let Some(floor) = third_floor {
+      windows[2].update_native_properties(|properties| {
+        properties.min_size = Some((floor, 0));
+        properties.min_size_source = MinSizeSource::Reported;
+      });
+    }
+
+    let workspace = Workspace::mock()
+      .tiling_containers(windows.iter().cloned().map(Into::into).collect())
+      .call();
+    let monitor = Monitor::mock().workspaces(vec![workspace]).call();
+    let (state, events) = mock_state();
+    attach_monitor(&state, &monitor).expect("Attach monitor.");
+
+    for window in &windows {
+      window.set_tiling_size(1. / 3.);
+    }
+
+    (state, events, windows)
+  }
+
+  /// Tiling sizes of the row, in order.
+  fn row_sizes(windows: &[TilingWindow; 3]) -> Vec<f32> {
+    windows.iter().map(TilingSizeGetters::tiling_size).collect()
+  }
+
+  /// Dragging the right edge of the middle window takes from the window
+  /// on its right, and leaves the edge on its left where it was.
+  #[test]
+  fn an_end_edge_trades_with_the_next_sibling_only() {
+    let (mut state, _events, windows) = row_of_three(None);
+
+    set_tiling_window_edge(
+      &windows[1],
+      660,
+      true,
+      ResizeEdge::End,
+      &mut state,
+    )
+    .expect("Resize.");
+
+    assert_close(
+      &row_sizes(&windows),
+      &[1. / 3., 660. / 1680., 460. / 1680.],
+    );
+  }
+
+  /// Dragging the left edge takes from the window on the left.
+  #[test]
+  fn a_start_edge_trades_with_the_previous_sibling_only() {
+    let (mut state, _events, windows) = row_of_three(None);
+
+    set_tiling_window_edge(
+      &windows[1],
+      660,
+      true,
+      ResizeEdge::Start,
+      &mut state,
+    )
+    .expect("Resize.");
+
+    assert_close(
+      &row_sizes(&windows),
+      &[460. / 1680., 660. / 1680., 1. / 3.],
+    );
+  }
+
+  /// The first window has nothing across its left edge, so the change
+  /// is shared out among the rest of the row.
+  #[test]
+  fn an_edge_without_a_neighbour_shares_the_change_out() {
+    let (mut state, _events, windows) = row_of_three(None);
+
+    set_tiling_window_edge(
+      &windows[0],
+      660,
+      true,
+      ResizeEdge::Start,
+      &mut state,
+    )
+    .expect("Resize.");
+
+    assert_close(
+      &row_sizes(&windows),
+      &[660. / 1680., 510. / 1680., 510. / 1680.],
+    );
+  }
+
+  /// The neighbour keeps its floor, however far the edge was dragged.
+  #[test]
+  fn an_edge_stops_at_the_floor_of_its_neighbour() {
+    let (mut state, _events, windows) = row_of_three(Some(500));
+
+    set_tiling_window_edge(
+      &windows[1],
+      5000,
+      true,
+      ResizeEdge::End,
+      &mut state,
+    )
+    .expect("Resize.");
+
+    assert_close(
+      &row_sizes(&windows),
+      &[1. / 3., 620. / 1680., 500. / 1680.],
+    );
+  }
+
+  /// A request of under half a pixel changes nothing, so the sizes stay
+  /// exactly as they were.
+  #[test]
+  fn an_edge_that_did_not_move_leaves_the_sizes_alone() {
+    let (mut state, _events, windows) = row_of_three(None);
+
+    set_tiling_window_edge(
+      &windows[1],
+      560,
+      true,
+      ResizeEdge::End,
+      &mut state,
+    )
+    .expect("Resize.");
+
+    assert_eq!(row_sizes(&windows), vec![1. / 3.; 3]);
+  }
+
+  /// A keyboard resize reads the tile's width back in whole pixels, so
+  /// a step out and a step back could in principle land off the start.
+  /// It does not: 200 round trips at three step sizes stay within half a
+  /// pixel of where they began.
+  #[test]
+  fn a_resize_step_out_and_back_returns_to_the_start() {
+    for step in ["2%", "3%", "7%"] {
+      let (mut state, _events, windows) = row_of_three(None);
+      let start = row_sizes(&windows);
+
+      for _ in 0..200 {
+        for sign in ["+", "-"] {
+          resize_window(
+            &windows[1].clone().into(),
+            Some(format!("{sign}{step}").parse().expect("Length.")),
+            None,
+            &mut state,
+          )
+          .expect("Resize.");
+        }
+
+        for (size, start) in row_sizes(&windows).iter().zip(&start) {
+          assert!(
+            (size - start).abs() * 1680. < 0.5,
+            "step {step}: {size} drifted from {start}"
+          );
+        }
+      }
+    }
   }
 }

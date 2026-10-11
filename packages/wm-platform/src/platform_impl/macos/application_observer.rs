@@ -1,12 +1,17 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::{
   cell::RefCell,
   ptr::NonNull,
-  sync::{Arc, Mutex},
+  sync::{Arc, Mutex, PoisonError},
 };
 
 use objc2_application_services::{AXError, AXObserver, AXUIElement};
 use objc2_core_foundation::{
-  kCFRunLoopDefaultMode, CFRetained, CFRunLoop, CFRunLoopSource, CFString,
+  kCFRunLoopCommonModes, CFRetained, CFRunLoop, CFRunLoopSource, CFString,
 };
 use tokio::sync::mpsc;
 
@@ -103,7 +108,10 @@ impl ApplicationObserver {
         ));
       }
 
-      CFRetained::retain(NonNull::new(observer).ok_or_else(|| {
+      // A Create function hands over one retained reference, which
+      // `from_raw` takes. Retaining it again left a count that never
+      // reached zero, so every observer and its Mach port leaked.
+      CFRetained::from_raw(NonNull::new(observer).ok_or_else(|| {
         crate::Error::InvalidPointer("AXObserver is null.".to_string())
       })?)
     };
@@ -121,8 +129,10 @@ impl ApplicationObserver {
     }));
 
     let observer_source = unsafe { observer.run_loop_source() };
+    // The common modes, so that notifications still arrive while a
+    // menu or an alert has the run loop in another mode.
     runloop.add_source(Some(&observer_source), unsafe {
-      kCFRunLoopDefaultMode
+      kCFRunLoopCommonModes
     });
 
     // Own the source and context before anything can fail, so an early
@@ -174,7 +184,7 @@ impl ApplicationObserver {
       }
     }
 
-    *app_windows.lock().unwrap() = windows;
+    *app_windows.lock().unwrap_or_else(PoisonError::into_inner) = windows;
 
     Ok(app_observer)
   }
@@ -241,7 +251,12 @@ impl ApplicationObserver {
   }
 
   pub(crate) fn emit_all_windows_destroyed(&self) {
-    for window in self.app_windows.lock().unwrap().iter() {
+    for window in self
+      .app_windows
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .iter()
+    {
       if let Err(err) = self.events_tx.send(WindowEvent::Destroyed {
         window_id: window.id(),
         notification: crate::WindowEventNotification(None),
@@ -256,7 +271,12 @@ impl ApplicationObserver {
   }
 
   pub(crate) fn emit_all_windows_hidden(&self) {
-    for window in self.app_windows.lock().unwrap().iter() {
+    for window in self
+      .app_windows
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .iter()
+    {
       if let Err(err) = self.events_tx.send(WindowEvent::Hidden {
         window: window.clone(),
         notification: crate::WindowEventNotification(None),
@@ -271,7 +291,12 @@ impl ApplicationObserver {
   }
 
   pub(crate) fn emit_all_windows_shown(&self) {
-    for window in self.app_windows.lock().unwrap().iter() {
+    for window in self
+      .app_windows
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .iter()
+    {
       if let Err(err) = self.events_tx.send(WindowEvent::Shown {
         window: window.clone(),
         notification: crate::WindowEventNotification(None),
@@ -312,7 +337,10 @@ impl ApplicationObserver {
     );
 
     let found_window = {
-      let app_windows = context.app_windows.lock().unwrap();
+      let app_windows = context
+        .app_windows
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
 
       app_windows
         .iter()
@@ -365,7 +393,7 @@ impl ApplicationObserver {
           context
             .app_windows
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|w| w.id() != window.id());
 
           if let Err(err) =
@@ -402,7 +430,10 @@ impl ApplicationObserver {
       // new element notifies before the old one's destroy looks untracked.
       // Rebind in place rather than tracking a duplicate `WindowId`.
       let tracked_window = {
-        let app_windows = context.app_windows.lock().unwrap();
+        let app_windows = context
+          .app_windows
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner);
 
         app_windows
           .iter()
@@ -452,7 +483,11 @@ impl ApplicationObserver {
     };
 
     if is_new_window {
-      context.app_windows.lock().unwrap().push(window.clone());
+      context
+        .app_windows
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(window.clone());
       if let Err(err) = Self::register_window_notifications(
         &window,
         &context.observer.clone(),

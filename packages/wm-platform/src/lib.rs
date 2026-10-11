@@ -1,4 +1,5 @@
 #![warn(clippy::all, clippy::pedantic)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::missing_errors_doc)]
 #![feature(iterator_try_collect)]
 

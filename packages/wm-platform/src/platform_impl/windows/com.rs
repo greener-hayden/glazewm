@@ -1,3 +1,8 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::{cell::RefCell, collections::HashMap};
 
 use windows::{
@@ -31,6 +36,41 @@ thread_local! {
 /// the cache against reports that never arrive.
 const MAX_CACHED_VIEWS: usize = 128;
 
+/// How many operations may fail in a row before the shell interfaces are
+/// refreshed whatever the errors were.
+///
+/// Guards against a stale interface that fails with a code `is_stale`
+/// does not know. Without it such an interface would never be replaced.
+const MAX_FAILURES: u8 = 8;
+
+/// Whether `error` says that a shell interface has lost its server, as
+/// happens when Explorer restarts.
+///
+/// An ordinary failure, such as no view for a window that just closed,
+/// is not one. The interfaces are fine then, and refreshing them would
+/// throw away every cached view for nothing.
+fn is_stale(error: &crate::Error) -> bool {
+  /// `CO_E_OBJNOTCONNECTED`.
+  const NOT_CONNECTED: u32 = 0x8004_01FD;
+  const FACILITY_RPC: u32 = 1;
+  const FACILITY_WIN32: u32 = 7;
+
+  let crate::Error::Windows(error) = error else {
+    return false;
+  };
+
+  #[allow(clippy::cast_sign_loss)]
+  let code = error.code().0 as u32;
+  let facility = (code >> 16) & 0x1FFF;
+
+  // The Win32 codes 1700 to 1999 are the RPC runtime's, such as
+  // `RPC_S_SERVER_UNAVAILABLE`.
+  code == NOT_CONNECTED
+    || facility == FACILITY_RPC
+    || (facility == FACILITY_WIN32
+      && (1700..2000).contains(&(code & 0xFFFF)))
+}
+
 pub(crate) struct ComInit {
   service_provider: Option<IServiceProvider>,
   application_view_collection: Option<IApplicationViewCollection>,
@@ -38,6 +78,8 @@ pub(crate) struct ComInit {
   /// Shell views by window handle, so repeat cloaking of a window skips
   /// the lookup round trip into explorer.
   views: HashMap<isize, IApplicationView>,
+  /// Operations that have failed in a row; see `MAX_FAILURES`.
+  failures: u8,
 }
 
 impl ComInit {
@@ -72,6 +114,7 @@ impl ComInit {
       application_view_collection,
       taskbar_list,
       views: HashMap::new(),
+      failures: 0,
     }
   }
 
@@ -111,9 +154,8 @@ impl ComInit {
 
       // Ref: https://github.com/Ciantic/AltTabAccessor/issues/1#issuecomment-1426877843
       // SAFETY: The view was just returned by the shell.
-      unsafe { view.set_cloak(1, flag) }.ok().map_err(|_| {
-        crate::Error::Platform("Failed to cloak window.".to_string())
-      })?;
+      // The error keeps its code, which `with_retry` reads.
+      unsafe { view.set_cloak(1, flag) }.ok()?;
       Ok(view)
     })?;
 
@@ -178,19 +220,37 @@ impl ComInit {
       unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_SERVER) }.ok();
   }
 
-  /// Executes a COM operation, refreshing interfaces on failure and
-  /// retrying once. Use this for operations that may fail due to stale
-  /// COM interfaces.
+  /// Executes a COM operation, and where it failed because the shell
+  /// interfaces are stale, refreshes them and retries once.
+  ///
+  /// The interfaces count as stale when one is missing, when the error
+  /// says so (see `is_stale`), or when `MAX_FAILURES` operations have
+  /// failed in a row. Any other error is returned as it is, with the
+  /// interfaces and cached views kept.
   pub fn with_retry<T, F>(&mut self, op: F) -> crate::Result<T>
   where
     F: Fn(&Self) -> crate::Result<T>,
   {
-    if let Ok(result) = op(self) {
-      Ok(result)
-    } else {
-      self.refresh();
-      op(self)
+    let error = match op(self) {
+      Ok(result) => {
+        self.failures = 0;
+        return Ok(result);
+      }
+      Err(error) => error,
+    };
+
+    self.failures = self.failures.saturating_add(1);
+
+    let missing = self.application_view_collection.is_none()
+      || self.taskbar_list.is_none();
+
+    if !missing && !is_stale(&error) && self.failures < MAX_FAILURES {
+      return Err(error);
     }
+
+    self.failures = 0;
+    self.refresh();
+    op(self)
   }
 }
 

@@ -11,7 +11,13 @@
 
 #[cfg(target_os = "macos")]
 use std::io::IsTerminal;
-use std::{env, path::PathBuf, process, time::Duration};
+use std::{
+  env,
+  panic::{self, AssertUnwindSafe},
+  path::PathBuf,
+  process,
+  time::Duration,
+};
 
 use anyhow::{Context, Error};
 use tokio::{process::Command, signal};
@@ -77,26 +83,43 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let (event_loop, dispatcher) = EventLoop::new()?;
 
+    install_panic_hook();
+
     let task_handle = std::thread::spawn(move || {
-      rt.block_on(async {
-        let start_res =
-          start_wm(config_path, verbosity, &dispatcher).await;
+      let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        rt.block_on(async {
+          let start_res =
+            start_wm(config_path, verbosity, &dispatcher).await;
 
-        if let Err(err) = &start_res {
-          // If unable to start the WM, the error is fatal and a message
-          // dialog is shown.
-          tracing::error!("{:?}", err);
-          dispatcher.show_error_dialog("Fatal error", &err.to_string());
-        }
+          if let Err(err) = &start_res {
+            // If unable to start the WM, the error is fatal and a message
+            // dialog is shown.
+            tracing::error!("{:?}", err);
+            dispatcher.show_error_dialog("Fatal error", &err.to_string());
+          }
 
-        if let Err(err) = dispatcher.stop_event_loop() {
-          // Forcefully exit the process to ensure the event loop is
-          // stopped.
-          tracing::error!("Failed to stop event loop gracefully: {}", err);
-          process::exit(1);
-        }
+          if let Err(err) = dispatcher.stop_event_loop() {
+            // Forcefully exit the process to ensure the event loop is
+            // stopped.
+            tracing::error!(
+              "Failed to stop event loop gracefully: {}",
+              err
+            );
+            process::exit(1);
+          }
 
-        start_res
+          start_res
+        })
+      }));
+
+      // A panic unwinds past the call that stops the event loop, so the
+      // main thread would keep the process alive with no window manager
+      // in it, still holding the single-instance lock. The state is gone
+      // with the unwind, so there is nothing left to clean up with; on
+      // Windows the watcher restores the windows once the process exits.
+      outcome.unwrap_or_else(|_| {
+        tracing::error!("Window manager thread panicked. Exiting.");
+        process::exit(1)
       })
     });
 
@@ -110,6 +133,28 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(wm_cli::start(args))
   }
+}
+
+/// Logs every panic, with its thread and a backtrace, before the default
+/// hook runs.
+///
+/// The release build on Windows has no console, so the default hook's
+/// message is lost there. Logging at error level puts it in `errors.log`.
+/// Does nothing until logging is set up.
+fn install_panic_hook() {
+  let default_hook = panic::take_hook();
+
+  panic::set_hook(Box::new(move |info| {
+    let backtrace = std::backtrace::Backtrace::force_capture();
+
+    tracing::error!(
+      thread = std::thread::current().name().unwrap_or("unnamed"),
+      "Panic: {info}
+{backtrace}"
+    );
+
+    default_hook(info);
+  }));
 }
 
 /// Returns the mouse events that the WM consumes.
@@ -155,6 +200,17 @@ async fn start_wm(
       anyhow::bail!(
         "Accessibility permissions are not granted. In System Preferences, \
          go to Privacy & Security > Accessibility and enable GlazeWM."
+      );
+    }
+
+    // Not fatal: tiling works without it. Only the pictures that window
+    // animations move are affected.
+    if !dispatcher.has_screen_capture_permission() {
+      tracing::warn!(
+        "Screen Recording permission is not granted, so window \
+         animations show empty frames. In System Settings, go to Privacy \
+         & Security > Screen Recording and enable GlazeWM, or turn \
+         animations off in the config."
       );
     }
   }
@@ -360,7 +416,11 @@ async fn start_wm(
 
     if let Err(err) = res {
       tracing::error!("{:?}", err);
-      dispatcher.show_error_dialog("Non-fatal error", &err.to_string());
+
+      // Not `show_error_dialog`: that blocks this thread until the dialog
+      // is dismissed, and no key, window, or timer event is handled
+      // meanwhile.
+      dispatcher.report_error("Non-fatal error", &err.to_string());
     }
   }
 
@@ -422,11 +482,17 @@ async fn wait_until(deadline: Option<std::time::Instant>) {
   }
 }
 
+/// How many daily warning log files are kept.
+const WARNING_LOG_FILES: usize = 7;
+
 /// Initialize logging with the specified verbosity level.
 ///
-/// Error logs are saved to `~/.glzr/glazewm/errors.log`. Timing lines of
-/// the `perf` target are saved to `~/.glzr/glazewm/perf.<date>.log`; see
-/// the `perf` module for how to read them.
+/// Error logs are saved to `~/.glzr/glazewm/errors.log`. Warnings and
+/// errors are also saved to `~/.glzr/glazewm/warnings.<date>.log`, which
+/// rolls over each UTC day and keeps [`WARNING_LOG_FILES`] files. Timing
+/// lines of the `perf` target are saved to
+/// `~/.glzr/glazewm/perf.<date>.log`; see the `perf` module for how to
+/// read them.
 fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
   let log_dir = home::home_dir()
     .context("Unable to get home directory.")?
@@ -434,6 +500,21 @@ fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
 
   let error_writer =
     tracing_appender::rolling::never(&log_dir, "errors.log");
+
+  // The release build on Windows has no console, so without a file a
+  // warning is seen by nobody. Like the perf log, a failure to open it
+  // must not keep the WM from starting.
+  let (warning_writer, warning_error) =
+    match tracing_appender::rolling::RollingFileAppender::builder()
+      .rotation(tracing_appender::rolling::Rotation::DAILY)
+      .filename_prefix("warnings")
+      .filename_suffix("log")
+      .max_log_files(WARNING_LOG_FILES)
+      .build(&log_dir)
+    {
+      Ok(writer) => (Some(writer), None),
+      Err(err) => (None, Some(err)),
+    };
 
   // The perf log is a diagnostic aid, so a failure to open it must not
   // keep the WM from starting. It is reported once logging is set up.
@@ -461,6 +542,15 @@ fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
         .with_filter(LevelFilter::ERROR),
     )
     .with(
+      // Output warnings and errors to the warning log file.
+      warning_writer.map(|writer| {
+        fmt::Layer::new()
+          .with_ansi(false)
+          .with_writer(writer)
+          .with_filter(LevelFilter::WARN)
+      }),
+    )
+    .with(
       // Output timing lines to the perf log file, at the verbosity level.
       perf_writer.map(|writer| {
         fmt::Layer::new()
@@ -474,6 +564,10 @@ fn setup_logging(verbosity: &Verbosity) -> anyhow::Result<()> {
 
   if let Some(err) = perf_error {
     tracing::warn!("Unable to open the perf log: {err}");
+  }
+
+  if let Some(err) = warning_error {
+    tracing::warn!("Unable to open the warning log: {err}");
   }
 
   tracing::info!(

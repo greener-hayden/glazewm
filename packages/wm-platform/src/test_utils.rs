@@ -48,6 +48,8 @@ impl NativeWindow {
       // test on macOS built one. Creating an element for an invalid pid
       // always succeeds; only operations on it fail, which is all a mock
       // promises anyway.
+      // SAFETY: Takes a process identifier by value, and returns an
+      // element that the caller owns.
       let element = || unsafe { AXUIElement::new_application(0) };
 
       let application = platform_impl::Application {

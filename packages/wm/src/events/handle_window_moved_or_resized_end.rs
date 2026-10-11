@@ -1,14 +1,13 @@
 use anyhow::Context;
 use wm_common::{
-  try_warn, ActiveDragOperation, FullscreenStateConfig, TilingDirection,
-  WindowState,
+  ActiveDrag, FullscreenStateConfig, TilingDirection, WindowState,
 };
-use wm_platform::{LengthValue, Point, Rect};
+use wm_platform::{Point, Rect};
 
 use crate::{
   commands::{
     container::{move_container_within_tree, wrap_in_split_container},
-    window::{set_window_size, update_window_state},
+    window::{set_tiling_window_edge, update_window_state, ResizeEdge},
   },
   events::update_floating_window_position,
   models::{
@@ -39,9 +38,34 @@ pub fn handle_window_moved_or_resized_end(
     return Ok(());
   };
 
+  let result = finish_drag(window, &active_drag, state, config);
+
+  // A drag that could not be finished must still end. The window would
+  // otherwise stay out of the layout, and Windows reports the end of a
+  // drag only once.
+  if result.is_err() {
+    window.set_active_drag(None);
+    state.pending_sync.queue_container_to_redraw(window.clone());
+  }
+
+  result
+}
+
+/// Applies the result of a finished drag and clears the drag state.
+fn finish_drag(
+  window: &WindowContainer,
+  active_drag: &ActiveDrag,
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
   match &window {
     WindowContainer::NonTilingWindow(window) => {
-      let is_maximized = try_warn!(window.native().is_maximized());
+      // Bind first; a match holds the native borrow.
+      let is_maximized = window.native().is_maximized();
+      let is_maximized = is_maximized.unwrap_or_else(|err| {
+        tracing::warn!("Kept cached maximized state: {err}");
+        window.is_native_maximized()
+      });
 
       window.update_native_properties(|properties| {
         properties.is_maximized = is_maximized;
@@ -102,7 +126,7 @@ pub fn handle_window_moved_or_resized_end(
       if active_drag.is_from_floating {
         update_floating_window_position(
           window,
-          window.native_properties().frame,
+          window.native_frame(),
           &nearest_monitor,
           state,
         )?;
@@ -115,52 +139,108 @@ pub fn handle_window_moved_or_resized_end(
       }
     }
     WindowContainer::TilingWindow(window) => {
-      tracing::info!(
-        "Tiling window move/resize ended: {}",
-        window.as_window_container()?
-      );
+      finish_tiling_drag(window, active_drag, state)?;
+    }
+  }
 
-      let frame = drag_end_frame(window, state);
+  Ok(())
+}
 
-      // Update the window's size based on the new frame position. This
-      // means we use the actual window dimensions as the source of truth.
-      set_window_size(
-        window.clone().into(),
-        Some(LengthValue::from_px(frame.width())),
-        Some(LengthValue::from_px(frame.height())),
+/// Applies a finished drag of a tiling window and clears the drag state.
+///
+/// A resize moves the dragged edge in the layout. A move that did not
+/// turn the window floating leaves the layout as it was, and the window
+/// is put back on its tile.
+fn finish_tiling_drag(
+  window: &TilingWindow,
+  active_drag: &ActiveDrag,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  tracing::info!(
+    "Tiling window move/resize ended: {}",
+    window.as_window_container()?
+  );
+
+  let frame = drag_end_frame(window, state);
+  let border_delta = window.border_delta();
+
+  apply_dragged_edges(
+    window,
+    &active_drag.initial_position,
+    &frame,
+    state,
+  )?;
+
+  // The window is already where the layout puts it when the resize
+  // was applied in full. It is redrawn otherwise, which snaps it back
+  // when:
+  // - A size limit held part of the resize back.
+  // - The window is the only tiling window in the workspace.
+  // - The window is not past the movement threshold for transitioning to
+  //   floating while being dragged.
+  // - The resize was in a direction that cannot change the window's tiling
+  //   size.
+  let is_settled =
+    window.to_rect()?.apply_delta(&border_delta, None) == frame;
+
+  if is_settled {
+    state
+      .pending_sync
+      .dequeue_container_from_redraw(window.clone());
+  } else {
+    state.pending_sync.queue_container_to_redraw(window.clone());
+  }
+
+  window.set_active_drag(None);
+
+  Ok(())
+}
+
+/// Moves, in the layout, the edges of a tiling window that a drag has
+/// moved from `start` to `frame`.
+///
+/// Each moved edge trades space with the neighbour across it (see
+/// `set_tiling_window_edge`), and the tiles that changed are queued for
+/// redraw. Applying the same frame twice changes nothing the second
+/// time, so this serves both the drag while it runs and its end.
+///
+/// Only an axis whose length the drag changed is applied. The other one
+/// can differ from its tile for reasons of its own, such as an
+/// application that rounds its size, and applying it would resize a
+/// split that nobody touched.
+pub(crate) fn apply_dragged_edges(
+  window: &TilingWindow,
+  start: &Rect,
+  frame: &Rect,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  // The layout works in tile rectangles, which leave out the border
+  // delta that the frame carries.
+  let tile = window.to_rect()?;
+  let tile_frame = tile.apply_delta(&window.border_delta(), None);
+
+  let axes = [
+    (
+      dragged_axis(start.left, start.width(), frame.left, frame.width()),
+      tile_frame.width() - tile.width(),
+      true,
+    ),
+    (
+      dragged_axis(start.top, start.height(), frame.top, frame.height()),
+      tile_frame.height() - tile.height(),
+      false,
+    ),
+  ];
+
+  for (axis, border, is_width_resize) in axes {
+    if let Some((length, edge)) = axis {
+      set_tiling_window_edge(
+        window,
+        length - border,
+        is_width_resize,
+        edge,
         state,
       )?;
-
-      let is_edge_resize = {
-        let is_resize = window.active_drag().is_some_and(|drag| {
-          matches!(drag.operation, Some(ActiveDragOperation::Resize))
-        });
-
-        let is_edge_child =
-          !window.prev_siblings().any(|s| s.is_tiling_window())
-            || !window.next_siblings().any(|s| s.is_tiling_window());
-
-        is_resize && is_edge_child
-      };
-
-      // Tiling windows that are first or last children are already at
-      // their correct position after a manual resize.
-      if is_edge_resize {
-        state
-          .pending_sync
-          .dequeue_container_from_redraw(window.clone());
-      } else {
-        // Force a redraw of the window to snap it back to its original
-        // position. This is necessary when:
-        // - The window is the only tiling window in the workspace.
-        // - The window is not past the movement threshold for
-        //   transitioning to floating while being dragged.
-        // - Resizing in a direction that doesn't change the window's
-        //   tiling size.
-        state.pending_sync.queue_container_to_redraw(window.clone());
-      }
-
-      window.set_active_drag(None);
     }
   }
 
@@ -177,14 +257,37 @@ pub fn handle_window_moved_or_resized_end(
 fn drag_end_frame(window: &TilingWindow, state: &WmState) -> Rect {
   let frame = state
     .native_sync
-    .observed_frame(window.id())
-    .unwrap_or_else(|| window.native_properties().frame);
+    .visible_frame(window.id())
+    .unwrap_or_else(|| window.native_frame());
 
   window.update_native_properties(|properties| {
     properties.frame = frame.clone();
   });
 
   frame
+}
+
+/// The length a drag left one axis at and the edge it moved, or `None`
+/// when the drag did not change that axis's length.
+///
+/// `start` and `end` are the positions of the axis's left or top edge.
+/// The right or bottom edge is the one that moved when that edge stood
+/// still.
+fn dragged_axis(
+  start: i32,
+  start_length: i32,
+  end: i32,
+  end_length: i32,
+) -> Option<(i32, ResizeEdge)> {
+  (end_length != start_length).then(|| {
+    let edge = if end == start {
+      ResizeEdge::End
+    } else {
+      ResizeEdge::Start
+    };
+
+    (end_length, edge)
+  })
 }
 
 /// Handles transition from temporary floating window to tiling window on
@@ -356,5 +459,166 @@ fn drop_position(mouse_pos: &Point, rect: &Rect) -> DropPosition {
     } else {
       DropPosition::Top
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use tokio::sync::mpsc::UnboundedReceiver;
+  use wm_common::{ActiveDragOperation, ParsedConfig, WmEvent};
+
+  use super::*;
+  use crate::{
+    models::{Monitor, Workspace},
+    test_utils::{attach_monitor, mock_state},
+    traits::TilingSizeGetters,
+  };
+
+  /// Three windows in a row on a gapless 1680px workspace, 560px each.
+  fn row_of_three(
+  ) -> (WmState, UnboundedReceiver<WmEvent>, [TilingWindow; 3]) {
+    let windows = [(); 3].map(|()| TilingWindow::mock().call());
+    let workspace = Workspace::mock()
+      .tiling_containers(windows.iter().cloned().map(Into::into).collect())
+      .call();
+    let monitor = Monitor::mock().workspaces(vec![workspace]).call();
+    let (state, events) = mock_state();
+    attach_monitor(&state, &monitor).expect("Attach monitor.");
+
+    for window in &windows {
+      window.set_tiling_size(1. / 3.);
+    }
+
+    (state, events, windows)
+  }
+
+  /// Ends a drag of `window` that began on its tile and left it at
+  /// `frame`.
+  fn release_at(window: &TilingWindow, frame: Rect, state: &mut WmState) {
+    let tile = window.to_rect().expect("Tile.");
+    window.update_native_properties(|properties| {
+      properties.frame = frame;
+    });
+    window.set_active_drag(Some(ActiveDrag {
+      operation: Some(ActiveDragOperation::Resize),
+      is_from_floating: false,
+      initial_position: tile,
+    }));
+
+    handle_window_moved_or_resized_end(
+      &window.clone().into(),
+      state,
+      &UserConfig::mock(ParsedConfig::default()),
+    )
+    .expect("Drag end.");
+  }
+
+  /// Asserts the tiling sizes of the row, in order.
+  fn assert_sizes(windows: &[TilingWindow; 3], expected: [f32; 3]) {
+    let sizes = windows
+      .iter()
+      .map(TilingSizeGetters::tiling_size)
+      .collect::<Vec<_>>();
+
+    for (size, expected) in sizes.iter().zip(expected) {
+      assert!(
+        (size - expected).abs() < 0.0001,
+        "sizes: {sizes:?}, expected: {expected:?}"
+      );
+    }
+  }
+
+  /// The window on the left keeps its size when the right edge of the
+  /// middle window is dragged, and the drag is over afterwards.
+  #[test]
+  fn releasing_a_right_edge_resizes_against_the_right_neighbour() {
+    let (mut state, _events, windows) = row_of_three();
+    let tile = windows[1].to_rect().expect("Tile.");
+
+    release_at(
+      &windows[1],
+      Rect::from_ltrb(tile.left, tile.top, tile.right + 100, tile.bottom),
+      &mut state,
+    );
+
+    assert_sizes(&windows, [1. / 3., 660. / 1680., 460. / 1680.]);
+    assert!(windows[1].active_drag().is_none());
+  }
+
+  /// The window on the right keeps its size when the left edge of the
+  /// middle window is dragged.
+  #[test]
+  fn releasing_a_left_edge_resizes_against_the_left_neighbour() {
+    let (mut state, _events, windows) = row_of_three();
+    let tile = windows[1].to_rect().expect("Tile.");
+
+    release_at(
+      &windows[1],
+      Rect::from_ltrb(tile.left - 100, tile.top, tile.right, tile.bottom),
+      &mut state,
+    );
+
+    assert_sizes(&windows, [460. / 1680., 660. / 1680., 1. / 3.]);
+  }
+
+  /// The drag applies its edges as it runs, and the release applies the
+  /// same frame again. The second time must change nothing.
+  #[test]
+  fn applying_the_same_dragged_frame_twice_changes_nothing_more() {
+    let (mut state, _events, windows) = row_of_three();
+    let tile = windows[1].to_rect().expect("Tile.");
+    let frame =
+      Rect::from_ltrb(tile.left, tile.top, tile.right + 100, tile.bottom);
+
+    apply_dragged_edges(&windows[1], &tile, &frame, &mut state)
+      .expect("First.");
+    assert_sizes(&windows, [1. / 3., 660. / 1680., 460. / 1680.]);
+
+    apply_dragged_edges(&windows[1], &tile, &frame, &mut state)
+      .expect("Second.");
+    assert_sizes(&windows, [1. / 3., 660. / 1680., 460. / 1680.]);
+  }
+
+  /// A drag that moved the window and kept its size changes no tile.
+  #[test]
+  fn releasing_a_moved_window_keeps_every_size() {
+    let (mut state, _events, windows) = row_of_three();
+    let tile = windows[1].to_rect().expect("Tile.");
+
+    release_at(
+      &windows[1],
+      Rect::from_ltrb(
+        tile.left + 5,
+        tile.top + 5,
+        tile.right + 5,
+        tile.bottom + 5,
+      ),
+      &mut state,
+    );
+
+    assert_sizes(&windows, [1. / 3.; 3]);
+    assert!(windows[1].active_drag().is_none());
+  }
+
+  #[test]
+  fn an_unchanged_length_is_not_a_dragged_axis() {
+    // A move changes the position and keeps the length.
+    assert_eq!(dragged_axis(100, 800, 140, 800), None);
+  }
+
+  #[test]
+  fn a_still_start_edge_means_the_end_edge_moved() {
+    assert_eq!(
+      dragged_axis(100, 800, 100, 860),
+      Some((860, ResizeEdge::End))
+    );
+  }
+
+  #[test]
+  fn a_moved_start_edge_is_the_dragged_edge() {
+    assert_eq!(
+      dragged_axis(100, 800, 40, 860),
+      Some((860, ResizeEdge::Start))
+    );
   }
 }

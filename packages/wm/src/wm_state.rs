@@ -435,7 +435,7 @@ impl WmState {
     let monitors = self.monitors();
     let working_areas = monitors
       .iter()
-      .map(|monitor| monitor.native_properties().working_area)
+      .map(Monitor::working_area)
       .collect::<Vec<_>>();
 
     monitors

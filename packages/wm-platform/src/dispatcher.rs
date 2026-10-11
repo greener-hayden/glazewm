@@ -1,3 +1,8 @@
+// LINT: The `unsafe` blocks here predate the rule that each one states
+// why it is sound. Document a block when you touch it, and remove this
+// once none is left without a `SAFETY` comment.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::{
   path::Path,
   sync::{
@@ -19,7 +24,10 @@ use objc2_application_services::{
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFBoolean, CFDictionary, CGPoint};
 #[cfg(target_os = "macos")]
-use objc2_core_graphics::{CGError, CGEvent, CGWarpMouseCursorPosition};
+use objc2_core_graphics::{
+  CGError, CGEvent, CGPreflightScreenCaptureAccess,
+  CGWarpMouseCursorPosition,
+};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSString, NSUserDefaults};
 #[cfg(target_os = "windows")]
@@ -60,6 +68,19 @@ pub type DispatchFn = dyn FnOnce() + Send + 'static;
 /// How long `Dispatcher::dispatch_sync` waits for the event loop to start
 /// a closure before giving up on it.
 const DISPATCH_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether a dialog from [`Dispatcher::report_error`] is open.
+static ERROR_DIALOG_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Marks the dialog from [`Dispatcher::report_error`] closed when
+/// dropped, so a panic while showing it cannot leave it marked open.
+struct ErrorDialogClosed;
+
+impl Drop for ErrorDialogClosed {
+  fn drop(&mut self) {
+    ERROR_DIALOG_OPEN.store(false, Ordering::Release);
+  }
+}
 
 /// How a cross-thread hop split between waiting in the event loop's queue
 /// and running.
@@ -227,6 +248,18 @@ pub trait DispatcherExtMacOs {
   /// This method is only available on macOS.
   fn has_ax_permission(&self, prompt: bool) -> bool;
 
+  /// Checks whether the Screen Recording permission is granted, without
+  /// asking for it.
+  ///
+  /// Window animations draw a picture of the window that moves. Without
+  /// this permission the picture of another application's window comes
+  /// back empty.
+  ///
+  /// # Platform-specific
+  ///
+  /// This method is only available on macOS.
+  fn has_screen_capture_permission(&self) -> bool;
+
   /// Gets whether displays have separate spaces.
   ///
   /// This setting is present in System Preferences under "Desktop & Dock"
@@ -290,6 +323,10 @@ impl DispatcherExtMacOs for Dispatcher {
     );
 
     unsafe { AXIsProcessTrustedWithOptions(Some(options.as_ref())) }
+  }
+
+  fn has_screen_capture_permission(&self) -> bool {
+    CGPreflightScreenCaptureAccess()
   }
 
   fn displays_have_separate_spaces(&self) -> bool {
@@ -927,9 +964,38 @@ impl Dispatcher {
     Ok(())
   }
 
+  /// Shows an error dialog without blocking the current thread.
+  ///
+  /// At most one such dialog is open at a time. An error reported while
+  /// one is open gets no dialog of its own, so a repeating error cannot
+  /// stack dialogs; the caller is expected to log every error itself.
+  pub fn report_error(&self, title: &str, message: &str) {
+    if ERROR_DIALOG_OPEN.swap(true, Ordering::AcqRel) {
+      return;
+    }
+
+    let closed = ErrorDialogClosed;
+    let dispatcher = self.clone();
+    let (title, message) = (title.to_owned(), message.to_owned());
+
+    let spawned = std::thread::Builder::new()
+      .name("glazewm-error-dialog".into())
+      .spawn(move || {
+        let _closed = closed;
+        dispatcher.show_error_dialog(&title, &message);
+      });
+
+    // The closure is dropped with the failed spawn, which marks the
+    // dialog closed again.
+    if let Err(err) = spawned {
+      tracing::warn!("Failed to show error dialog: {err}");
+    }
+  }
+
   /// Shows a modal error dialog with the given title and message.
   ///
-  /// Blocks the current thread until the user dismisses the dialog.
+  /// Blocks the current thread until the user dismisses the dialog. Use
+  /// [`Self::report_error`] from a thread that must keep running.
   #[allow(clippy::missing_panics_doc)]
   pub fn show_error_dialog(&self, title: &str, message: &str) {
     #[cfg(target_os = "windows")]

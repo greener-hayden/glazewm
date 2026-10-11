@@ -14,7 +14,10 @@ use windows::Win32::{
   Foundation::{
     CloseHandle, BOOL, HANDLE, HINSTANCE, LPARAM, LRESULT, WPARAM,
   },
-  System::Threading::{CreateEventW, GetCurrentThreadId, INFINITE},
+  System::Threading::{
+    CreateEventW, GetCurrentThread, GetCurrentThreadId, SetThreadPriority,
+    INFINITE, THREAD_PRIORITY_TIME_CRITICAL,
+  },
   UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, MsgWaitForMultipleObjectsEx,
     PeekMessageW, HHOOK, HOOKPROC, KBDLLHOOKSTRUCT, MSG,
@@ -418,6 +421,17 @@ fn run_input(
   control: &InputControl,
 ) -> Option<InputState> {
   INPUT.with(|slot| *slot.borrow_mut() = Some(state));
+  // Windows removes a low-level hook whose thread does not answer in
+  // time, and tells nobody. A thread at normal priority can be starved
+  // that long by a process using every core. The callback is short and
+  // does not allocate, so running it ahead of other work costs little. A
+  // failure only leaves the priority as it was.
+  // SAFETY: The pseudo handle always refers to the calling thread.
+  if let Err(err) = unsafe {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+  } {
+    tracing::warn!("Keyboard thread priority was not raised: {err}");
+  }
   let mut message = MSG::default();
   // SAFETY: Initializes this thread's message queue.
   unsafe { PeekMessageW(&raw mut message, None, 0, 0, PM_NOREMOVE) };

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use windows::Win32::{
-  Foundation::{HWND, WAIT_OBJECT_0},
+  Foundation::{HWND, WAIT_OBJECT_0, WAIT_TIMEOUT},
   Graphics::{
     DirectComposition::DCompositionWaitForCompositorClock,
     Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO},
@@ -9,6 +9,16 @@ use windows::Win32::{
 };
 
 use crate::FrameSignal;
+
+/// Shortest wait for one compositor frame, in milliseconds.
+///
+/// Four frame periods alone are 16 ms at 240 Hz, which an ordinary
+/// compositor hiccup under load outlasts.
+const MIN_TIMEOUT_MS: u32 = 100;
+
+/// How many waits in a row may time out before the clock is reported
+/// unavailable.
+const MAX_TIMEOUTS: u8 = 3;
 
 /// A DirectComposition wait paired with an observed DWM frame serial.
 pub(crate) struct NativeFrameClock {
@@ -21,23 +31,34 @@ impl NativeFrameClock {
     Ok(Self {
       timeout_ms: u32::try_from(frame.as_millis())?
         .saturating_mul(4)
-        .max(1),
+        .max(MIN_TIMEOUT_MS),
     })
   }
 
   /// Waits for real compositor progress; failures never advance readiness.
   pub(crate) fn wait(&mut self) -> FrameSignal {
-    // SAFETY: No handles are passed, so this only waits on the clock.
-    let result =
-      unsafe { DCompositionWaitForCompositorClock(None, self.timeout_ms) };
-    if result != WAIT_OBJECT_0.0 {
-      return FrameSignal::Unavailable;
+    // A late frame is waited for again. Reporting the clock unavailable
+    // ends its thread and cuts every running animation, which is right
+    // for a compositor that has stopped and wrong for one that is slow.
+    for _ in 0..MAX_TIMEOUTS {
+      // SAFETY: No handles are passed, so this only waits on the clock.
+      let result = unsafe {
+        DCompositionWaitForCompositorClock(None, self.timeout_ms)
+      };
+
+      if result == WAIT_OBJECT_0.0 {
+        return match Self::current_frame() {
+          Ok(frame) => FrameSignal::Presented(frame),
+          Err(_) => FrameSignal::Unavailable,
+        };
+      }
+
+      if result != WAIT_TIMEOUT.0 {
+        break;
+      }
     }
 
-    match Self::current_frame() {
-      Ok(frame) => FrameSignal::Presented(frame),
-      Err(_) => FrameSignal::Unavailable,
-    }
+    FrameSignal::Unavailable
   }
 
   /// Samples the native compositor serial for a mutation boundary.

@@ -10,14 +10,14 @@ use windows::Win32::{
   UI::{
     Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK},
     WindowsAndMessaging::{
-      EnumWindows, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE,
+      EnumWindows, GetAncestor, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE,
       EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
       EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE,
       EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_FOREGROUND,
       EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-      EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, OBJID_WINDOW,
-      WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WS_CAPTION,
-      WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+      EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT,
+      OBJID_WINDOW, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+      WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     },
   },
 };
@@ -42,6 +42,8 @@ pub struct WindowEventNotificationInner {
 #[derive(Debug)]
 pub(crate) struct WindowListener {
   hook_handles: Vec<HWINEVENTHOOK>,
+  /// Reaches the event loop thread, which owns the hooks.
+  dispatcher: Dispatcher,
 }
 
 impl WindowListener {
@@ -68,14 +70,41 @@ impl WindowListener {
       Self::hook_win_events()
     })??;
 
-    Ok(Self { hook_handles })
+    Ok(Self {
+      hook_handles,
+      dispatcher: dispatcher.clone(),
+    })
   }
 
   /// Implements [`WindowListener::terminate`].
   pub(crate) fn terminate(&mut self) {
     crate::opening_windows::set_enabled(false);
-    for handle in self.hook_handles.drain(..) {
-      let _ = unsafe { UnhookWinEvent(handle) };
+
+    let handles = self
+      .hook_handles
+      .drain(..)
+      .map(|handle| handle.0)
+      .collect::<Vec<_>>();
+
+    if handles.is_empty() {
+      return;
+    }
+
+    // A hook can only be removed by the thread that installed it, which
+    // is the event loop's. Removed from here, the call fails and the
+    // hook stays live until the process exits.
+    let unhooked = self.dispatcher.dispatch_sync(move || {
+      for handle in handles {
+        // SAFETY: The handle came from `SetWinEventHook` on this thread
+        // and is removed once, since the list was drained.
+        if !unsafe { UnhookWinEvent(HWINEVENTHOOK(handle)) }.as_bool() {
+          tracing::warn!("Failed to remove a window event hook.");
+        }
+      }
+    });
+
+    if let Err(err) = unhooked {
+      tracing::warn!("Window event hooks were not removed: {err}");
     }
   }
 
@@ -97,6 +126,8 @@ impl WindowListener {
       .iter()
       .try_fold(Vec::new(), |mut handles, (min, max)| {
         // Create a window hook for the event range.
+        // SAFETY: The callback is a function that lives as long as the
+        // process, and every other argument is passed by value.
         let hook_handle = unsafe {
           SetWinEventHook(
             *min,
@@ -196,6 +227,25 @@ impl WindowListener {
 
     if !is_window_event {
       return;
+    }
+
+    // Moves and renames are the frequent events, and the hook reports
+    // them for every window handle in the system, child controls
+    // included. An application laying out its controls sends one per
+    // control per step. Only a top-level window is ever managed, so
+    // these are dropped here, before they cost a channel send and a
+    // wake of the WM thread each.
+    if matches!(
+      event_type,
+      EVENT_OBJECT_LOCATIONCHANGE | EVENT_OBJECT_NAMECHANGE
+    ) {
+      // SAFETY: The handle is passed by value, and the system returns
+      // null for one that no longer names a window.
+      let root = unsafe { GetAncestor(handle, GA_ROOT) };
+
+      if root != handle {
+        return;
+      }
     }
 
     let Some(event_tx) = EVENT_TX.with(|lock| lock.get().cloned()) else {

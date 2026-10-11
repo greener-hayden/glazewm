@@ -8,10 +8,12 @@
 
 use std::{
   collections::HashMap,
+  panic::{self, AssertUnwindSafe},
   sync::{
     atomic::{AtomicBool, AtomicIsize, Ordering},
     mpsc, Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak,
   },
+  time::{Duration, Instant},
 };
 
 use windows::Win32::{
@@ -37,6 +39,13 @@ static PENDING: LazyLock<Mutex<HashMap<WindowId, Pending>>> =
 /// carries the window hooks and every `dispatch_sync` target, so blocking
 /// it stops window management outright rather than merely delaying one
 /// window's reveal.
+/// How long one shell call may take before it is reported as stalled.
+///
+/// Every call on the worker waits behind the one that is running, so a
+/// slow explorer delays every cloak. The style lanes report the same
+/// way.
+const SHELL_STALL: Duration = Duration::from_secs(1);
+
 enum Job {
   Conceal(WindowId, NativeSession),
   Restore(NativeSession),
@@ -95,10 +104,21 @@ static WORKER: LazyLock<mpsc::Sender<Job>> = LazyLock::new(|| {
   if let Err(err) = std::thread::Builder::new()
     .name("glazewm-shell".into())
     .spawn(move || {
+      // A panic in one job must not end the worker. Every ticket queued
+      // behind it would stay pending for good, and nothing times those
+      // out. Each job is caught, and counts as failed.
       for job in rx {
         match job {
           Job::Conceal(id, session) => {
-            if let Err(err) = conceal_session(id, &session) {
+            let concealed = panic::catch_unwind(AssertUnwindSafe(|| {
+              conceal_session(id, &session)
+            }))
+            .unwrap_or_else(|_| {
+              Err(crate::Error::Platform(
+                "Opening concealment panicked.".into(),
+              ))
+            });
+            if let Err(err) = concealed {
               // The reservation promised concealment this could not
               // deliver, so drop it rather than leave a window claimed
               // and visible.
@@ -108,7 +128,15 @@ static WORKER: LazyLock<mpsc::Sender<Job>> = LazyLock::new(|| {
               tracing::debug!(window = ?id, "Opening source concealment requested.");
             }
           }
-          Job::Restore(session) => release_session(&session),
+          Job::Restore(session) => {
+            if panic::catch_unwind(AssertUnwindSafe(|| {
+              release_session(&session);
+            }))
+            .is_err()
+            {
+              tracing::error!("Session release panicked.");
+            }
+          }
           Job::Shell {
             session,
             call,
@@ -118,14 +146,41 @@ static WORKER: LazyLock<mpsc::Sender<Job>> = LazyLock::new(|| {
             if !ticket.claim() {
               continue;
             }
-            let result = call.run(&session);
-            if let Err(err) = &result {
-              tracing::debug!(?call, "Shell call failed: {err}");
+            let started = Instant::now();
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+              call.run(&session)
+            }));
+            let elapsed = started.elapsed();
+            if elapsed >= SHELL_STALL {
+              tracing::warn!(
+                ?call,
+                elapsed_ms = elapsed.as_millis(),
+                "Shell call stalled on the shell worker."
+              );
             }
-            ticket.complete(result.is_ok());
+            let succeeded = match outcome {
+              Ok(Ok(())) => true,
+              Ok(Err(err)) => {
+                tracing::debug!(?call, "Shell call failed: {err}");
+                false
+              }
+              Err(_) => {
+                tracing::error!(?call, "Shell call panicked.");
+                false
+              }
+            };
+            ticket.complete(succeeded);
             notify_native_wake();
           }
-          Job::Forget(id) => crate::platform_impl::forget_cloak_view(id.0),
+          Job::Forget(id) => {
+            if panic::catch_unwind(|| {
+              crate::platform_impl::forget_cloak_view(id.0);
+            })
+            .is_err()
+            {
+              tracing::error!("Shell view eviction panicked.");
+            }
+          }
         }
       }
     })

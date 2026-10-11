@@ -592,8 +592,11 @@ thread_local! {
 /// separate scan for each put 1-7ms per window on the path from keypress
 /// to first frame. One scan now serves every overlay for as long as late
 /// discovery would tolerate anyway: one `DiscoveryThrottle` interval.
-/// A late search on an overlay that found nothing always rescans, because
-/// its companions may have appeared since.
+/// A late search on an overlay that found nothing rescans sooner, because
+/// its companions may have appeared since: it accepts a scan of up to half
+/// that interval. Every such overlay searches in the same frame, so the
+/// first one scans and the rest share its scan, where each used to scan
+/// for itself.
 #[derive(Default)]
 struct CompanionScan {
   at: Option<Instant>,
@@ -603,8 +606,8 @@ struct CompanionScan {
 
 impl CompanionScan {
   /// Appends the companions of `source` to `found`, scanning only when
-  /// `rescan` is set or the shared scan is older than one discovery
-  /// interval.
+  /// the shared scan is older than one discovery interval, or than half
+  /// of one when `rescan` is set.
   fn companions_of(
     source: isize,
     rescan: bool,
@@ -613,10 +616,14 @@ impl CompanionScan {
     COMPANION_SCAN.with(|scan| {
       let mut scan = scan.borrow_mut();
       let now = Instant::now();
-      let fresh = !rescan
-        && scan.at.is_some_and(|at| {
-          now.saturating_duration_since(at) < companion::DISCOVERY_INTERVAL
-        });
+      let max_age = if rescan {
+        companion::DISCOVERY_INTERVAL / 2
+      } else {
+        companion::DISCOVERY_INTERVAL
+      };
+      let fresh = scan
+        .at
+        .is_some_and(|at| now.saturating_duration_since(at) < max_age);
       if !fresh {
         scan.rescan()?;
         scan.at = Some(now);

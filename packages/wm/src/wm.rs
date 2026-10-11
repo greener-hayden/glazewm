@@ -257,6 +257,7 @@ impl WindowManager {
         wm_platform::FrameSignal::Unavailable => {
           unavailable = true;
           self.state.native_sync.presentation_failed();
+          self.state.animation_manager.clock_stopped();
         }
         wm_platform::FrameSignal::Wake => {}
       }

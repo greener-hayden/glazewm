@@ -609,6 +609,9 @@ enum DecorationPhase {
 /// Owns native mutations for one window.
 struct ManagedWindow {
   native: PlacementSession,
+  /// When the WM took the window on, until its first placement is
+  /// logged. See the `placed` perf line.
+  claimed_at: Option<Instant>,
   frame: FrameReconciler,
   motion: Option<MotionOwner>,
   source: Option<SourceLease>,
@@ -1048,15 +1051,30 @@ impl PlacementCoordinator {
     if self.stacking_busy() {
       return None;
     }
+    let now = Instant::now();
     if !paused && (self.layout_dirty || !self.dirty.is_empty()) {
-      return Some(Instant::now());
+      return Some(now);
     }
     self
       .windows
       .values()
       .flat_map(|window| {
         [
-          (!paused).then(|| window.frame.deadline()).flatten(),
+          // A write held behind its concealment cannot be issued by a
+          // pass, so its frame asks for none. A pending frame with no
+          // write issued reports "now", which would otherwise run a sync
+          // every millisecond until the concealment lands. The shell
+          // worker's completion and `backstop` wake the pass that issues
+          // the write; this wakes the one that gives up on the wait.
+          (!paused)
+            .then(|| {
+              window
+                .shell
+                .conceal_wait
+                .held_until(now)
+                .or_else(|| window.frame.deadline())
+            })
+            .flatten(),
           (!paused)
             .then(|| {
               window
@@ -1235,13 +1253,30 @@ impl PlacementCoordinator {
   }
 
   /// Invalidates constraints and in-flight operations.
+  ///
+  /// Intents are kept. They are what the user or a window rule asked
+  /// for, which a change of display or config does not take back; see
+  /// `forget_styling` for the one caller that does.
   pub fn invalidate(&mut self) {
     self.layout_dirty = true;
     for window in self.windows.values_mut() {
       window.frame.restart();
       window.cancelled = true;
     }
-    self.intents.clear();
+    self.dirty.extend(self.windows.keys().copied());
+  }
+
+  /// Forgets the opacity and title bar asked for on every window.
+  ///
+  /// For a config reload, before its window rules run again: the new
+  /// config decides the styling, and a rule that is gone must not leave
+  /// its styling behind. A pending minimize is a command, not styling,
+  /// and is kept.
+  pub fn forget_styling(&mut self) {
+    for intent in self.intents.values_mut() {
+      intent.opacity = None;
+      intent.title_bar = None;
+    }
     self.dirty.extend(self.windows.keys().copied());
   }
   /// Releases overlays after native recovery succeeds.
@@ -1282,10 +1317,13 @@ impl PlacementCoordinator {
       .then(|| Instant::now() + Duration::from_millis(250));
   }
 
-  /// Where a managed window stands now, read without asking its
+  /// Where a managed window shows now, read without asking its
   /// application. `None` for a window that is not managed, or is gone.
-  pub fn observed_frame(&self, id: Uuid) -> Option<Rect> {
-    self.windows.get(&id)?.native.observed_frame().ok()
+  ///
+  /// The frame is in layout coordinates on both platforms: it leaves out
+  /// the invisible resize borders that Windows adds around a window.
+  pub fn visible_frame(&self, id: Uuid) -> Option<Rect> {
+    self.windows.get(&id)?.native.visible_frame().ok()
   }
 
   /// Reports geometry currently owned by reconciliation.
@@ -1642,12 +1680,77 @@ mod stacking_order_tests {
   }
 }
 
+/// Work that a sync took from the coordinator to act on.
+///
+/// Held outside the sync so that a sync which fails before it acts can
+/// hand the work back, see `platform_sync`.
+#[derive(Default)]
+struct TakenWork {
+  /// Windows that were marked dirty.
+  dirty: HashSet<Uuid>,
+
+  /// Whether the layout was marked changed.
+  layout_dirty: bool,
+}
+
+/// Moves the cursor to the centre of `focused`, where the config asks
+/// for a jump.
+fn jump_cursor(
+  focused: &Container,
+  state: &WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
+  let monitor = focused.monitor().context("No monitor.")?;
+  let should_jump = config.value.general.cursor_jump.trigger
+    == CursorJumpTrigger::WindowFocus
+    || state
+      .dispatcher
+      .cursor_position()
+      .ok()
+      .and_then(|point| state.monitor_at_point(&point))
+      .is_none_or(|current| current.id() != monitor.id());
+
+  if should_jump {
+    state
+      .dispatcher
+      .set_cursor_position(&focused.to_rect()?.center_point())?;
+  }
+
+  Ok(())
+}
+
 /// Applies queued state through guarded native sessions.
-#[allow(clippy::too_many_lines)]
+///
+/// A sync fails only before it has acted on any window. The dirty marks
+/// it took are then put back, so the next sync still sees them; no timer
+/// retries a failed sync, and the work would otherwise wait for an
+/// unrelated event to queue it again.
 pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
   origin: SyncOrigin,
+) -> anyhow::Result<()> {
+  let mut taken = TakenWork::default();
+  let result = sync_taken(state, config, origin, &mut taken);
+
+  if result.is_err() {
+    state.native_sync.dirty.extend(taken.dirty);
+    state.native_sync.layout_dirty |= taken.layout_dirty;
+  }
+
+  result
+}
+
+/// Runs one sync, recording in `taken` the work it took.
+///
+/// Must not return an error once the window loop has started; see
+/// `platform_sync`.
+#[allow(clippy::too_many_lines)]
+fn sync_taken(
+  state: &mut WmState,
+  config: &UserConfig,
+  origin: SyncOrigin,
+  taken: &mut TakenWork,
 ) -> anyhow::Result<()> {
   if state.native_sync.stacking_busy() {
     return Ok(());
@@ -1663,8 +1766,8 @@ pub fn platform_sync(
   let repaired = crate::commands::container::repair_tiling_sizes(
     &state.root_container.clone().into(),
   );
-  let layout_changed =
-    std::mem::take(&mut state.native_sync.layout_dirty) || repaired;
+  taken.layout_dirty = std::mem::take(&mut state.native_sync.layout_dirty);
+  let layout_changed = taken.layout_dirty || repaired;
   // Every commit solves the layout again. A queued redraw is not the only
   // thing that moves a rect: a dropped floating window writes its own
   // placement and asks for no redraw, and reconciling that window against
@@ -1697,7 +1800,8 @@ pub fn platform_sync(
     state.pending_sync.needs_focused_effect_update();
   let windows = windows_in_stacking_order(state);
   let t_order = span.elapsed();
-  let dirty = std::mem::take(&mut state.native_sync.dirty);
+  taken.dirty = std::mem::take(&mut state.native_sync.dirty);
+  let dirty = &taken.dirty;
   let now = Instant::now();
   // Once per commit; see `ReconcilePass::sampled_frame`.
   let sampled_frame = wm_platform::FrameClock::current_frame()?;
@@ -1718,7 +1822,7 @@ pub fn platform_sync(
     &reconcile_candidates(
       &windows,
       &redraw,
-      &dirty,
+      dirty,
       &plans,
       all_effects_changed,
       focus_effects_changed,
@@ -1743,7 +1847,11 @@ pub fn platform_sync(
     let Some(&needs_reorder) = selected.get(&id) else {
       continue;
     };
-    let monitor = window.monitor().context("No monitor.")?;
+    // One window without a monitor must not stop the windows after it.
+    let Some(monitor) = window.monitor() else {
+      tracing::warn!("Skipped a window without a monitor: {window}");
+      continue;
+    };
     let pass = ReconcilePass {
       owner: &monitor,
       now,
@@ -1825,26 +1933,21 @@ pub fn platform_sync(
         tracing::warn!("Desktop focus failed: {err}");
       }
     }
-    state.emit_event(WmEvent::FocusChanged {
-      focused_container: focused.to_dto()?,
-    });
+    // Windows have been written by now, so a failure from here on is
+    // logged and the commit is finished. Returning would leave prepared
+    // motions held and the pending queue uncleared.
+    match focused.to_dto() {
+      Ok(focused_container) => {
+        state.emit_event(WmEvent::FocusChanged { focused_container });
+      }
+      Err(err) => tracing::warn!("Focus event failed: {err}"),
+    }
   }
   if state.pending_sync.needs_cursor_jump()
     && config.value.general.cursor_jump.enabled
   {
-    let monitor = focused.monitor().context("No monitor.")?;
-    let should_jump = config.value.general.cursor_jump.trigger
-      == CursorJumpTrigger::WindowFocus
-      || state
-        .dispatcher
-        .cursor_position()
-        .ok()
-        .and_then(|point| state.monitor_at_point(&point))
-        .is_none_or(|current| current.id() != monitor.id());
-    if should_jump {
-      state
-        .dispatcher
-        .set_cursor_position(&focused.to_rect()?.center_point())?;
+    if let Err(err) = jump_cursor(&focused, state, config) {
+      tracing::warn!("Cursor jump failed: {err}");
     }
   }
   release_ready(state);
@@ -1985,7 +2088,7 @@ fn plan_window<'a>(
   // A sent window fades where it stands; its tile is on a workspace
   // nobody can see.
   let tile = if trigger == Some(AnimationTrigger::WindowSent) {
-    window.native_properties().frame
+    window.native_frame()
   } else {
     state
       .layout_snapshot
@@ -2461,6 +2564,21 @@ impl ConcealWait {
     } else {
       ConcealGate::Held
     }
+  }
+}
+
+impl ConcealWait {
+  /// When a wait that is still running gives up, or `None` when no wait
+  /// is running.
+  ///
+  /// A wait that is past its limit counts as not running. Its window
+  /// may not have had a pass since, and a time in the past would ask
+  /// for a pass at once, every time it is asked.
+  fn held_until(&self, now: Instant) -> Option<Instant> {
+    self
+      .since
+      .map(|since| since + CONCEAL_LIMIT)
+      .filter(|until| *until > now)
   }
 }
 
@@ -2953,6 +3071,7 @@ fn reconcile_window(
     });
     slot.insert(ManagedWindow {
       native,
+      claimed_at: Some(Instant::now()),
       frame: FrameReconciler::new(desired),
       motion: None,
       source,
@@ -3383,11 +3502,25 @@ fn reconcile_managed(
   timer.mark("opacity");
   let decorations = desired_decorations(window, intent, config);
   if entry.decorations.as_ref() != Some(&decorations) {
-    entry
-      .native
-      .set_decorations(decorations.border.as_ref(), &decorations.corner)?;
-    entry.native.title_bar(decorations.title_bar)?;
-    entry.decorations = Some(decorations);
+    // Decorations are cosmetic. An error here must not end the pass: the
+    // caller releases the session of a window whose pass failed, which
+    // reveals a window that belongs to a hidden workspace. The window was
+    // validated at the top of the pass, so this is not a dead window. The
+    // decorations stay unrecorded and are tried again on the next pass.
+    let applied = (|| -> anyhow::Result<()> {
+      entry.native.set_decorations(
+        decorations.border.as_ref(),
+        &decorations.corner,
+      )?;
+      entry.native.title_bar(decorations.title_bar)?;
+      Ok(())
+    })();
+    match applied {
+      Ok(()) => entry.decorations = Some(decorations),
+      Err(err) => {
+        tracing::debug!(window = %id, "Decorations not applied: {err}");
+      }
+    }
   }
   timer.mark("decorations");
   // Conceal before any placement write. Cloaked sources need the same
@@ -3467,7 +3600,12 @@ fn reconcile_managed(
       && visible
       && matches!(window.state(), WindowState::Tiling)
     {
-      let hint = entry.native.minimum_size()?;
+      // A window that does not answer has no reported floor; the one it
+      // was seen to keep still counts.
+      let hint = entry.native.minimum_size().unwrap_or_else(|err| {
+        tracing::debug!(window = %id, "Minimum size not read: {err}");
+        None
+      });
       if let Some(mut minimum) =
         entry.frame.constraint(&observed, hint, now)
       {
@@ -3760,7 +3898,13 @@ fn reconcile_managed(
     && native_state != NativeState::Minimized
     && (entry.stacking != z_order || reorder)
   {
-    if let Some(order) = &z_order {
+    // Stacking is cosmetic in the same sense as decorations above: an
+    // error is logged, the order stays unrecorded, and the next pass that
+    // reaches here tries again.
+    let stacked = (|| -> anyhow::Result<()> {
+      let Some(order) = &z_order else {
+        return Ok(());
+      };
       // Apps restack themselves, so the last write says nothing about
       // where the window is now. Leaving the always-on-top band lifts a
       // window over every normal window, and sending one to the bottom
@@ -3777,8 +3921,14 @@ fn reconcile_managed(
       if !settled {
         entry.native.set_z_order(order)?;
       }
+      Ok(())
+    })();
+    match stacked {
+      Ok(()) => entry.stacking = z_order,
+      Err(err) => {
+        tracing::debug!(window = %id, "Stacking order not applied: {err}");
+      }
     }
-    entry.stacking = z_order;
   }
   timer.mark("z_order");
   // Taskbar membership is a round trip to the shell, measured at 1-8ms.
@@ -3831,6 +3981,24 @@ fn reconcile_managed(
   }
   timer.mark("fullscreen");
   timer.report(&id, || window.native_properties().process_name);
+  // How long a window took to reach its place after the WM took it on:
+  // its frame has converged and nothing conceals it any longer. Logged
+  // once per window, always at `INFO`, since the fast ones are what a
+  // slow one is judged against.
+  if entry.frame.phase == ReconcilePhase::Converged
+    && entry.source.is_none()
+  {
+    if let Some(claimed_at) = entry.claimed_at.take() {
+      perf::emit(
+        true,
+        format_args!(
+          "placed window={id} app={} visible={visible} ms={:.1}",
+          window.native_properties().process_name,
+          perf::millis(claimed_at.elapsed()),
+        ),
+      );
+    }
+  }
   Ok(())
 }
 
@@ -5723,6 +5891,22 @@ mod shell_gate_tests {
       .unwrap();
     assert_eq!(poll, ShellPoll::Settled);
     assert!(write_allowed(&mut wait, poll, now));
+  }
+
+  /// A running wait reports when it gives up; one that is over or was
+  /// never started reports nothing.
+  #[test]
+  fn a_conceal_wait_is_held_only_until_its_limit() {
+    let now = Instant::now();
+    let mut wait = ConcealWait::default();
+    assert_eq!(wait.held_until(now), None);
+
+    assert_eq!(wait.check(true, now), ConcealGate::Held);
+    assert_eq!(wait.held_until(now), Some(now + CONCEAL_LIMIT));
+    assert_eq!(wait.held_until(now + CONCEAL_LIMIT), None);
+
+    assert_eq!(wait.check(false, now), ConcealGate::Open);
+    assert_eq!(wait.held_until(now), None);
   }
 
   #[test]

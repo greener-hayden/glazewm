@@ -71,6 +71,19 @@ impl Rect {
     self.bottom - self.top
   }
 
+  /// Whether this rectangle has the top-left corner of `target`, and a
+  /// width and height each within `slack` pixels of it.
+  ///
+  /// For telling a window that has reached a frame from one that has
+  /// not, where the application may round the size it is asked for.
+  #[must_use]
+  pub fn is_at_with_size_within(&self, target: &Rect, slack: i32) -> bool {
+    self.left == target.left
+      && self.top == target.top
+      && (self.width() - target.width()).abs() <= slack
+      && (self.height() - target.height()).abs() <= slack
+  }
+
   /// Converts screen coordinates to Windows placement.
   #[must_use]
   pub fn to_workspace(&self, monitor: &Rect, working: &Rect) -> Self {
@@ -379,6 +392,21 @@ impl From<Rect> for CGRect {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A rounded size counts as arrived; a different corner never does.
+  #[test]
+  fn matches_a_frame_whose_size_was_rounded() {
+    let target = Rect::from_xy(100, 50, 800, 600);
+
+    assert!(target.is_at_with_size_within(&target, 0));
+    assert!(
+      Rect::from_xy(100, 50, 792, 616).is_at_with_size_within(&target, 16)
+    );
+    assert!(!Rect::from_xy(100, 50, 780, 600)
+      .is_at_with_size_within(&target, 16));
+    assert!(!Rect::from_xy(101, 50, 800, 600)
+      .is_at_with_size_within(&target, 16));
+  }
 
   /// Converts negative-monitor placement with both appbars.
   #[test]

@@ -66,6 +66,11 @@ impl TryFrom<&NativeWindow> for NativeWindowProperties {
   type Error = anyhow::Error;
 
   fn try_from(native_window: &NativeWindow) -> Result<Self, Self::Error> {
+    // The frame and both flags in one request. On macOS each separate
+    // read is a hop to the main thread and a round trip to an
+    // application that is still launching.
+    let state = native_window.frame_and_state()?;
+
     Ok(Self {
       title: native_window.title()?,
       title_read_at: Instant::now(),
@@ -74,9 +79,9 @@ impl TryFrom<&NativeWindow> for NativeWindowProperties {
       #[cfg(target_os = "macos")]
       bundle_id: native_window.bundle_id(),
       process_name: native_window.process_name()?,
-      frame: native_window.frame()?,
-      is_minimized: native_window.is_minimized()?,
-      is_maximized: native_window.is_maximized()?,
+      frame: state.frame,
+      is_minimized: state.is_minimized?,
+      is_maximized: state.is_maximized?,
       is_resizable: native_window.is_resizable()?,
       min_size: None,
       min_size_source: MinSizeSource::default(),

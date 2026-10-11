@@ -43,6 +43,12 @@ impl TapRunLoop {
     std::thread::Builder::new()
       .name("glazewm-event-taps".to_string())
       .spawn(move || {
+        // The window server waits on this thread for every tapped key.
+        // A failure only costs latency.
+        if let Err(err) = super::set_interactive_qos() {
+          tracing::warn!("{err}");
+        }
+
         let source = EventLoop::create_dispatch_source(StopKind::RunLoop);
         let is_ready = source.is_ok();
 

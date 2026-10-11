@@ -41,6 +41,11 @@ tasks:
     cmds:
       - cargo clippy --workspace {{if ne OS "windows"}}--exclude wm-watcher{{end}} --all-targets --all-features --locked -- -D warnings
 
+  lint:macos:
+    desc: Offline macOS cross-target Clippy with warnings as errors; catches macOS-only lint failures before CI
+    cmds:
+      - cargo clippy --offline --locked --workspace --exclude wm-watcher --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
+
   test:
     desc: Run workspace tests (macOS desktop harness is separate)
     cmds:

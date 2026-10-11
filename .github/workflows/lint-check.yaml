@@ -12,12 +12,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # MacOS (Apple Silicon)
+          # MacOS (Apple Silicon). `wm-watcher` is Windows-only and its
+          # build script panics elsewhere by design.
           - platform: macos-latest
             target: aarch64-apple-darwin
+            clippy-args: --exclude wm-watcher
           # Windows (x64)
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
+            clippy-args: ''
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
@@ -30,21 +33,21 @@ jobs:
           targets: ${{ matrix.target }}
           toolchain: nightly
 
+      # Keyed per job. Clippy and the tests build different artifacts, and
+      # a shared key is saved by whichever job finishes first, which left
+      # the other one building from cold.
       - uses: swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          shared-key: lint-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Check formatting (rustfmt)
         run: cargo fmt --check
 
       # Clippy itself runs `cargo check`, so this will also check for compilation errors.
+      # The whole workspace, as `task lint` does, so every crate and every
+      # test and bench target is linted, not only the default members.
       - name: Check linting (clippy)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      # The default members leave `wm-platform`'s benches and test targets
-      # out, so they are linted explicitly.
-      - name: Check linting of wm-platform targets (clippy)
-        run: cargo clippy -p wm-platform --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace ${{ matrix.clippy-args }} --all-targets --all-features --locked -- -D warnings
 
   # Both platforms are first-class here, so both run the suite. This is the
   # only gate that exercises the platform the author is not sitting at.
@@ -91,11 +94,11 @@ jobs:
 
       - uses: swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3
         with:
-          shared-key: ${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          shared-key: test-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
 
       # Deliberately not `--all-features`. The only features here are
       # wm-platform's `test_utils`, which dev-dependencies already enable,
       # and wm's `ui_access`, which stamps uiAccess=true into the manifest
       # so the binary refuses to launch unelevated (os error 740).
       - name: Run tests
-        run: cargo test --workspace ${{ matrix.test-args }}
+        run: cargo test --workspace ${{ matrix.test-args }} --locked

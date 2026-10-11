@@ -54,6 +54,14 @@ gaps:
     bottom: '20px'
     left: '20px'
 
+  # Gap between a window and the screen edge when it is the only tiling
+  # window in its workspace. Uses `outer_gap` when left out.
+  # single_window_outer_gap:
+  #   top: '60px'
+  #   right: '200px'
+  #   bottom: '20px'
+  #   left: '200px'
+
 # *Experimental* animation support!
 # Uncomment to enable window move/open animations.
 #
@@ -171,6 +179,17 @@ window_behavior:
       # Whether to show fullscreen windows as always on top.
       shown_on_top: false
 
+# Each workspace needs a `name`. The other options are:
+# - `display_name`: text shown for the workspace in place of its name.
+# - `bind_to_monitor`: index of the monitor that the workspace opens on,
+#   starting at 0.
+# - `keep_alive`: keeps the workspace active when it has no windows.
+#
+# Example:
+#   - name: '1'
+#     display_name: 'Web'
+#     bind_to_monitor: 0
+#     keep_alive: true
 workspaces:
   - name: '1'
   - name: '2'
@@ -182,6 +201,25 @@ workspaces:
   - name: '8'
   - name: '9'
 
+# Each rule runs its `commands` on a window that fits any entry under
+# `match`. An entry can test `window_process`, `window_title`,
+# `window_class` (Windows only) and `window_bundle_id` (macOS only), and a
+# window has to pass every test in the entry. A test is one of `equals`,
+# `includes`, `regex`, `not_equals` or `not_regex`.
+#
+# The other options of a rule are:
+# - `on`: when the rule runs. A list of `manage` (the window is first
+#   managed), `focus` and `title_change`. Defaults to `manage` and
+#   `title_change`.
+# - `run_once`: whether the rule runs once per window (the default), or
+#   each time it fits.
+#
+# Example:
+#   - commands: ['set-floating']
+#     on: ['manage']
+#     run_once: false
+#     match:
+#       - window_title: { includes: 'Preferences' }
 window_rules:
   - commands: ['ignore']
     match:

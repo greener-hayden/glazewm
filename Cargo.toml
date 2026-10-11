@@ -20,6 +20,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "fast-rng", "serde"] }
 wm-macros = { path = "packages/wm-macros" }
 
+# The WM is a resident process whose hot paths cross crate boundaries
+# (`wm` into `wm-platform` and `wm-common`). Thin LTO and a single codegen
+# unit let those calls inline; the cost is a longer release build. Line
+# tables keep backtraces in the error log readable.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
 [workspace.lints]
 clippy.all = { level = "warn", priority = -1 }
 clippy.pedantic = { level = "warn", priority = -1 }

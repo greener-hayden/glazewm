@@ -26,6 +26,31 @@ GlazeWM lets you easily organize windows and adjust their layout on the fly by u
 
 </div>
 
+## This fork
+
+This repository is `greener-hayden/glazewm`, a personal fork of [glzr-io/glazewm](https://github.com/glzr-io/glazewm). Work lands on the `dogfood/all` branch. Nothing here is sent upstream.
+
+The rest of this README is upstream's. Its installation section installs upstream's build, not this fork.
+
+What this fork adds:
+
+- Window animations on Windows and macOS, with spring easing and a workspace slide.
+- A placement reconciler that checks each window against its tile and retries within a budget.
+- Floating windows that stay above tiled ones on Windows (`window_behavior.floating_above_tiled`).
+- A perf log and an opt-in benchmark harness. See [docs/benchmarks.md](./docs/benchmarks.md).
+
+To build and install this fork:
+
+- Run `task --list` to see every target. `task check` runs the format, lint, and test gates.
+- Run `task install` to build, install, and restart the window manager. It needs the packaging helper named in `Taskfile.yml`.
+- `task check:macos` and `task lint:macos` check the macOS target from a Windows machine.
+
+Logs are in `~/.glzr/glazewm/`:
+
+- `errors.log` holds errors, including panics with a backtrace.
+- `warnings.<date>.log` holds warnings and errors, one file per day, seven kept.
+- `perf.<date>.log` holds timing lines.
+
 ### 🌟 Key features
 
 - Simple YAML configuration

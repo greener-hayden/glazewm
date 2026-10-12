@@ -102,23 +102,6 @@ pub trait CommonGetters {
       .count()
   }
 
-  /// Number of tiling containers that share this container's parent,
-  /// excluding the container itself.
-  ///
-  /// Counts in place, so unlike `tiling_siblings().count()` it neither
-  /// clones the siblings nor allocates. Returns 0 if the container has no
-  /// parent.
-  fn tiling_sibling_count(&self) -> usize {
-    let id = self.id();
-    self.borrow_parent().as_ref().map_or(0, |parent| {
-      parent
-        .borrow_children()
-        .iter()
-        .filter(|sibling| sibling.is_tiling() && sibling.id() != id)
-        .count()
-    })
-  }
-
   fn tiling_children(
     &self,
   ) -> Box<dyn Iterator<Item = TilingContainer> + '_> {

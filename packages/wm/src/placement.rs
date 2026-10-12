@@ -1326,6 +1326,18 @@ impl PlacementCoordinator {
     self.windows.get(&id)?.native.visible_frame().ok()
   }
 
+  /// The smallest size that a managed window's application says the
+  /// window takes, borders included. `None` for a window that is not
+  /// managed, does not answer, or reports none.
+  ///
+  /// # Platform-specific
+  ///
+  /// - Windows: asks the application, waiting 20 ms at most.
+  /// - macOS: always `None`.
+  pub fn reported_minimum(&self, id: Uuid) -> Option<(i32, i32)> {
+    self.windows.get(&id)?.native.minimum_size().ok().flatten()
+  }
+
   /// Reports geometry currently owned by reconciliation.
   pub fn owns_geometry(&self, id: Uuid) -> bool {
     self.windows.get(&id).is_some_and(ManagedWindow::settling)

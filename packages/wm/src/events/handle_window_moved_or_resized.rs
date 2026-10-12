@@ -15,8 +15,8 @@ use crate::{
     window::update_window_state,
   },
   events::{apply_dragged_edges, handle_window_moved_or_resized_end},
-  models::{Monitor, NonTilingWindow, WindowContainer},
-  traits::{CommonGetters, WindowGetters},
+  models::{MinSizeSource, Monitor, NonTilingWindow, WindowContainer},
+  traits::{CommonGetters, PositionGetters, WindowGetters},
   user_config::UserConfig,
   wm_state::WmState,
 };
@@ -536,6 +536,10 @@ fn update_drag_state(
       ..active_drag.clone()
     }));
 
+    if !is_move {
+      record_reported_floors(window, state)?;
+    }
+
     is_move
   };
 
@@ -627,6 +631,70 @@ fn update_drag_state(
         }
       }
     }
+  }
+
+  Ok(())
+}
+
+/// Records the floor that each tiling window beside a resize reports,
+/// so that the resize knows from its first step which tiles can give up
+/// space.
+///
+/// A floor is otherwise learned only once a window has refused a frame,
+/// which is after the resize that asked for it: the layout would follow
+/// the drag and then fall back. A window that stands smaller than what
+/// it reports has disproved the report, and is left alone.
+fn record_reported_floors(
+  window: &WindowContainer,
+  state: &mut WmState,
+) -> anyhow::Result<()> {
+  let Some(workspace) = window.workspace() else {
+    return Ok(());
+  };
+
+  for container in workspace.descendants() {
+    let Some(tile) = container.as_tiling_window() else {
+      continue;
+    };
+
+    let Some(reported) = state.native_sync.reported_minimum(tile.id())
+    else {
+      continue;
+    };
+
+    // The report is of the whole window. The layout works in tile
+    // rectangles, which leave out the borders.
+    let tile_rect = tile.to_rect()?;
+    let window_rect =
+      tile_rect.apply_delta(&tile.total_border_delta()?, None);
+    let floor = (
+      (reported.0 - (window_rect.width() - tile_rect.width())).max(0),
+      (reported.1 - (window_rect.height() - tile_rect.height())).max(0),
+    );
+
+    let frame = tile.native_frame();
+    let visible = tile_rect.apply_delta(&tile.border_delta(), None);
+    let shown = (
+      frame.width() - (visible.width() - tile_rect.width()),
+      frame.height() - (visible.height() - tile_rect.height()),
+    );
+
+    if floor == (0, 0) || shown.0 + 1 < floor.0 || shown.1 + 1 < floor.1 {
+      continue;
+    }
+
+    // The layout only changes where the floor is new. The same floor
+    // known by inference becomes a reported one.
+    if tile.min_size() != Some(floor) {
+      state
+        .pending_sync
+        .queue_container_to_redraw(workspace.clone());
+    }
+
+    tile.update_native_properties(|properties| {
+      properties.min_size = Some(floor);
+      properties.min_size_source = MinSizeSource::Reported;
+    });
   }
 
   Ok(())

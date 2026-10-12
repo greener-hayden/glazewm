@@ -3,15 +3,9 @@ use wm_common::WindowState;
 use wm_platform::{LengthValue, Rect};
 
 use crate::{
-  commands::container::resize_tiling_container,
-  models::{
-    Container, NonTilingWindow, TilingContainer, TilingWindow,
-    WindowContainer,
-  },
-  traits::{
-    CommonGetters, PositionGetters, TilingSizeGetters, WindowGetters,
-    MIN_TILING_SIZE,
-  },
+  commands::container::{Boundary, ResizeEdge},
+  models::{NonTilingWindow, TilingWindow, WindowContainer},
+  traits::{CommonGetters, PositionGetters, WindowGetters},
   wm_state::WmState,
 };
 
@@ -19,129 +13,40 @@ use crate::{
 const MIN_FLOATING_WIDTH: i32 = 250;
 const MIN_FLOATING_HEIGHT: i32 = 140;
 
-/// What resizing a tiling window along one axis starts from.
+/// Sets the size of a window.
 ///
-/// A caller that has already resolved these for its own sums passes them
-/// on in `ResizeContexts`, so each is solved once per command.
-pub struct ResizeContext {
-  /// The container whose tiling size changes. Can be an ancestor split.
-  container_to_resize: TilingContainer,
-
-  /// Parent of `container_to_resize`.
-  parent: Container,
-
-  /// Rectangle of `parent` when this was resolved.
-  pub(super) parent_rect: Rect,
-
-  /// Tiling siblings of the window being resized.
-  pub(super) sibling_count: usize,
-}
-
-impl ResizeContext {
-  /// Resolves the context of a resize along an axis.
-  ///
-  /// Returns `None` when nothing can be resized along that axis.
-  pub fn resolve(
-    window: &TilingWindow,
-    is_width_resize: bool,
-  ) -> anyhow::Result<Option<Self>> {
-    window
-      .container_to_resize(is_width_resize)?
-      .map(|container_to_resize| {
-        Self::from_container(window, container_to_resize)
-      })
-      .transpose()
-  }
-
-  /// Resolves the context for a known `container_to_resize`.
-  pub fn from_container(
-    window: &TilingWindow,
-    container_to_resize: TilingContainer,
-  ) -> anyhow::Result<Self> {
-    let parent = container_to_resize.parent().context("No parent.")?;
-    let parent_rect = parent.to_rect()?;
-
-    Ok(Self {
-      container_to_resize,
-      parent,
-      parent_rect,
-      sibling_count: window.tiling_sibling_count(),
-    })
-  }
-
-  /// Length of the parent along an axis that its tiling children share
-  /// out, in pixels. This is the parent's length without its gaps.
-  fn parent_length(&self, is_width_resize: bool) -> anyhow::Result<i32> {
-    let (horizontal_gap, vertical_gap) =
-      self.container_to_resize.inner_gaps()?;
-
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    let gaps = self.sibling_count as i32;
-
-    Ok(if is_width_resize {
-      self.parent_rect.width() - horizontal_gap * gaps
-    } else {
-      self.parent_rect.height() - vertical_gap * gaps
-    })
-  }
-}
-
-/// Edge of a tiling window that a resize moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResizeEdge {
-  /// The left edge of a width, or the top edge of a height.
-  Start,
-
-  /// The right edge of a width, or the bottom edge of a height.
-  End,
-}
-
-/// Contexts that a caller has already resolved for each axis.
-///
-/// A context is only good while no tiling size has changed since it was
-/// resolved, so the height context is dropped once the width has been
-/// resized.
-#[derive(Default)]
-pub struct ResizeContexts {
-  pub width: Option<ResizeContext>,
-  pub height: Option<ResizeContext>,
-}
-
+/// A tiling window is resized by moving a boundary (see
+/// `grow_tiling_window`), so a length is reached only as far as the
+/// floors of the tiles that pay for it allow.
 pub fn set_window_size(
   window: WindowContainer,
   target_width: Option<LengthValue>,
   target_height: Option<LengthValue>,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
-  set_window_size_with_contexts(
-    window,
-    target_width,
-    target_height,
-    ResizeContexts::default(),
-    state,
-  )
-}
-
-/// Sets the size of a window, reusing contexts the caller has resolved.
-///
-/// Gives the same result as `set_window_size`, which resolves each
-/// context itself.
-pub fn set_window_size_with_contexts(
-  window: WindowContainer,
-  target_width: Option<LengthValue>,
-  target_height: Option<LengthValue>,
-  contexts: ResizeContexts,
-  state: &mut WmState,
-) -> anyhow::Result<()> {
   match window {
     WindowContainer::TilingWindow(window) => {
-      set_tiling_window_size(
-        &window,
-        target_width,
-        target_height,
-        contexts,
-        state,
-      )?;
+      for (target, is_width) in
+        [(target_width, true), (target_height, false)]
+      {
+        let Some(target) = target else {
+          continue;
+        };
+
+        let rect = window.to_rect()?;
+        let current = if is_width {
+          rect.width()
+        } else {
+          rect.height()
+        };
+
+        grow_tiling_window(
+          &window,
+          is_width,
+          |row_length| target.to_px(row_length, None) - current,
+          state,
+        )?;
+      }
     }
     WindowContainer::NonTilingWindow(window) => {
       if matches!(window.state(), WindowState::Floating(_)) {
@@ -158,271 +63,33 @@ pub fn set_window_size_with_contexts(
   Ok(())
 }
 
-fn set_tiling_window_size(
+/// Grows a tiling window along one axis, or shrinks it when negative.
+///
+/// Moves the boundary of the nearest row in which the window has a
+/// neighbour: the one after it, or the one before it for the last tile
+/// of a row. Every other boundary stays where it is.
+///
+/// `px` is given the length that the tiles of that row share out, which
+/// a percentage is taken from, and returns the pixels to grow by.
+/// Nothing happens where no row has a neighbour, as for the only window
+/// of a workspace.
+pub(super) fn grow_tiling_window(
   window: &TilingWindow,
-  target_width: Option<LengthValue>,
-  target_height: Option<LengthValue>,
-  contexts: ResizeContexts,
+  is_width: bool,
+  px: impl FnOnce(i32) -> i32,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
-  let ResizeContexts { width, height } = contexts;
-  let mut resized = false;
+  let Some(boundary) = Boundary::find(
+    &window.as_tiling_container()?,
+    is_width,
+    &[ResizeEdge::End, ResizeEdge::Start],
+  ) else {
+    return Ok(());
+  };
 
-  if let Some(target_width) = target_width {
-    resized =
-      set_tiling_window_length(window, &target_width, true, width, state)?;
-  }
-
-  if let Some(target_height) = target_height {
-    // Resizing the width moved tiling sizes, which the height context
-    // was resolved before.
-    let height = if resized { None } else { height };
-    set_tiling_window_length(
-      window,
-      &target_height,
-      false,
-      height,
-      state,
-    )?;
-  }
+  boundary.grow(px(boundary.row_length()?), state)?;
 
   Ok(())
-}
-
-/// Updates either the width or height of a tiling window.
-///
-/// Resolves the context itself unless given one. Returns whether the
-/// layout changed: a tiling size was set, or a floor was forgotten.
-fn set_tiling_window_length(
-  window: &TilingWindow,
-  target_length: &LengthValue,
-  is_width_resize: bool,
-  context: Option<ResizeContext>,
-  state: &mut WmState,
-) -> anyhow::Result<bool> {
-  // When resizing a tiling window, the container to resize can actually be
-  // an ancestor split container.
-  let context = match context {
-    Some(context) => Some(context),
-    None => ResizeContext::resolve(window, is_width_resize)?,
-  };
-
-  if let Some(context) = context {
-    let parent_length = context.parent_length(is_width_resize)?;
-    let ResizeContext {
-      container_to_resize,
-      parent,
-      ..
-    } = context;
-
-    // Without room to resize into, a pixel length has no percentage.
-    if parent_length <= 0 {
-      return Ok(false);
-    }
-
-    let requested_px = target_length.to_px(parent_length, None);
-
-    // A sibling pinned to its floor cannot give the space up, and the
-    // window cannot take less than its own; asking would only be undone.
-    let (mut floor, mut ceiling) =
-      length_limits(&container_to_resize, parent_length, is_width_resize);
-
-    // That holds for a floor the application reported. An inferred one
-    // is re-tested instead, so the limits are taken again without it.
-    let released = release_floors_in_the_way(
-      &container_to_resize,
-      requested_px,
-      floor,
-      ceiling,
-      is_width_resize,
-    );
-
-    if released {
-      (floor, ceiling) = length_limits(
-        &container_to_resize,
-        parent_length,
-        is_width_resize,
-      );
-    }
-
-    let target_px = requested_px.clamp(floor, ceiling);
-
-    // Convert the target length to a tiling size.
-    let tiling_size =
-      LengthValue::from_px(target_px).to_percentage(parent_length);
-
-    // Skip the resize if the window is already at the target size.
-    let resized = container_to_resize.tiling_size() - tiling_size != 0.;
-    if resized {
-      resize_tiling_container(&container_to_resize, tiling_size);
-    }
-
-    // A released floor moves the layout even where no tiling size does.
-    if resized || released {
-      state
-        .pending_sync
-        .queue_containers_to_redraw(parent.tiling_children());
-      return Ok(true);
-    }
-  }
-
-  Ok(false)
-}
-
-/// Sets the length of a tiling window along one axis by moving one edge.
-///
-/// Only the neighbour across `edge` gives up or takes the space, so every
-/// other edge in the row stays where it is. This is what dragging an edge
-/// shows the user, where `set_window_size` shares the change out among
-/// all siblings.
-///
-/// The length is clamped to the floors of the window and the neighbour.
-/// Without a neighbour across `edge`, such as at the end of a row, the
-/// change is shared out as `set_window_size` does.
-pub fn set_tiling_window_edge(
-  window: &TilingWindow,
-  target_px: i32,
-  is_width_resize: bool,
-  edge: ResizeEdge,
-  state: &mut WmState,
-) -> anyhow::Result<()> {
-  let Some(context) = ResizeContext::resolve(window, is_width_resize)?
-  else {
-    return Ok(());
-  };
-
-  let container = context.container_to_resize.clone();
-  let neighbour = match edge {
-    ResizeEdge::Start => container
-      .prev_siblings()
-      .find_map(|sibling| sibling.as_tiling_container().ok()),
-    ResizeEdge::End => container
-      .next_siblings()
-      .find_map(|sibling| sibling.as_tiling_container().ok()),
-  };
-
-  let Some(neighbour) = neighbour else {
-    set_tiling_window_length(
-      window,
-      &LengthValue::from_px(target_px),
-      is_width_resize,
-      Some(context),
-      state,
-    )?;
-    return Ok(());
-  };
-
-  let parent_length = context.parent_length(is_width_resize)?;
-
-  // The two tiles trade space, so their sizes keep this sum.
-  let pair_size = container.tiling_size() + neighbour.tiling_size();
-
-  // Without room to resize into, or for both tiles to keep a usable
-  // size, there is nothing to trade.
-  if parent_length <= 0
-    || !pair_size.is_finite()
-    || pair_size < 2. * MIN_TILING_SIZE
-  {
-    return Ok(());
-  }
-
-  #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-  let limits = || {
-    let floor = container.min_length(is_width_resize);
-    let pair_px = (pair_size * parent_length as f32) as i32;
-
-    (
-      floor,
-      (pair_px - neighbour.min_length(is_width_resize)).max(floor),
-    )
-  };
-
-  let (mut floor, mut ceiling) = limits();
-
-  // An inferred floor in the way is re-tested, as in
-  // `release_floors_in_the_way`. Only the neighbour's floor can be, since
-  // no other sibling gives up space here.
-  let released = if target_px < floor {
-    container.release_inferred_floors(is_width_resize)
-  } else if target_px > ceiling {
-    neighbour.release_inferred_floors(is_width_resize)
-  } else {
-    false
-  };
-
-  if released {
-    (floor, ceiling) = limits();
-  }
-
-  let tiling_size = LengthValue::from_px(target_px.clamp(floor, ceiling))
-    .to_percentage(parent_length)
-    .clamp(MIN_TILING_SIZE, pair_size - MIN_TILING_SIZE);
-
-  // A change of under half a pixel moves nothing on screen.
-  #[allow(clippy::cast_precision_loss)]
-  let half_pixel = 0.5 / parent_length as f32;
-  let resized =
-    (container.tiling_size() - tiling_size).abs() >= half_pixel;
-
-  if resized {
-    container.set_tiling_size(tiling_size);
-    neighbour.set_tiling_size(pair_size - tiling_size);
-  }
-
-  if resized || released {
-    state
-      .pending_sync
-      .queue_containers_to_redraw(context.parent.tiling_children());
-  }
-
-  Ok(())
-}
-
-/// The shortest and longest that `container` can be along an axis, in
-/// pixels, given its own floor and the floors of its siblings.
-fn length_limits(
-  container: &TilingContainer,
-  parent_length: i32,
-  is_width_resize: bool,
-) -> (i32, i32) {
-  let siblings_floor = container
-    .tiling_siblings()
-    .map(|sibling| sibling.min_length(is_width_resize))
-    .sum::<i32>();
-
-  let floor = container.min_length(is_width_resize);
-  (floor, (parent_length - siblings_floor).max(floor))
-}
-
-/// Forgets the inferred floors that keep `container` from the length
-/// asked for: its own when asked for less than `floor`, its siblings'
-/// when asked for more than `ceiling`.
-///
-/// An inferred floor can be wrong, and it cannot be disproved from
-/// outside, since the layout never asks a window for less than its
-/// floor. The user asking is the reason to ask the window again. A
-/// request within the limits leaves every floor alone.
-///
-/// Returns whether any floor was forgotten.
-fn release_floors_in_the_way(
-  container: &TilingContainer,
-  requested_px: i32,
-  floor: i32,
-  ceiling: i32,
-  is_width_resize: bool,
-) -> bool {
-  if requested_px < floor {
-    container.release_inferred_floors(is_width_resize)
-  } else if requested_px > ceiling {
-    // Every sibling is asked, so this cannot stop at the first.
-    let mut released = false;
-    for sibling in container.tiling_siblings() {
-      released |= sibling.release_inferred_floors(is_width_resize);
-    }
-    released
-  } else {
-    false
-  }
 }
 
 fn set_floating_window_size(
@@ -487,9 +154,9 @@ mod tests {
   use super::*;
   use crate::{
     commands::window::resize_window,
-    layout_snapshot::tests::{reference_min_length, reference_to_rect},
     models::{MinSizeSource, Monitor, SplitContainer, Workspace},
     test_utils::{attach_monitor, mock_state},
+    traits::TilingSizeGetters,
   };
 
   /// A horizontal workspace holding window `a` and a vertical split of
@@ -504,13 +171,8 @@ mod tests {
   }
 
   impl Fixture {
-    /// The fixture with floors that the applications reported.
-    fn new() -> Self {
-      Self::with_floors(MinSizeSource::Reported)
-    }
-
     /// The fixture with every floor known from `source`.
-    fn with_floors(source: MinSizeSource) -> Self {
+    fn new(source: MinSizeSource) -> Self {
       let gaps = GapsConfig {
         inner_gap: LengthValue::from_px(10),
         ..GapsConfig::default()
@@ -541,7 +203,7 @@ mod tests {
         .call();
       let workspace = Workspace::mock()
         .gaps_config(gaps)
-        .tiling_containers(vec![a.clone().into(), upper.into()])
+        .tiling_containers(vec![a.into(), upper.into()])
         .call();
       let monitor = Monitor::mock().workspaces(vec![workspace]).call();
       let (state, events) = mock_state();
@@ -556,336 +218,169 @@ mod tests {
       }
     }
 
-    /// Tiling size of every tiling container, breadth first.
-    fn sizes(&self) -> Vec<f32> {
-      self
+    /// Resizes a window of the fixture by pixel deltas.
+    fn resize(
+      &mut self,
+      window: &TilingWindow,
+      width: Option<i32>,
+      height: Option<i32>,
+    ) {
+      resize_window(
+        &window.clone().into(),
+        width.map(LengthValue::from_px),
+        height.map(LengthValue::from_px),
+        &mut self.state,
+      )
+      .expect("Resize.");
+    }
+
+    /// Asserts the tiling size of every tiling container, breadth
+    /// first: `a`, the vertical split, `b`, the horizontal split, `c`,
+    /// `d`.
+    fn assert_sizes(&self, expected: [f32; 6]) {
+      let sizes = self
         .state
         .root_container
         .descendants()
         .filter_map(|container| container.as_tiling_container().ok())
         .map(|container| container.tiling_size())
-        .collect()
-    }
-  }
+        .collect::<Vec<_>>();
 
-  /// The three-chain resize that this module replaced, kept as an oracle.
-  ///
-  /// Solves the layout from the workspace down for each rectangle it
-  /// reads, and resolves every context again for each axis.
-  #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-  fn reference_resize(
-    window: &TilingWindow,
-    width_delta: Option<LengthValue>,
-    height_delta: Option<LengthValue>,
-  ) -> anyhow::Result<()> {
-    let tiling = window.as_tiling_container()?;
-    let window_rect = reference_to_rect(&tiling)?;
-
-    let target = |delta: Option<LengthValue>, is_width: bool| {
-      let Some(delta) = delta else {
-        return anyhow::Ok(None);
-      };
-      let parent_length = tiling
-        .container_to_resize(is_width)?
-        .and_then(|container| container.parent())
-        .and_then(|parent| {
-          let rect = reference_parent_rect(&parent).ok()?;
-          Some(if is_width {
-            rect.width()
-          } else {
-            rect.height()
-          })
-        })
-        .and_then(|length| {
-          let (horizontal_gap, vertical_gap) = tiling.inner_gaps().ok()?;
-          let gap = if is_width {
-            horizontal_gap
-          } else {
-            vertical_gap
-          };
-          Some(length - gap * tiling.tiling_siblings().count() as i32)
-        });
-      let current = if is_width {
-        window_rect.width()
-      } else {
-        window_rect.height()
-      };
-
-      Ok(parent_length.map(|length| current + delta.to_px(length, None)))
-    };
-
-    let target_width = target(width_delta, true)?;
-    let target_height = target(height_delta, false)?;
-
-    for (target, is_width) in
-      [(target_width, true), (target_height, false)]
-    {
-      if let Some(px) = target {
-        reference_set_length(window, px, is_width)?;
+      assert_eq!(sizes.len(), expected.len(), "sizes: {sizes:?}");
+      for (size, expected) in sizes.iter().zip(expected) {
+        assert!(
+          (size - expected).abs() < 0.0001,
+          "sizes: {sizes:?}, expected: {expected:?}"
+        );
       }
     }
-
-    Ok(())
   }
 
-  /// Rectangle of a direction container, solved from the workspace down.
-  fn reference_parent_rect(parent: &Container) -> anyhow::Result<Rect> {
-    match parent {
-      Container::Workspace(workspace) => workspace.to_rect(),
-      Container::Split(split) => {
-        reference_to_rect(&split.as_tiling_container()?)
-      }
-      _ => anyhow::bail!("Not a direction container."),
-    }
-  }
+  // The expected sizes below follow from the layout of the fixture: the
+  // workspace is 1680x1000, so with a 10px gap the top row gives `a` and
+  // the vertical split 835px each, which gives `b` and the horizontal
+  // split 495px each, which gives `c` 413px and `d` 412px of the 825px
+  // between them.
 
-  /// The old `set_tiling_window_length` for a length in pixels.
-  #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-  fn reference_set_length(
-    window: &TilingWindow,
-    target_px: i32,
-    is_width_resize: bool,
-  ) -> anyhow::Result<()> {
-    let Some(container_to_resize) =
-      window.container_to_resize(is_width_resize)?
-    else {
-      return Ok(());
-    };
-    let parent = container_to_resize.parent().context("No parent.")?;
-    let (horizontal_gap, vertical_gap) =
-      container_to_resize.inner_gaps()?;
-    let parent_rect = reference_parent_rect(&parent)?;
-
-    let parent_length = if is_width_resize {
-      parent_rect.width()
-        - horizontal_gap * window.tiling_siblings().count() as i32
-    } else {
-      parent_rect.height()
-        - vertical_gap * window.tiling_siblings().count() as i32
-    };
-    if parent_length <= 0 {
-      return Ok(());
-    }
-
-    let siblings_floor = container_to_resize
-      .tiling_siblings()
-      .map(|sibling| reference_min_length(&sibling, is_width_resize))
-      .sum::<i32>();
-    let floor =
-      reference_min_length(&container_to_resize, is_width_resize);
-    let ceiling = (parent_length - siblings_floor).max(floor);
-    let target_px = LengthValue::from_px(target_px)
-      .to_px(parent_length, None)
-      .clamp(floor, ceiling);
-    let tiling_size =
-      LengthValue::from_px(target_px).to_percentage(parent_length);
-
-    if container_to_resize.tiling_size() - tiling_size != 0. {
-      resize_tiling_container(&container_to_resize, tiling_size);
-    }
-
-    Ok(())
-  }
-
-  /// Resizes `pick`'s window in two fixtures, once with `resize_window`
-  /// and once with the oracle, and returns the sizes the first ends on.
-  ///
-  /// Panics unless both end on exactly the same sizes.
-  fn resize_both(
-    pick: fn(&Fixture) -> &TilingWindow,
-    width: Option<LengthValue>,
-    height: Option<LengthValue>,
-  ) -> Vec<f32> {
-    let mut fixture = Fixture::new();
-    let window = pick(&fixture).clone();
-    resize_window(
-      &window.into(),
-      width.clone(),
-      height.clone(),
-      &mut fixture.state,
-    )
-    .expect("Resize.");
-
-    let reference = Fixture::new();
-    reference_resize(pick(&reference), width, height)
-      .expect("Reference resize.");
-
-    assert_eq!(
-      fixture.sizes(),
-      reference.sizes(),
-      "resize_window diverged from the three-chain algorithm"
-    );
-
-    fixture.sizes()
-  }
-
-  /// Asserts sizes against ones worked out for the base revision.
-  fn assert_close(actual: &[f32], expected: &[f32]) {
-    assert_eq!(actual.len(), expected.len(), "sizes: {actual:?}");
-    for (size, expected) in actual.iter().zip(expected) {
-      assert!(
-        (size - expected).abs() < 0.0001,
-        "sizes: {actual:?}, expected: {expected:?}"
-      );
-    }
-  }
-
-  /// Sizes in the order of `Fixture::sizes`: `a`, the vertical split, `b`,
-  /// the horizontal split, `c`, `d`.
-  const UNTOUCHED: [f32; 6] = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
-
-  // The expected sizes below follow from the layout the base revision
-  // solves for this fixture: the workspace is 1680x1000, so with a 10px
-  // gap the top row gives `a` and the vertical split 835px each, which
-  // gives `b` and the horizontal split 495px each, which gives `c` 413px
-  // and `d` 412px of the 825px between them.
-
-  /// `d` +60px wide: 472px of 825px, under the 525px its sibling's 300px
-  /// floor leaves it. 472 / 825 for `d`, the rest for `c`.
-  const WIDTH_ONLY: [f32; 6] =
-    [0.5, 0.5, 0.5, 0.5, 0.427_878_8, 0.572_121_2];
-
-  /// `d` +60px tall: the horizontal split is resized, since the resize is
-  /// across its row. 555px of 990px, under the 790px that `b`'s 200px
-  /// floor leaves it. 555 / 990 for the split, the rest for `b`.
-  const HEIGHT_ONLY: [f32; 6] =
-    [0.5, 0.5, 0.439_393_94, 0.560_606_06, 0.5, 0.5];
-
-  /// Both of the above at once.
-  const BOTH_CHANGED: [f32; 6] = [
-    0.5,
-    0.5,
-    0.439_393_94,
-    0.560_606_06,
-    0.427_878_8,
-    0.572_121_2,
-  ];
-
-  /// `b` +0px wide leaves the vertical split at 835 / 1670, and +100px
-  /// tall takes 595px of 990px, under the 840px that the horizontal
-  /// split's 150px floor leaves it.
-  const WIDTH_NO_OP: [f32; 6] =
-    [0.5, 0.5, 0.601_010_1, 0.398_989_9, 0.5, 0.5];
-
-  /// `d` asking for far more is held at 525px of 825px.
-  const CAPPED: [f32; 6] = [0.5, 0.5, 0.5, 0.5, 0.363_636_36, 0.636_363_6];
-
+  /// `d` is the last tile of its row, so its left boundary moves: 472px
+  /// of 825px for `d`, the rest for `c`.
   #[test]
-  fn fixture_starts_even() {
-    assert_close(&Fixture::new().sizes(), &UNTOUCHED);
+  fn width_moves_the_boundary_of_the_own_row() {
+    let mut fixture = Fixture::new(MinSizeSource::Reported);
+    let d = fixture.d.clone();
+    fixture.resize(&d, Some(60), None);
+
+    fixture.assert_sizes([0.5, 0.5, 0.5, 0.5, 353. / 825., 472. / 825.]);
+  }
+
+  /// The row of `d` runs along the width, so its height is that of the
+  /// horizontal split: 555px of 990px, the rest for `b`.
+  #[test]
+  fn height_moves_the_boundary_of_the_split_above() {
+    let mut fixture = Fixture::new(MinSizeSource::Reported);
+    let d = fixture.d.clone();
+    fixture.resize(&d, None, Some(60));
+
+    fixture.assert_sizes([0.5, 0.5, 435. / 990., 555. / 990., 0.5, 0.5]);
   }
 
   #[test]
-  fn width_only() {
-    let sizes =
-      resize_both(|f| &f.d, Some(LengthValue::from_px(60)), None);
-    assert_close(&sizes, &WIDTH_ONLY);
+  fn width_and_height_are_resized_independently() {
+    let mut fixture = Fixture::new(MinSizeSource::Reported);
+    let d = fixture.d.clone();
+    fixture.resize(&d, Some(60), Some(60));
+
+    fixture.assert_sizes([
+      0.5,
+      0.5,
+      435. / 990.,
+      555. / 990.,
+      353. / 825.,
+      472. / 825.,
+    ]);
   }
 
+  /// `b` is alone in its row along the width, so the vertical split is
+  /// what grows, against `a`.
   #[test]
-  fn height_only() {
-    let sizes =
-      resize_both(|f| &f.d, None, Some(LengthValue::from_px(60)));
-    assert_close(&sizes, &HEIGHT_ONLY);
+  fn width_of_a_stacked_window_resizes_its_split() {
+    let mut fixture = Fixture::new(MinSizeSource::Reported);
+    let b = fixture.b.clone();
+    fixture.resize(&b, Some(100), None);
+
+    fixture.assert_sizes([735. / 1670., 935. / 1670., 0.5, 0.5, 0.5, 0.5]);
   }
 
-  /// The width changes, so the height must not reuse a context from
-  /// before it.
+  /// A reported floor on the tile that pays caps how far a window can
+  /// grow: `c` keeps its 300px.
   #[test]
-  fn width_and_height_where_the_width_changes() {
-    let sizes = resize_both(
-      |f| &f.d,
-      Some(LengthValue::from_px(60)),
-      Some(LengthValue::from_px(60)),
-    );
-    assert_close(&sizes, &BOTH_CHANGED);
+  fn growth_stops_at_a_reported_floor() {
+    let mut fixture = Fixture::new(MinSizeSource::Reported);
+    let d = fixture.d.clone();
+    fixture.resize(&d, Some(5000), None);
+
+    fixture.assert_sizes([0.5, 0.5, 0.5, 0.5, 300. / 825., 525. / 825.]);
   }
 
-  /// The width asks for exactly what the window has, so nothing moves and
-  /// the height keeps the context resolved up front.
+  /// The same request with inferred floors. The width floor of `c` is
+  /// forgotten, so `d` takes all but the smallest tile of 9px. The height
+  /// floor of `c` is not in the way and stays.
   #[test]
-  fn width_and_height_where_the_width_is_a_no_op() {
-    let sizes = resize_both(
-      |f| &f.b,
-      Some(LengthValue::from_px(0)),
-      Some(LengthValue::from_px(100)),
-    );
-    assert_close(&sizes, &WIDTH_NO_OP);
-  }
-
-  /// A floor on a sibling caps how far a window can grow.
-  #[test]
-  fn growth_stops_at_the_sibling_floor() {
-    let sizes =
-      resize_both(|f| &f.d, Some(LengthValue::from_px(5000)), None);
-    assert_close(&sizes, &CAPPED);
-  }
-
-  /// Resizes `d`'s width in a fixture whose floors are all inferred.
-  fn resize_d_with_inferred_floors(width_px: i32) -> Fixture {
-    let mut fixture = Fixture::with_floors(MinSizeSource::Inferred);
-    resize_window(
-      &fixture.d.clone().into(),
-      Some(LengthValue::from_px(width_px)),
-      None,
-      &mut fixture.state,
-    )
-    .expect("Resize.");
-
-    fixture
-  }
-
-  /// The same request as `growth_stops_at_the_sibling_floor`. `c`'s
-  /// width floor is forgotten, so `d` takes all but the minimum tile;
-  /// `c`'s height floor is not in the way and stays.
-  #[test]
-  fn growth_past_an_inferred_sibling_floor_releases_it() {
-    let fixture = resize_d_with_inferred_floors(5000);
+  fn growth_past_an_inferred_floor_releases_it() {
+    let mut fixture = Fixture::new(MinSizeSource::Inferred);
+    let d = fixture.d.clone();
+    fixture.resize(&d, Some(5000), None);
 
     assert_eq!(fixture.c.min_size(), Some((0, 150)));
     assert_eq!(fixture.d.min_size(), Some((150, 100)));
-    assert_close(&fixture.sizes(), &[0.5, 0.5, 0.5, 0.5, 0.01, 0.99]);
+    fixture.assert_sizes([0.5, 0.5, 0.5, 0.5, 9. / 825., 816. / 825.]);
   }
 
   /// `d` -400px wide: 12px of 825px, under its own 150px floor, which is
-  /// forgotten. 12 / 825 for `d`, the rest for `c`.
+  /// forgotten.
   #[test]
   fn shrinking_below_an_own_inferred_floor_releases_it() {
-    let fixture = resize_d_with_inferred_floors(-400);
+    let mut fixture = Fixture::new(MinSizeSource::Inferred);
+    let d = fixture.d.clone();
+    fixture.resize(&d, Some(-400), None);
 
     assert_eq!(fixture.d.min_size(), Some((0, 100)));
     assert_eq!(fixture.c.min_size(), Some((300, 150)));
-    assert_close(
-      &fixture.sizes(),
-      &[0.5, 0.5, 0.5, 0.5, 0.985_454_56, 0.014_545_455],
-    );
+    fixture.assert_sizes([0.5, 0.5, 0.5, 0.5, 813. / 825., 12. / 825.]);
   }
 
   /// A request that fits within the floors has no reason to re-test
   /// them.
   #[test]
   fn a_request_within_inferred_floors_keeps_them() {
-    let fixture = resize_d_with_inferred_floors(60);
+    let mut fixture = Fixture::new(MinSizeSource::Inferred);
+    let d = fixture.d.clone();
+    fixture.resize(&d, Some(60), None);
 
     assert_eq!(fixture.c.min_size(), Some((300, 150)));
     assert_eq!(fixture.d.min_size(), Some((150, 100)));
-    assert_close(&fixture.sizes(), &WIDTH_ONLY);
+  }
+
+  /// An absolute size is reached by the same boundary: `d` at 40% of
+  /// the 825px its row shares out is 330px.
+  #[test]
+  fn a_size_is_set_through_the_same_boundary() {
+    let mut fixture = Fixture::new(MinSizeSource::Reported);
+    set_window_size(
+      fixture.d.clone().into(),
+      Some("40%".parse().expect("Length.")),
+      None,
+      &mut fixture.state,
+    )
+    .expect("Size.");
+
+    fixture.assert_sizes([0.5, 0.5, 0.5, 0.5, 495. / 825., 330. / 825.]);
   }
 
   /// Three windows in a row on a gapless 1680px workspace, 560px each.
-  /// The third window can be given a reported width floor.
   fn row_of_three(
-    third_floor: Option<i32>,
   ) -> (WmState, UnboundedReceiver<WmEvent>, [TilingWindow; 3]) {
     let windows = [(); 3].map(|()| TilingWindow::mock().call());
-
-    if let Some(floor) = third_floor {
-      windows[2].update_native_properties(|properties| {
-        properties.min_size = Some((floor, 0));
-        properties.min_size_source = MinSizeSource::Reported;
-      });
-    }
-
     let workspace = Workspace::mock()
       .tiling_containers(windows.iter().cloned().map(Into::into).collect())
       .call();
@@ -900,120 +395,38 @@ mod tests {
     (state, events, windows)
   }
 
-  /// Tiling sizes of the row, in order.
-  fn row_sizes(windows: &[TilingWindow; 3]) -> Vec<f32> {
-    windows.iter().map(TilingSizeGetters::tiling_size).collect()
+  /// Widths of the row as the layout shows them.
+  fn widths(windows: &[TilingWindow; 3]) -> Vec<i32> {
+    windows
+      .iter()
+      .map(|window| window.to_rect().expect("Rect.").width())
+      .collect()
   }
 
-  /// Dragging the right edge of the middle window takes from the window
-  /// on its right, and leaves the edge on its left where it was.
+  /// Growing the middle window moves its right boundary. The window on
+  /// its left keeps its width.
   #[test]
-  fn an_end_edge_trades_with_the_next_sibling_only() {
-    let (mut state, _events, windows) = row_of_three(None);
+  fn a_middle_window_grows_towards_the_end_of_its_row() {
+    let (mut state, _events, windows) = row_of_three();
 
-    set_tiling_window_edge(
-      &windows[1],
-      660,
-      true,
-      ResizeEdge::End,
+    resize_window(
+      &windows[1].clone().into(),
+      Some(LengthValue::from_px(100)),
+      None,
       &mut state,
     )
     .expect("Resize.");
 
-    assert_close(
-      &row_sizes(&windows),
-      &[1. / 3., 660. / 1680., 460. / 1680.],
-    );
+    assert_eq!(widths(&windows), [560, 660, 460]);
   }
 
-  /// Dragging the left edge takes from the window on the left.
-  #[test]
-  fn a_start_edge_trades_with_the_previous_sibling_only() {
-    let (mut state, _events, windows) = row_of_three(None);
-
-    set_tiling_window_edge(
-      &windows[1],
-      660,
-      true,
-      ResizeEdge::Start,
-      &mut state,
-    )
-    .expect("Resize.");
-
-    assert_close(
-      &row_sizes(&windows),
-      &[460. / 1680., 660. / 1680., 1. / 3.],
-    );
-  }
-
-  /// The first window has nothing across its left edge, so the change
-  /// is shared out among the rest of the row.
-  #[test]
-  fn an_edge_without_a_neighbour_shares_the_change_out() {
-    let (mut state, _events, windows) = row_of_three(None);
-
-    set_tiling_window_edge(
-      &windows[0],
-      660,
-      true,
-      ResizeEdge::Start,
-      &mut state,
-    )
-    .expect("Resize.");
-
-    assert_close(
-      &row_sizes(&windows),
-      &[660. / 1680., 510. / 1680., 510. / 1680.],
-    );
-  }
-
-  /// The neighbour keeps its floor, however far the edge was dragged.
-  #[test]
-  fn an_edge_stops_at_the_floor_of_its_neighbour() {
-    let (mut state, _events, windows) = row_of_three(Some(500));
-
-    set_tiling_window_edge(
-      &windows[1],
-      5000,
-      true,
-      ResizeEdge::End,
-      &mut state,
-    )
-    .expect("Resize.");
-
-    assert_close(
-      &row_sizes(&windows),
-      &[1. / 3., 620. / 1680., 500. / 1680.],
-    );
-  }
-
-  /// A request of under half a pixel changes nothing, so the sizes stay
-  /// exactly as they were.
-  #[test]
-  fn an_edge_that_did_not_move_leaves_the_sizes_alone() {
-    let (mut state, _events, windows) = row_of_three(None);
-
-    set_tiling_window_edge(
-      &windows[1],
-      560,
-      true,
-      ResizeEdge::End,
-      &mut state,
-    )
-    .expect("Resize.");
-
-    assert_eq!(row_sizes(&windows), vec![1. / 3.; 3]);
-  }
-
-  /// A keyboard resize reads the tile's width back in whole pixels, so
-  /// a step out and a step back could in principle land off the start.
-  /// It does not: 200 round trips at three step sizes stay within half a
-  /// pixel of where they began.
+  /// A step out and a step back return to the start exactly, since both
+  /// move the same boundary by the same whole number of pixels.
   #[test]
   fn a_resize_step_out_and_back_returns_to_the_start() {
     for step in ["2%", "3%", "7%"] {
-      let (mut state, _events, windows) = row_of_three(None);
-      let start = row_sizes(&windows);
+      let (mut state, _events, windows) = row_of_three();
+      let start = widths(&windows);
 
       for _ in 0..200 {
         for sign in ["+", "-"] {
@@ -1026,12 +439,7 @@ mod tests {
           .expect("Resize.");
         }
 
-        for (size, start) in row_sizes(&windows).iter().zip(&start) {
-          assert!(
-            (size - start).abs() * 1680. < 0.5,
-            "step {step}: {size} drifted from {start}"
-          );
-        }
+        assert_eq!(widths(&windows), start, "step {step}");
       }
     }
   }

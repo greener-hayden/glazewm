@@ -2,12 +2,10 @@ use std::cell::Ref;
 
 use ambassador::delegatable_trait;
 use anyhow::Context;
-use wm_common::{GapsConfig, TilingDirection};
+use wm_common::GapsConfig;
 
-use super::{CommonGetters, TilingDirectionGetters};
-use crate::models::{
-  Container, DirectionContainer, MonitorMetrics, TilingContainer,
-};
+use super::CommonGetters;
+use crate::models::MonitorMetrics;
 
 pub const MIN_TILING_SIZE: f32 = 0.01;
 
@@ -49,46 +47,6 @@ pub trait TilingSizeGetters: CommonGetters {
         .inner_gap
         .to_px(metrics.width, Some(scale_factor)),
     )
-  }
-
-  /// Gets the container to resize when resizing a tiling window.
-  fn container_to_resize(
-    &self,
-    is_width_resize: bool,
-  ) -> anyhow::Result<Option<TilingContainer>> {
-    let parent = self.direction_container().context("No parent.")?;
-
-    let tiling_direction = parent.tiling_direction();
-
-    // Whether the resize is in the inverse of its tiling direction.
-    let is_inverse_resize = match tiling_direction {
-      TilingDirection::Horizontal => !is_width_resize,
-      TilingDirection::Vertical => is_width_resize,
-    };
-
-    let container_to_resize = if is_inverse_resize {
-      match parent {
-        // Prevent workspaces from being resized.
-        DirectionContainer::Split(parent) => Some(parent.into()),
-        DirectionContainer::Workspace(_) => None,
-      }
-    } else {
-      let grandparent = parent.parent().context("No grandparent.")?;
-
-      if self.tiling_sibling_count() > 0 {
-        // Window can only be resized if it has siblings.
-        Some(self.as_tiling_container()?)
-      } else {
-        // Resize grandparent in layouts like H[1 V[2 H[3]]], where
-        // container 3 is resized horizontally.
-        match grandparent {
-          Container::Split(grandparent) => Some(grandparent.into()),
-          _ => None,
-        }
-      }
-    };
-
-    Ok(container_to_resize)
   }
 }
 

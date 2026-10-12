@@ -1,5 +1,6 @@
 mod attach_container;
 mod attach_to_tile;
+mod boundary;
 mod detach_container;
 mod detach_tile;
 mod flatten_child_split_containers;
@@ -18,6 +19,7 @@ mod wrap_in_split_container;
 
 pub use attach_container::*;
 pub use attach_to_tile::*;
+pub use boundary::*;
 pub use detach_container::*;
 pub use detach_tile::*;
 pub use flatten_child_split_containers::*;

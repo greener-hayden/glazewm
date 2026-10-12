@@ -6,8 +6,11 @@ use wm_platform::{Point, Rect};
 
 use crate::{
   commands::{
-    container::{move_container_within_tree, wrap_in_split_container},
-    window::{set_tiling_window_edge, update_window_state, ResizeEdge},
+    container::{
+      move_container_within_tree, wrap_in_split_container, Boundary,
+      ResizeEdge,
+    },
+    window::update_window_state,
   },
   events::update_floating_window_position,
   models::{
@@ -199,8 +202,8 @@ fn finish_tiling_drag(
 /// Moves, in the layout, the edges of a tiling window that a drag has
 /// moved from `start` to `frame`.
 ///
-/// Each moved edge trades space with the neighbour across it (see
-/// `set_tiling_window_edge`), and the tiles that changed are queued for
+/// Each moved edge moves the boundary it lies on to where the edge now
+/// is (see `Boundary`), and the tiles that changed are queued for
 /// redraw. Applying the same frame twice changes nothing the second
 /// time, so this serves both the drag while it runs and its end.
 ///
@@ -214,33 +217,40 @@ pub(crate) fn apply_dragged_edges(
   frame: &Rect,
   state: &mut WmState,
 ) -> anyhow::Result<()> {
-  // The layout works in tile rectangles, which leave out the border
-  // delta that the frame carries.
-  let tile = window.to_rect()?;
-  let tile_frame = tile.apply_delta(&window.border_delta(), None);
+  // Where the layout has the frame now. A boundary along one axis does
+  // not move an edge along the other, so one reading serves both.
+  let tile_frame =
+    window.to_rect()?.apply_delta(&window.border_delta(), None);
 
   let axes = [
     (
-      dragged_axis(start.left, start.width(), frame.left, frame.width()),
-      tile_frame.width() - tile.width(),
+      (start.left, start.right),
+      (frame.left, frame.right),
+      (tile_frame.left, tile_frame.right),
       true,
     ),
     (
-      dragged_axis(start.top, start.height(), frame.top, frame.height()),
-      tile_frame.height() - tile.height(),
+      (start.top, start.bottom),
+      (frame.top, frame.bottom),
+      (tile_frame.top, tile_frame.bottom),
       false,
     ),
   ];
 
-  for (axis, border, is_width_resize) in axes {
-    if let Some((length, edge)) = axis {
-      set_tiling_window_edge(
-        window,
-        length - border,
-        is_width_resize,
-        edge,
-        state,
-      )?;
+  for (start, end, tile, is_width) in axes {
+    let Some(edge) = dragged_edge(start, end) else {
+      continue;
+    };
+
+    let delta = match edge {
+      ResizeEdge::Start => end.0 - tile.0,
+      ResizeEdge::End => end.1 - tile.1,
+    };
+
+    if let Some(boundary) =
+      Boundary::find(&window.as_tiling_container()?, is_width, &[edge])
+    {
+      boundary.shift(delta, state)?;
     }
   }
 
@@ -267,26 +277,20 @@ fn drag_end_frame(window: &TilingWindow, state: &WmState) -> Rect {
   frame
 }
 
-/// The length a drag left one axis at and the edge it moved, or `None`
-/// when the drag did not change that axis's length.
+/// The edge that a drag moved along one axis, or `None` when the drag
+/// did not change the length of that axis.
 ///
-/// `start` and `end` are the positions of the axis's left or top edge.
-/// The right or bottom edge is the one that moved when that edge stood
-/// still.
-fn dragged_axis(
-  start: i32,
-  start_length: i32,
-  end: i32,
-  end_length: i32,
-) -> Option<(i32, ResizeEdge)> {
-  (end_length != start_length).then(|| {
-    let edge = if end == start {
-      ResizeEdge::End
-    } else {
+/// `start` and `end` each hold the positions of the two edges of the
+/// axis, before and after. The edge that moved further is the dragged
+/// one. The other can be off by a few pixels where the two frames were
+/// read in different ways, so it is not required to have stood still.
+fn dragged_edge(start: (i32, i32), end: (i32, i32)) -> Option<ResizeEdge> {
+  (end.1 - end.0 != start.1 - start.0).then(|| {
+    if end.0.abs_diff(start.0) > end.1.abs_diff(start.1) {
       ResizeEdge::Start
-    };
-
-    (end_length, edge)
+    } else {
+      ResizeEdge::End
+    }
   })
 }
 
@@ -469,7 +473,7 @@ mod tests {
 
   use super::*;
   use crate::{
-    models::{Monitor, Workspace},
+    models::{MinSizeSource, Monitor, Workspace},
     test_utils::{attach_monitor, mock_state},
     traits::TilingSizeGetters,
   };
@@ -600,25 +604,56 @@ mod tests {
     assert!(windows[1].active_drag().is_none());
   }
 
+  /// The right edge of the first window was dragged over a neighbour
+  /// that is at its reported floor. The neighbour slides along, and the
+  /// last window gives up the space.
   #[test]
-  fn an_unchanged_length_is_not_a_dragged_axis() {
+  fn releasing_an_edge_over_a_tile_at_its_floor_takes_from_the_next() {
+    let (mut state, _events, windows) = row_of_three();
+    windows[1].update_native_properties(|properties| {
+      properties.min_size = Some((560, 0));
+      properties.min_size_source = MinSizeSource::Reported;
+    });
+    let tile = windows[0].to_rect().expect("Tile.");
+
+    release_at(
+      &windows[0],
+      Rect::from_ltrb(tile.left, tile.top, tile.right + 200, tile.bottom),
+      &mut state,
+    );
+
+    assert_sizes(&windows, [760. / 1680., 560. / 1680., 360. / 1680.]);
+  }
+
+  #[test]
+  fn an_unchanged_length_is_not_a_dragged_edge() {
     // A move changes the position and keeps the length.
-    assert_eq!(dragged_axis(100, 800, 140, 800), None);
+    assert_eq!(dragged_edge((100, 900), (140, 940)), None);
   }
 
   #[test]
   fn a_still_start_edge_means_the_end_edge_moved() {
     assert_eq!(
-      dragged_axis(100, 800, 100, 860),
-      Some((860, ResizeEdge::End))
+      dragged_edge((100, 900), (100, 960)),
+      Some(ResizeEdge::End)
     );
   }
 
   #[test]
   fn a_moved_start_edge_is_the_dragged_edge() {
     assert_eq!(
-      dragged_axis(100, 800, 40, 860),
-      Some((860, ResizeEdge::Start))
+      dragged_edge((100, 900), (40, 900)),
+      Some(ResizeEdge::Start)
+    );
+  }
+
+  /// The start frame was read 7px wider on each side than the end
+  /// frame. The right edge still moved further, so it is the dragged one.
+  #[test]
+  fn a_start_frame_read_wider_does_not_change_the_edge() {
+    assert_eq!(
+      dragged_edge((93, 907), (100, 1000)),
+      Some(ResizeEdge::End)
     );
   }
 }
